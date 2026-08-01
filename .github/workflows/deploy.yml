@@ -36,6 +36,9 @@ jobs:
       - name: Build project
         run: npm run build
 
+      - name: SPA fallback for client-side routes (e.g. /print/:id)
+        run: cp dist/index.html dist/404.html
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
