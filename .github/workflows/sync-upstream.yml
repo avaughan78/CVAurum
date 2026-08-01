@@ -1,0 +1,73 @@
+name: Sync upstream (akhil-dara/CVAurum)
+
+# Keeps this fork's main branch up to date with the original project. Clean
+# merges are pushed straight to main and deployed automatically; if upstream
+# ever conflicts with our fork-only files (CNAME, deploy workflow, vite
+# config's `base`), a PR is opened instead so a human resolves it before
+# anything touches the live site.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # every Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/akhil-dara/cvaurum.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: echo "count=$(git rev-list --count origin/main..upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Attempt clean merge
+        id: merge
+        if: steps.check.outputs.count != '0'
+        run: |
+          git checkout main
+          if git merge upstream/main --no-edit; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push and deploy
+        if: steps.check.outputs.count != '0' && steps.merge.outputs.clean == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push origin main
+          gh workflow run deploy.yml
+
+      - name: Open PR for manual conflict resolution
+        if: steps.check.outputs.count != '0' && steps.merge.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b "$branch" upstream/main
+          git push origin "$branch" -f
+          gh pr create --base main --head "$branch" \
+            --title "Sync upstream: manual merge needed" \
+            --body "Weekly upstream sync found commits on [akhil-dara/CVAurum](https://github.com/akhil-dara/CVAurum) that don't merge cleanly with this fork's changes (CNAME, deploy workflow, vite config base). Resolve the conflicts here (GitHub's web editor can do it) and merge into \`main\`." \
+            || echo "PR already open for this branch"
