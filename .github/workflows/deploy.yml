@@ -1,9 +1,21 @@
-name: Deploy to GitHub Pages
+name: Deploy upstream CVAurum to GitHub Pages
+
+# cv.hirepotential.co.uk serves the original project (akhil-dara/CVAurum) unmodified, always at
+# its latest main. Every day this builds upstream's main, runs its own typecheck and test suite,
+# and deploys only if they pass. Nothing is merged into this repository, so there is nothing to
+# conflict. See FORK.md.
 
 on:
+  schedule:
+    - cron: '0 5 * * *' # every day, 05:00 UTC
   push:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream commit, branch or tag to deploy (default: main)"
+        required: false
+        default: main
 
 permissions:
   contents: read
@@ -12,7 +24,7 @@ permissions:
 
 concurrency:
   group: "pages"
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -21,31 +33,44 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Check out upstream CVAurum
         uses: actions/checkout@v4
+        with:
+          repository: akhil-dara/cvaurum
+          ref: ${{ inputs.ref || 'main' }}
+
+      - name: Record the upstream commit
+        run: |
+          echo "### Deploying akhil-dara/cvaurum @ $(git rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          git log -1 --format='%ad · %s' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'
+          node-version: '22'
+          cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
-      - name: Build project
-        run: npm run build
+      - name: Typecheck and test (upstream's own gate)
+        run: |
+          npm run typecheck
+          npm test
 
-      - name: SPA fallback for client-side routes (e.g. /print/:id)
-        run: cp dist/index.html dist/404.html
+      - name: Build
+        run: npm run build:nocheck
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
+      - name: Custom domain
+        run: echo "cv.hirepotential.co.uk" > dist/CNAME
+
+      - name: Set up Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './dist'
+          path: ./dist
 
       - name: Deploy to GitHub Pages
         id: deployment
