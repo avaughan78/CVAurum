@@ -15,3 +15,7 @@ https://cv.hirepotential.co.uk. HirePotential's apps link to it as their free CV
 - **Deploy a specific version:** Actions › Deploy upstream CVAurum › Run workflow, and give an
   upstream commit (useful to roll back if upstream breaks something its tests don't catch).
 - **If a deploy fails:** the site keeps the last good version. GitHub emails the failure.
+- **Security headers:** GitHub Pages ignores upstream's `public/_headers`, so the same headers
+  (Content-Security-Policy and the rest; HSTS without `includeSubDomains; preload`) are set by a
+  Cloudflare Response Header Transform Rule on `cv.hirepotential.co.uk`. If upstream changes its
+  `_headers`, update that rule to match.
