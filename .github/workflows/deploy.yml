@@ -75,3 +75,25 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  # Separate from the deploy so a header change never blocks it; a failure here emails you.
+  # GitHub Pages ignores upstream's _headers, so ours come from a Cloudflare rule (FORK.md).
+  headers:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repository (the checker and expected headers)
+        uses: actions/checkout@v4
+
+      - name: Check out upstream's _headers
+        uses: actions/checkout@v4
+        with:
+          repository: akhil-dara/cvaurum
+          ref: ${{ inputs.ref || 'main' }}
+          path: upstream
+          sparse-checkout: public/_headers
+          sparse-checkout-cone-mode: false
+
+      - name: Compare security headers
+        run: .github/headers/check.sh upstream/public/_headers
