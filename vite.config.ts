@@ -5,7 +5,6 @@ import path from 'node:path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  base: '/', // <--- ADD THIS LINE
   plugins: [
     react(),
     VitePWA({
@@ -25,18 +24,28 @@ export default defineConfig({
         scope: '/',
         icons: [
           { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+          // Concrete PNG sizes — required before Chrome offers "Install app".
           { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
           { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
           { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
         ],
       },
       workbox: {
+        // Fonts are self-hosted, so they precache via the woff2 glob below — no
+        // third-party runtime caching is needed. The app contacts no external host.
         globPatterns: ['**/*.{js,css,html,svg,png,ico,woff,woff2}'],
+        // OCR engine assets (tesseract worker/core/traineddata, ~10MB) are only
+        // needed when a user imports a scanned PDF — keep them OUT of the precache
+        // so first load stays lean; they fetch on demand, same-origin, from /ocr/.
+        // Same for the opt-in semantic-match engine (~34MB) under /semantic/,
+        // and its worker chunk — it must download only after the user opts in.
         globIgnores: ['**/ocr/**', '**/semantic/**', '**/semantic.worker-*.js'],
         maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
         navigateFallback: '/index.html',
+        // The print route renders client-side; never serve the SPA shell for it from cache wrongly.
         navigateFallbackDenylist: [/^\/print\//],
       },
+      // Keep the dev server untouched; the service worker only ships in builds.
       devOptions: { enabled: false },
     }),
   ],
