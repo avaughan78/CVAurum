@@ -1,20 +1,50 @@
 import { useState } from 'react'
+import { deleteItem } from '@/store/deleteItem'
 import { GripVertical, Trash2, Plus, ChevronDown } from 'lucide-react'
 import { useResumeStore } from '@/store/useResumeStore'
 import type { ResumeContent, ResumeDocument } from '@/types/document'
-import { cn } from '@/lib/utils'
-import { newItem, ADD_LABEL } from '@/lib/sections'
+import type { NamedLink } from '@/types/resume'
+import { cn, currentYearMonth, dateProgress, uid } from '@/lib/utils'
+import { newItem, removeItem, entryBadgeOn, metaColumnOn, ADD_LABEL } from '@/lib/sections'
+import { railLabel } from '@/lib/rail'
 import { SortableList } from './SortableList'
 import { TextField, TextAreaField, DateField, TagInput, RatingField, Row, Labeled } from './fields/Inputs'
 import { LogoPicker } from './fields/LogoPicker'
-import { RichTextEditor } from './fields/RichTextEditor'
+import { RichTextLazy as RichTextEditor } from './fields/RichTextLazy'
 import { BulletsEditor } from './fields/BulletsEditor'
+import { Segmented, Select, Toggle } from './fields/Controls'
+import { hasPagePin, togglePagePin } from '@/lib/pageBreakPins'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyItem = Record<string, any>
 
 /** Common language fluency levels (CEFR-ish), offered as a dropdown. */
 const FLUENCY_LEVELS = ['Native', 'Fluent', 'Professional', 'Conversational', 'Intermediate', 'Basic']
+
+/**
+ * What a school calls the three fields an education entry already stores.
+ * The entry's `level` picks a set of NAMES and SUGGESTIONS - studyType, area
+ * and score are the same three stored fields whichever is chosen, so every
+ * template prints a school entry today with no template work and no export
+ * knows the difference. The editor asking a Class XII entry for a "Degree"
+ * and a "3.8 GPA" is what left school leavers with nowhere to type.
+ */
+const EDU_LEVELS = {
+  degree: { label: 'Degree', study: 'Degree', studyHint: 'B.S.', area: 'Field of study', areaHint: 'Computer Science', scoreHint: '3.8 GPA' },
+  diploma: { label: 'Diploma', study: 'Diploma', studyHint: 'Diploma in Mechanical Engineering', area: 'Field of study', areaHint: 'Mechanical Engineering', scoreHint: 'First class' },
+  intermediate: { label: 'Intermediate / +2', study: 'Class / Board', studyHint: 'Intermediate, MPC', area: 'Stream', areaHint: 'Science', scoreHint: '94.2%' },
+  secondary: { label: 'School (Class X)', study: 'Class / Board', studyHint: 'Class X, CBSE', area: 'Stream', areaHint: '', scoreHint: '9.4 CGPA' },
+  certificate: { label: 'Certificate', study: 'Certificate', studyHint: 'Certificate in Data Analytics', area: 'Subject', areaHint: 'Data Analytics', scoreHint: 'Passed' },
+} as const
+
+type EduLevel = keyof typeof EDU_LEVELS
+
+/** The names this entry's fields go by: its own level, else a degree's -
+ *  which is exactly what every entry stored before the field existed shows. */
+const eduLevel = (level?: string): (typeof EDU_LEVELS)[EduLevel] =>
+  EDU_LEVELS[(level as EduLevel) in EDU_LEVELS ? (level as EduLevel) : 'degree']
+
+const EDU_LEVEL_OPTIONS = (Object.keys(EDU_LEVELS) as EduLevel[]).map((value) => ({ value, label: EDU_LEVELS[value].label }))
 
 function itemTitle(sectionKey: string, it: AnyItem): string {
   switch (sectionKey) {
@@ -92,11 +122,8 @@ export function SectionItemsEditor({ doc, sectionKey }: { doc: ResumeDocument; s
       const it = list.find((x) => x.id === id)
       if (it) fn(it)
     })
-  const removeById = (id: string) =>
-    mutate((list) => {
-      const idx = list.findIndex((x) => x.id === id)
-      if (idx >= 0) list.splice(idx, 1)
-    })
+  // Says what went, with an Undo right there (store/deleteItem.ts).
+  const removeById = (id: string) => deleteItem(sectionKey, id)
   const reorder = (order: string[]) =>
     mutate((list) => {
       const byId = new Map(list.map((x) => [x.id, x]))
@@ -146,11 +173,18 @@ export function SectionItemsEditor({ doc, sectionKey }: { doc: ResumeDocument; s
                       })
                     }
                   >
-                    <ChevronDown className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')} />
+                    <ChevronDown
+                      className={cn(
+                        'h-4 w-4 shrink-0 text-muted-foreground transition-transform',
+                        open && 'rotate-180'
+                      )}
+                    />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">{itemTitle(sectionKey, it)}</span>
                       {itemSubtitle(sectionKey, it) && (
-                        <span className="block truncate text-xs text-muted-foreground">{itemSubtitle(sectionKey, it)}</span>
+                        <span className="block truncate text-xs text-muted-foreground">
+                          {itemSubtitle(sectionKey, it)}
+                        </span>
                       )}
                     </span>
                   </button>
@@ -165,7 +199,8 @@ export function SectionItemsEditor({ doc, sectionKey }: { doc: ResumeDocument; s
                 </div>
                 {open && (
                   <div className="space-y-3 border-t border-border p-3">
-                    <ItemFields sectionKey={sectionKey} item={it} patch={(fn) => patchById(id, fn)} />
+                    <ItemFields doc={doc} sectionKey={sectionKey} item={it} patch={(fn) => patchById(id, fn)} />
+                    <PageBreakRow sectionKey={sectionKey} itemId={id} />
                   </div>
                 )}
               </div>
@@ -185,31 +220,274 @@ function SummaryEditor({ doc }: { doc: ResumeDocument }) {
   return (
     <RichTextEditor
       value={doc.content.basics.summary ?? ''}
-      onChange={(v) => update((c) => { c.basics.summary = v })}
+      onChange={(v) =>
+        update((c) => {
+          c.basics.summary = v
+        })
+      }
       placeholder="2–3 punchy lines: who you are, your strongest skills, and the impact you bring…"
       minHeight={110}
     />
   )
 }
 
-function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: AnyItem; patch: (fn: (it: AnyItem) => void) => void }) {
-  const set = (key: string) => (v: any) => patch((it) => { it[key] = v })
+/**
+ * Per-entry badge control (inline-reorder spec, Task C): live preview of what
+ * renders beside the entry (uploaded logo, else the monogram initial) plus a
+ * tri-state override — Auto follows the section's "Entry badges" toggle,
+ * Show/Hide force it for this entry only (`item.badge`, resolved by
+ * `entryBadgeOn` in the renderer).
+ */
+function BadgeRow({
+  sectionKey,
+  item,
+  patch,
+}: {
+  sectionKey: string
+  item: AnyItem
+  patch: (fn: (it: AnyItem) => void) => void
+}) {
+  const doc = useResumeStore((s) => s.doc)
+  const updateMetadata = useResumeStore((s) => s.updateMetadata)
+  if (!doc) return null
+  const sectionOn = doc.metadata.layout.sectionSettings?.[sectionKey]?.showBadges === true
+  const src =
+    sectionKey === 'education'
+      ? item.institution || item.area
+      : sectionKey === 'volunteer'
+        ? item.organization || item.position
+        : item.name || item.position
+  const letter = String(src || '')
+    .trim()
+    .charAt(0)
+    .toUpperCase()
+  const hasLogo = !!item.logo && /^(data:image\/|blob:)/i.test(item.logo)
+  const monogramOn = entryBadgeOn(item, { showBadges: sectionOn })
+  const mode: 'auto' | 'show' | 'hide' = item.badge === true ? 'show' : item.badge === false ? 'hide' : 'auto'
+  const setMode = (m: 'auto' | 'show' | 'hide') =>
+    patch((it) => {
+      it.badge = m === 'auto' ? undefined : m === 'show'
+    })
+  const seg = (m: 'auto' | 'show' | 'hide', label: string) => (
+    <button
+      type="button"
+      className={cn(
+        'rounded px-2 py-0.5 text-[11px] font-medium transition',
+        mode === m ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:bg-muted/60'
+      )}
+      aria-pressed={mode === m}
+      onClick={() => setMode(m)}
+    >
+      {label}
+    </button>
+  )
+  return (
+    <Labeled label="Entry badge">
+      <div className="flex items-center gap-2">
+        <span
+          className={cn(
+            'flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-md border border-border bg-white text-sm font-semibold',
+            !hasLogo && !monogramOn && 'opacity-35'
+          )}
+          aria-hidden
+        >
+          {hasLogo ? <img src={item.logo} alt="" className="h-full w-full object-contain p-0.5" /> : letter || '·'}
+        </span>
+        <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
+          {seg('auto', 'Auto')}
+          {seg('show', 'Show')}
+          {seg('hide', 'Hide')}
+        </div>
+        <span className="min-w-0 text-[11px] leading-tight text-muted-foreground">
+          {hasLogo ? (
+            'Logo shows; the initial appears only without one.'
+          ) : mode === 'auto' && !sectionOn ? (
+            <>
+              Section badges are off.{' '}
+              <button
+                type="button"
+                className="underline decoration-dotted underline-offset-2 hover:text-foreground"
+                onClick={() =>
+                  updateMetadata((m) => {
+                    if (!m.layout.sectionSettings) m.layout.sectionSettings = {}
+                    m.layout.sectionSettings[sectionKey] = {
+                      ...(m.layout.sectionSettings[sectionKey] ?? {}),
+                      showBadges: true,
+                    }
+                  })
+                }
+              >
+                Turn on for this section
+              </button>
+            </>
+          ) : monogramOn ? (
+            'Shows the initial beside this entry.'
+          ) : (
+            'Hidden for this entry.'
+          )}
+        </span>
+      </div>
+    </Labeled>
+  )
+}
+
+/**
+ * Panel twin of the canvas entry cluster's "Start on new page" pin. A phone
+ * has no editable canvas, so the pin has to be reachable from the entry's
+ * own card as well; both write the same {section, itemId} into page.breaks
+ * through the same helper, and both stand down while auto-fit owns the
+ * pagination, exactly as the section style sheet does.
+ */
+function PageBreakRow({ sectionKey, itemId }: { sectionKey: string; itemId: string }) {
+  const autoFitOn = useResumeStore((s) => s.doc?.metadata.page.autoFit ?? true)
+  const pinned = useResumeStore((s) => (s.doc ? hasPagePin(s.doc.metadata.page.breaks, sectionKey, itemId) : false))
+  const updateMetadata = useResumeStore((s) => s.updateMetadata)
+  return (
+    <div className="border-t border-border pt-3">
+      {autoFitOn ? (
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-sm text-foreground">Start on new page</span>
+          <span className="text-right text-[11px] leading-tight text-muted-foreground">
+            Turn off “Magic fit” (Design) to pin page breaks.
+          </span>
+        </div>
+      ) : (
+        <Toggle
+          label="Start on new page"
+          checked={pinned}
+          onChange={() => updateMetadata((m) => togglePagePin(m.page.breaks, sectionKey, itemId))}
+        />
+      )}
+    </div>
+  )
+}
+
+/** The section name the rail decides its automatic word from. Every custom
+ *  section is one 'custom' as far as the rail is concerned. */
+const railSectionOf = (sectionKey: string) => (sectionKey.startsWith('custom-') ? 'custom' : sectionKey)
+/** The five section kinds the rail draws a cell for. No other entry has one,
+ *  so no other form offers the fields. */
+const RAIL_SECTIONS = new Set(['work', 'education', 'projects', 'volunteer', 'custom'])
+
+/**
+ * The rail's two fields for one entry, folded away under a disclosure.
+ *
+ * This is the phone's path to them: the canvas date popover carries the same
+ * pair, and a phone has no editable canvas. Shown only while the document's
+ * date column IS the rail - on any other template the two fields would set
+ * something that is never drawn.
+ *
+ * Each field's placeholder is the automatic label, resolved with this entry's
+ * own override taken out, so the author sees what the rail says today before
+ * deciding to say something else.
+ */
+function RailFields({
+  doc,
+  sectionKey,
+  item,
+  patch,
+}: {
+  doc: ResumeDocument
+  sectionKey: string
+  item: AnyItem
+  patch: (fn: (it: AnyItem) => void) => void
+}) {
+  const key = railSectionOf(sectionKey)
+  if (!RAIL_SECTIONS.has(key)) return null
+  if (metaColumnOn(doc.metadata, doc.content) !== 'gutter') return null
+  const railDefault = railLabel(key, { ...item, rail: undefined }, currentYearMonth())
+  return (
+    <details className="mt-1">
+      <summary className="cursor-pointer text-xs text-muted-foreground">Rail label</summary>
+      <Row>
+        <TextField
+          label="Rail year"
+          value={item.rail?.year ?? ''}
+          onChange={(v) =>
+            patch((it) => {
+              it.rail = { ...(it.rail ?? {}), year: v }
+            })
+          }
+          placeholder={railDefault?.year ?? 'automatic'}
+        />
+        <TextField
+          label="Rail word"
+          value={item.rail?.word ?? ''}
+          onChange={(v) =>
+            patch((it) => {
+              it.rail = { ...(it.rail ?? {}), word: v }
+            })
+          }
+          placeholder={railDefault?.word || 'automatic'}
+        />
+      </Row>
+    </details>
+  )
+}
+
+function ItemFields({
+  doc,
+  sectionKey,
+  item,
+  patch,
+}: {
+  doc: ResumeDocument
+  sectionKey: string
+  item: AnyItem
+  patch: (fn: (it: AnyItem) => void) => void
+}) {
+  const set = (key: string) => (v: any) =>
+    patch((it) => {
+      it[key] = v
+    })
 
   switch (sectionKey) {
     case 'work':
       return (
         <>
           <Row>
-            <TextField label="Job title" value={item.position} onChange={set('position')} placeholder="Senior Engineer" />
+            <TextField
+              label="Job title"
+              value={item.position}
+              onChange={set('position')}
+              placeholder="Senior Engineer"
+            />
             <TextField label="Company" value={item.name} onChange={set('name')} placeholder="Vertex Labs" />
           </Row>
+          {/* The entry's link. It could be set from the canvas chain button
+              alone, and the panel is where every other field of this entry
+              lives - so on a phone, with the panel open over the canvas, a
+              wrong address already live in the exported PDF could not be
+              corrected. Five other section types have had this field all
+              along. */}
+          <TextField
+            label="Link"
+            value={item.url ?? ''}
+            onChange={set('url')}
+            placeholder="https://vertexlabs.io"
+          />
+
+          {/* Location used to sit beside a nested pair of date fields, which
+              left each of the four month/year selects a quarter of the row —
+              too narrow to show the month or year it had selected. The dates
+              now get a row of their own, as they do in every other section. */}
+          <TextField
+            label="Location"
+            value={item.location}
+            onChange={set('location')}
+            placeholder="San Francisco, CA"
+          />
           <Row>
-            <TextField label="Location" value={item.location} onChange={set('location')} placeholder="San Francisco, CA" />
-            <div className="grid grid-cols-2 gap-2">
-              <DateField label="Start" value={item.startDate} onChange={set('startDate')} />
-              <DateField label="End" value={item.endDate} onChange={set('endDate')} allowPresent />
-            </div>
+            <DateField label="Start" value={item.startDate} onChange={set('startDate')} />
+            <DateField
+              label="End"
+              value={item.endDate}
+              onChange={set('endDate')}
+              allowPresent
+              singleWith={item.startDate}
+            />
           </Row>
+          <RailFields doc={doc} sectionKey={sectionKey} item={item} patch={patch} />
           <TextAreaField
             label="Role summary"
             value={item.summary ?? ''}
@@ -217,39 +495,162 @@ function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: Any
             placeholder="One or two lines on the scope of the role (optional) — also editable right on the resume"
           />
           <LogoPicker label="Company logo" value={item.logo} onChange={set('logo')} />
+          <BadgeRow sectionKey={sectionKey} item={item} patch={patch} />
           <BulletsEditor label="Achievements" items={item.highlights ?? []} onChange={set('highlights')} />
         </>
       )
-    case 'education':
+    case 'education': {
+      // What this entry's fields are called here, and how far along it is.
+      // The status row shows the state the page is printing - a finish still
+      // ahead reads as "In progress" before anything is stored - exactly as
+      // the date field's "Present" tick reflects an empty end date.
+      const names = eduLevel(item.level)
+      const status = dateProgress(item.status, item.endDate, currentYearMonth())
       return (
         <>
-          <TextField label="Institution" value={item.institution} onChange={set('institution')} placeholder="UC Berkeley" />
+          <TextField
+            label="Institution"
+            value={item.institution}
+            onChange={set('institution')}
+            placeholder="UC Berkeley"
+          />
+          {/* The entry's link. It could be set from the canvas chain button
+              alone, and the panel is where every other field of this entry
+              lives - so on a phone, with the panel open over the canvas, a
+              wrong address already live in the exported PDF could not be
+              corrected. Five other section types have had this field all
+              along. */}
+          <TextField
+            label="Link"
+            value={item.url ?? ''}
+            onChange={set('url')}
+            placeholder="https://berkeley.edu"
+          />
+
+          <Select
+            label="Level"
+            value={(item.level as EduLevel) ?? 'degree'}
+            options={EDU_LEVEL_OPTIONS}
+            onChange={(v) =>
+              patch((it) => {
+                // A degree is what an entry with no level already shows, so
+                // choosing it stores nothing: old documents and new ones that
+                // never touched this row stay the same bytes.
+                it.level = v === 'degree' ? undefined : v
+              })
+            }
+          />
           <Row>
-            <TextField label="Degree" value={item.studyType} onChange={set('studyType')} placeholder="B.S." />
-            <TextField label="Field of study" value={item.area} onChange={set('area')} placeholder="Computer Science" />
+            <TextField label={names.study} value={item.studyType} onChange={set('studyType')} placeholder={names.studyHint} />
+            <TextField label={names.area} value={item.area} onChange={set('area')} placeholder={names.areaHint} />
           </Row>
           <Row>
             <DateField label="Start" value={item.startDate} onChange={set('startDate')} />
-            <DateField label="End" value={item.endDate} onChange={set('endDate')} allowPresent />
+            <DateField
+              label="End"
+              value={item.endDate}
+              onChange={set('endDate')}
+              allowPresent
+              singleWith={item.startDate}
+            />
           </Row>
+          <RailFields doc={doc} sectionKey={sectionKey} item={item} patch={patch} />
+          <Labeled
+            label="Status"
+            hint="In progress states the finish as expected — “Expected May 2027” — instead of printing a graduation that has not happened yet."
+          >
+            <Segmented
+              value={status}
+              options={[
+                { value: 'completed', label: 'Completed' },
+                { value: 'pursuing', label: 'In progress' },
+              ]}
+              onChange={(v) =>
+                patch((it) => {
+                  it.status = v
+                })
+              }
+            />
+          </Labeled>
           <Row>
             <TextField label="Location" value={item.location} onChange={set('location')} placeholder="Berkeley, CA" />
-            <TextField label="Grade / GPA" value={item.score} onChange={set('score')} placeholder="3.8 GPA" />
+            <TextField label="Grade / GPA" value={item.score} onChange={set('score')} placeholder={names.scoreHint} />
           </Row>
           <TagInput label="Relevant courses" value={item.courses ?? []} onChange={set('courses')} />
           <LogoPicker label="Institution logo" value={item.logo} onChange={set('logo')} />
+          <BadgeRow sectionKey={sectionKey} item={item} patch={patch} />
         </>
       )
+    }
     case 'projects':
       return (
         <>
-          <TextField label="Project name" value={item.name} onChange={set('name')} placeholder="Pulse — Observability" />
+          <TextField
+            label="Project name"
+            value={item.name}
+            onChange={set('name')}
+            placeholder="Pulse — Observability"
+          />
           <TextField label="Link" value={item.url} onChange={set('url')} placeholder="https://github.com/…" />
+          {/* A project usually has more than one place to point at - the
+              repository, a demo, a write-up - and printing three bare
+              addresses reads far worse than three short names. Each row is a
+              NAME and where it goes; the page shows the name. */}
+          <Labeled label="More links">
+            <div className="space-y-1.5">
+              {((item.links ?? []) as NamedLink[]).map((lnk: NamedLink, li: number) => (
+                <div key={lnk.id ?? li} className="flex items-center gap-2">
+                  <input
+                    className="input w-32 shrink-0"
+                    value={lnk.label ?? ''}
+                    placeholder="Shown as"
+                    aria-label="Link name"
+                    onChange={(e) =>
+                      set('links')(((item.links ?? []) as NamedLink[]).map((x: NamedLink, xi: number) => (xi === li ? { ...x, label: e.target.value } : x)))
+                    }
+                  />
+                  <input
+                    className="input min-w-0 flex-1"
+                    value={lnk.url ?? ''}
+                    placeholder="https://…"
+                    aria-label="Link address"
+                    onChange={(e) =>
+                      set('links')(((item.links ?? []) as NamedLink[]).map((x: NamedLink, xi: number) => (xi === li ? { ...x, url: e.target.value } : x)))
+                    }
+                  />
+                  <button
+                    type="button"
+                    className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground/60 hover:bg-danger/10 hover:text-danger"
+                    aria-label="Remove link"
+                    onClick={() => set('links')(((item.links ?? []) as NamedLink[]).filter((_: NamedLink, xi: number) => xi !== li))}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                className="text-[13px] font-medium text-primary"
+                onClick={() => set('links')([...((item.links ?? []) as NamedLink[]), { id: uid(), label: '', url: '' }])}
+              >
+                + Add link
+              </button>
+            </div>
+          </Labeled>
           <Row>
             <DateField label="Start" value={item.startDate} onChange={set('startDate')} />
-            <DateField label="End" value={item.endDate} onChange={set('endDate')} allowPresent />
+            <DateField
+              label="End"
+              value={item.endDate}
+              onChange={set('endDate')}
+              allowPresent
+              singleWith={item.startDate}
+            />
           </Row>
-          <TextField label="One-line description" value={item.description} onChange={set('description')} placeholder="What is it?" />
+          <RailFields doc={doc} sectionKey={sectionKey} item={item} patch={patch} />
+          <Labeled label="One-line description">
+            <RichTextEditor value={item.description ?? ''} onChange={set('description')} minHeight={36} />
+          </Labeled>
           <BulletsEditor label="Highlights" items={item.highlights ?? []} onChange={set('highlights')} />
           <TagInput label="Tech / keywords" value={item.keywords ?? []} onChange={set('keywords')} />
         </>
@@ -257,9 +658,27 @@ function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: Any
     case 'skills':
       return (
         <>
-          <TextField label="Category" value={item.name} onChange={set('name')} placeholder="Languages, Frontend, Cloud…" />
-          <TagInput label="Skills" value={item.keywords ?? []} onChange={set('keywords')} placeholder="Add a skill and press Enter" />
-          <RatingField label="Proficiency (optional, shows a meter)" value={item.rating} onChange={(v) => patch((it) => { it.rating = v || undefined })} />
+          <TextField
+            label="Category"
+            value={item.name}
+            onChange={set('name')}
+            placeholder="Languages, Frontend, Cloud…"
+          />
+          <TagInput
+            label="Skills"
+            value={item.keywords ?? []}
+            onChange={set('keywords')}
+            placeholder="Add a skill and press Enter"
+          />
+          <RatingField
+            label="Proficiency (optional, shows a meter)"
+            value={item.rating}
+            onChange={(v) =>
+              patch((it) => {
+                it.rating = v || undefined
+              })
+            }
+          />
         </>
       )
     case 'languages':
@@ -271,36 +690,87 @@ function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: Any
               <select className="input" value={item.fluency || ''} onChange={(e) => set('fluency')(e.target.value)}>
                 <option value="">Select level…</option>
                 {FLUENCY_LEVELS.map((l) => (
-                  <option key={l} value={l}>{l}</option>
+                  <option key={l} value={l}>
+                    {l}
+                  </option>
                 ))}
-                {item.fluency && !FLUENCY_LEVELS.includes(item.fluency) && <option value={item.fluency}>{item.fluency}</option>}
+                {item.fluency && !FLUENCY_LEVELS.includes(item.fluency) && (
+                  <option value={item.fluency}>{item.fluency}</option>
+                )}
               </select>
             </Labeled>
           </Row>
-          <RatingField label="Level (optional)" value={item.rating} onChange={(v) => patch((it) => { it.rating = v || undefined })} />
+          <RatingField
+            label="Level (optional)"
+            value={item.rating}
+            onChange={(v) =>
+              patch((it) => {
+                it.rating = v || undefined
+              })
+            }
+          />
         </>
       )
     case 'certificates':
       return (
         <>
-          <TextField label="Certificate" value={item.name} onChange={set('name')} placeholder="AWS Solutions Architect" />
+          <TextField
+            label="Certificate"
+            value={item.name}
+            onChange={set('name')}
+            placeholder="AWS Solutions Architect"
+          />
           <Row>
             <TextField label="Issuer" value={item.issuer} onChange={set('issuer')} placeholder="Amazon Web Services" />
             <DateField label="Date" value={item.date} onChange={set('date')} />
           </Row>
-          <TextField label="Link" value={item.url} onChange={set('url')} placeholder="https://…" />
+          <Row>
+            <TextField label="Link" value={item.url} onChange={set('url')} placeholder="https://…" />
+            {/* Name it and the word is printed after the issuer, the way a
+                credential line usually ends. Leave it empty and the
+                certificate's own title carries the link instead. */}
+            <TextField
+              label="Link shown as"
+              value={item.urlLabel ?? ''}
+              onChange={set('urlLabel')}
+              placeholder="Verify"
+            />
+          </Row>
+          <LogoPicker label="Issuer logo" value={item.logo} onChange={set('logo')} />
         </>
       )
     case 'awards':
       return (
         <>
-          <TextField label="Award" value={item.title} onChange={set('title')} placeholder="Engineering Excellence Award" />
+          <TextField
+            label="Award"
+            value={item.title}
+            onChange={set('title')}
+            placeholder="Engineering Excellence Award"
+          />
           <Row>
             <TextField label="Awarder" value={item.awarder} onChange={set('awarder')} placeholder="Vertex Labs" />
             <DateField label="Date" value={item.date} onChange={set('date')} />
           </Row>
+          <Row>
+            <TextField label="Link" value={item.url ?? ''} onChange={set('url')} placeholder="https://…" />
+            {/* Name it and the word prints after the awarder, the way a
+                credential line ends. Leave it empty and the award's own title
+                carries the link. */}
+            <TextField
+              label="Link shown as"
+              value={item.urlLabel ?? ''}
+              onChange={set('urlLabel')}
+              placeholder="Verify"
+            />
+          </Row>
           <Labeled label="Summary">
-            <RichTextEditor value={item.summary ?? ''} onChange={set('summary')} minHeight={48} placeholder="Why you earned it…" />
+            <RichTextEditor
+              value={item.summary ?? ''}
+              onChange={set('summary')}
+              minHeight={48}
+              placeholder="Why you earned it…"
+            />
           </Labeled>
         </>
       )
@@ -325,14 +795,25 @@ function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: Any
             <TextField label="Role" value={item.position} onChange={set('position')} />
             <TextField label="Organization" value={item.organization} onChange={set('organization')} />
           </Row>
+          {/* Same gap as work and education: the canvas chain button was the
+              only way in. */}
+          <TextField label="Link" value={item.url ?? ''} onChange={set('url')} placeholder="https://example.org" />
           <Row>
             <DateField label="Start" value={item.startDate} onChange={set('startDate')} />
-            <DateField label="End" value={item.endDate} onChange={set('endDate')} allowPresent />
+            <DateField
+              label="End"
+              value={item.endDate}
+              onChange={set('endDate')}
+              allowPresent
+              singleWith={item.startDate}
+            />
           </Row>
+          <RailFields doc={doc} sectionKey={sectionKey} item={item} patch={patch} />
           <Labeled label="Summary">
             <RichTextEditor value={item.summary ?? ''} onChange={set('summary')} minHeight={48} />
           </Labeled>
           <LogoPicker label="Organization logo" value={item.logo} onChange={set('logo')} />
+          <BadgeRow sectionKey={sectionKey} item={item} patch={patch} />
           <BulletsEditor label="Highlights" items={item.highlights ?? []} onChange={set('highlights')} />
         </>
       )
@@ -347,7 +828,12 @@ function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: Any
       return (
         <>
           <TextField label="Name" value={item.name} onChange={set('name')} placeholder="Jane Doe — Manager at …" />
-          <TextAreaField label="Reference" value={item.reference} onChange={set('reference')} placeholder="“Alex is…”  or  Available on request" />
+          <TextAreaField
+            label="Reference"
+            value={item.reference}
+            onChange={set('reference')}
+            placeholder="“Alex is…”  or  Available on request"
+          />
         </>
       )
     default:
@@ -362,6 +848,7 @@ function ItemFields({ sectionKey, item, patch }: { sectionKey: string; item: Any
             <DateField label="Date" value={item.date} onChange={set('date')} />
             <TextField label="Location" value={item.location} onChange={set('location')} />
           </Row>
+          <RailFields doc={doc} sectionKey={sectionKey} item={item} patch={patch} />
           <TextField label="Link" value={item.url} onChange={set('url')} placeholder="https://…" />
           <Labeled label="Description">
             <RichTextEditor value={item.summary ?? ''} onChange={set('summary')} minHeight={48} />

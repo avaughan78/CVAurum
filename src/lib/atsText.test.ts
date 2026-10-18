@@ -1,0 +1,456 @@
+import { describe, expect, it } from 'vitest'
+import { atsSectionOrder, resumeToAtsText } from './atsText'
+import { MetadataSchema } from '@/types/metadata'
+import type { ResumeDocument } from '@/types/document'
+import { createDocument } from '@/data/defaults'
+import { resolveOrder } from '@/lib/sections'
+
+describe('resumeToAtsText ignores purely visual link and icon choices', () => {
+  // The tag shape of a named link and the folio chip on a heading are ink,
+  // not words: the text a parser reads is built from the data model and can
+  // never see a DOM class, so every combination must serialize byte for byte
+  // the same. This pins that down before either setting exists on the page.
+  const docWith = (metadata: Record<string, unknown>): ResumeDocument =>
+    ({
+      id: 'res-1',
+      title: 'T',
+      createdAt: 0,
+      updatedAt: 0,
+      content: {
+        basics: { name: 'Alex Morgan', url: 'https://alexmorgan.dev', profiles: [], location: {} },
+        work: [],
+        education: [],
+        projects: [
+          {
+            id: 'p1',
+            name: 'Pulse',
+            description: 'Observability toolkit.',
+            url: 'https://github.com/alexmorgan/pulse',
+            links: [
+              { id: 'l1', label: 'Portfolio', url: 'https://alexmorgan.dev' },
+              { id: 'l2', label: 'Source', url: 'https://github.com/alexmorgan/pulse' },
+            ],
+            startDate: '2022',
+            endDate: '',
+            highlights: ['3.2k stars.'],
+            keywords: [],
+          },
+        ],
+        skills: [],
+        languages: [],
+        certificates: [
+          {
+            id: 'c1',
+            name: 'Cloud Architect',
+            issuer: 'Vendor',
+            date: '2024',
+            url: 'https://x.test/c1',
+            urlLabel: 'Verify',
+          },
+        ],
+        awards: [],
+        publications: [],
+        volunteer: [],
+        interests: [],
+        references: [],
+        custom: [],
+      },
+      metadata: MetadataSchema.parse({ layout: { main: ['projects', 'certificates'] }, ...metadata }),
+    }) as unknown as ResumeDocument
+
+  it('is byte-identical for links.style plain vs tag', () => {
+    const plain = resumeToAtsText(docWith({ links: { style: 'plain' } }))
+    const tag = resumeToAtsText(docWith({ links: { style: 'tag' } }))
+    expect(plain).toContain('Portfolio')
+    expect(plain).toContain('Verify')
+    expect(plain).toBe(tag)
+  })
+
+  it('is byte-identical for sectionIconStyle chip vs folio', () => {
+    const chip = resumeToAtsText(docWith({ layout: { main: ['projects', 'certificates'], sectionIconStyle: 'chip' } }))
+    const folio = resumeToAtsText(
+      docWith({ layout: { main: ['projects', 'certificates'], sectionIconStyle: 'folio' } })
+    )
+    expect(chip).toContain('Pulse')
+    expect(chip).toBe(folio)
+  })
+
+  // The section's own link style is NOT purely visual at one setting: 'none'
+  // says the address does not print, and this text reads the document rather
+  // than the page, so it has to drop the address itself.
+  it('drops the project address when the section prints no link line', () => {
+    const off = resumeToAtsText(
+      docWith({ layout: { main: ['projects', 'certificates'], sectionSettings: { projects: { linkStyle: 'none' } } } })
+    )
+    expect(off).toContain('Pulse')
+    expect(off).not.toContain('github.com/alexmorgan/pulse')
+  })
+
+  it('keeps it for every style that does print the line', () => {
+    for (const linkStyle of ['auto', 'tag', 'plain']) {
+      const on = resumeToAtsText(
+        docWith({ layout: { main: ['projects', 'certificates'], sectionSettings: { projects: { linkStyle } } } })
+      )
+      expect(on, linkStyle).toContain('github.com/alexmorgan/pulse')
+    }
+  })
+})
+
+describe('atsSectionOrder', () => {
+  // The exporter emits the main column ahead of the sidebar in the text layer
+  // whichever side the sidebar is drawn on, so this view must do the same.
+  // It previously put a LEFT sidebar first, on the grounds that it comes first
+  // in the DOM, and showed people a worse parse order than their own PDF has.
+  it('reads the main column before the sidebar in a two-column resume', () => {
+    expect(atsSectionOrder(['work', 'education'], ['skills'], true)).toEqual(['work', 'education', 'skills'])
+  })
+
+  it('ignores the sidebar entirely when the layout is single-column', () => {
+    expect(atsSectionOrder(['work'], ['skills'], false)).toEqual(['work'])
+  })
+})
+
+describe('resumeToAtsText prints a time span when the section asks for one', () => {
+  // The span is real text the shared date formatter appends, so the words a
+  // parser reads are the words on the page - and they are absent, not blank,
+  // for every section that never asked. Closed ranges only: an open one
+  // would read the calendar and the assertion would age.
+  const docWith = (sectionSettings: Record<string, unknown> = {}): ResumeDocument =>
+    ({
+      id: 'res-1',
+      title: 'T',
+      createdAt: 0,
+      updatedAt: 0,
+      content: {
+        basics: { name: 'Alex Morgan', profiles: [], location: {} },
+        work: [{ id: 'w1', name: 'Acme', position: 'Engineer', startDate: '2019-01', endDate: '2021-03', highlights: [] }],
+        education: [
+          {
+            id: 'e1',
+            institution: 'State University',
+            studyType: 'BSc',
+            area: 'Computer Science',
+            startDate: '2015-09',
+            endDate: '2019-06',
+            courses: [],
+          },
+        ],
+        projects: [],
+        skills: [],
+        languages: [],
+        certificates: [],
+        awards: [],
+        publications: [],
+        volunteer: [],
+        interests: [],
+        references: [],
+        custom: [],
+      },
+      metadata: MetadataSchema.parse({ layout: { main: ['work', 'education'], sectionSettings } }),
+    }) as unknown as ResumeDocument
+
+  it('appends the span to that section and leaves the others alone', () => {
+    const text = resumeToAtsText(docWith({ work: { showDuration: true } }))
+    expect(text).toContain('Jan 2019 — Mar 2021 (2 yrs 3 mos)')
+    expect(text).toContain('Sep 2015 — Jun 2019\n')
+    expect(text).not.toContain('(3 yrs 10 mos)')
+  })
+
+  it('prints no span by default, and none when the switch is off', () => {
+    expect(resumeToAtsText(docWith())).not.toContain('(')
+    expect(resumeToAtsText(docWith({ work: { showDuration: false } }))).not.toContain('(')
+  })
+})
+
+describe('resumeToAtsText prints dates the way the document formats them', () => {
+  // The month style, the separator, the present word and the language are
+  // one setting the shared formatter reads, so the text a parser sees is the
+  // text on the page. Ranges are closed and open (no span), so nothing here
+  // reads the calendar.
+  const docWith = (dates: Record<string, unknown> = {}): ResumeDocument =>
+    ({
+      id: 'res-1',
+      title: 'T',
+      createdAt: 0,
+      updatedAt: 0,
+      content: {
+        basics: { name: 'Alex Morgan', profiles: [], location: {} },
+        work: [
+          { id: 'w1', name: 'Acme', position: 'Engineer', startDate: '2019-01', endDate: '2021-03', highlights: [] },
+          { id: 'w2', name: 'Beta', position: 'Lead', startDate: '2021-04', endDate: '', highlights: [] },
+        ],
+        education: [],
+        projects: [],
+        skills: [],
+        languages: [],
+        certificates: [{ id: 'c1', name: 'Cloud Architect', issuer: 'Vendor', date: '2024-09' }],
+        awards: [],
+        publications: [],
+        volunteer: [],
+        interests: [],
+        references: [],
+        custom: [],
+      },
+      metadata: MetadataSchema.parse({ layout: { main: ['work', 'certificates'] }, dates }),
+    }) as unknown as ResumeDocument
+
+  it('reads as it always did when the document never chose', () => {
+    const text = resumeToAtsText(docWith())
+    expect(text).toContain('Jan 2019 — Mar 2021')
+    expect(text).toContain('Apr 2021 — Present')
+    expect(text).toContain('Sep 2024')
+  })
+
+  it('follows the month style, the separator and the present word', () => {
+    const text = resumeToAtsText(docWith({ month: 'long', separator: 'to', present: 'Current' }))
+    expect(text).toContain('January 2019 to March 2021')
+    expect(text).toContain('April 2021 to Current')
+    expect(text).toContain('September 2024')
+    expect(text).not.toContain('Present')
+  })
+
+  it('follows the language, single dates included', () => {
+    const text = resumeToAtsText(docWith({ month: 'long', language: 'de', separator: 'endash' }))
+    expect(text).toContain('Januar 2019 – März 2021')
+    expect(text).toContain('September 2024')
+  })
+})
+
+describe('resumeToAtsText leads each entry with the field the section leads with', () => {
+  // The page can put the organisation above the title in a section; the text
+  // a parser reads must list the two lines in the same order. Emphasis is
+  // ink, not words: which line is bold changes nothing here.
+  //
+  // The DATE rides the head row beside whichever field leads, because that is
+  // where the page draws it - at the far edge of the title's own row, with the
+  // organisation and the location on the row beneath. These expectations used
+  // to read title, organisation, date, which puts the employer where the file
+  // puts the date; against the exported text layer of all 67 designs that was
+  // eleven tokens out of sequence on every one of them.
+  const docWith = (sectionSettings: Record<string, unknown> = {}): ResumeDocument =>
+    ({
+      id: 'res-1',
+      title: 'T',
+      createdAt: 0,
+      updatedAt: 0,
+      content: {
+        basics: { name: 'Alex Morgan', profiles: [], location: {} },
+        work: [
+          { id: 'w1', name: 'Acme', position: 'Engineer', startDate: '2019-01', endDate: '2021-03', location: 'Austin', highlights: [] },
+        ],
+        education: [
+          { id: 'e1', institution: 'State University', studyType: 'BSc', area: 'Computer Science', startDate: '2015', endDate: '2019', courses: [] },
+        ],
+        projects: [],
+        skills: [],
+        languages: [],
+        certificates: [],
+        awards: [],
+        publications: [],
+        volunteer: [{ id: 'v1', organization: 'Food Bank', position: 'Driver', startDate: '2020', endDate: '2021', highlights: [] }],
+        interests: [],
+        references: [],
+        custom: [{ id: 'x1', name: 'Talks', items: [{ id: 'i1', name: 'Keynote', subtitle: 'DevConf', date: '2022', location: 'Berlin', highlights: [] }] }],
+      },
+      metadata: MetadataSchema.parse({ layout: { main: ['work', 'education', 'volunteer', 'custom-x1'], sectionSettings } }),
+    }) as unknown as ResumeDocument
+
+  it('title first by default: position, then company; degree, then school', () => {
+    const text = resumeToAtsText(docWith())
+    expect(text).toContain('Engineer  ·  Jan 2019 — Mar 2021\nAcme  ·  Austin')
+    expect(text).toContain('BSc, Computer Science  ·  2015 — 2019\nState University')
+    expect(text).toContain('Driver  ·  2020 — 2021\nFood Bank')
+    expect(text).toContain('Keynote  ·  2022\nDevConf  ·  Berlin')
+  })
+
+  it('organisation first swaps the two lines in that section, and in no other', () => {
+    const text = resumeToAtsText(docWith({ work: { entryOrder: 'org-first' }, custom: { entryOrder: 'org-first' } }))
+    expect(text).toContain('Acme  ·  Jan 2019 — Mar 2021\nEngineer  ·  Austin')
+    expect(text).toContain('BSc, Computer Science  ·  2015 — 2019\nState University')
+    expect(text).toContain('Driver  ·  2020 — 2021\nFood Bank')
+    // A custom section's settings are keyed by its own key, not by 'custom'.
+    expect(text).toContain('Keynote  ·  2022\nDevConf  ·  Berlin')
+    const each = resumeToAtsText(
+      docWith({ education: { entryOrder: 'org-first' }, volunteer: { entryOrder: 'org-first' }, 'custom-x1': { entryOrder: 'org-first' } }),
+    )
+    expect(each).toContain('State University  ·  2015 — 2019\nBSc, Computer Science')
+    expect(each).toContain('Food Bank  ·  2020 — 2021\nDriver')
+    expect(each).toContain('DevConf  ·  2022\nKeynote  ·  Berlin')
+  })
+
+  it('is byte-identical whichever line is bold', () => {
+    const stock = resumeToAtsText(docWith())
+    expect(resumeToAtsText(docWith({ work: { entryEmphasis: 'org' }, education: { entryEmphasis: 'org' } }))).toBe(stock)
+    const swapped = resumeToAtsText(docWith({ work: { entryOrder: 'org-first' } }))
+    expect(resumeToAtsText(docWith({ work: { entryOrder: 'org-first', entryEmphasis: 'org' } }))).toBe(swapped)
+  })
+})
+
+describe('resumeToAtsText follows the section on the meta line', () => {
+  // Which edge the date sits on is placement, and the text an ATS reads has
+  // no columns to place anything in, so it reads the same either way. Which
+  // of the two fields comes FIRST is not placement - the page and the Word
+  // file both lead with the location once it joins the date - so the text
+  // leads with it too, and the three surfaces name the pair in one order.
+  const docWith = (sectionSettings: Record<string, unknown> = {}): ResumeDocument =>
+    ({
+      id: 'res-1',
+      title: 'T',
+      createdAt: 0,
+      updatedAt: 0,
+      content: {
+        basics: { name: 'Alex Morgan', profiles: [], location: {} },
+        work: [
+          { id: 'w1', name: 'Acme', position: 'Engineer', startDate: '2019-01', endDate: '2021-03', location: 'Austin', highlights: [] },
+        ],
+        education: [
+          { id: 'e1', institution: 'State University', studyType: 'BSc', area: 'Computer Science', location: 'Boston', startDate: '2015', endDate: '2019', courses: [] },
+        ],
+        projects: [],
+        skills: [],
+        languages: [],
+        certificates: [],
+        awards: [],
+        publications: [],
+        volunteer: [],
+        interests: [],
+        references: [],
+        custom: [{ id: 'x1', name: 'Talks', items: [{ id: 'i1', name: 'Keynote', subtitle: 'DevConf', date: '2022', location: 'Berlin', highlights: [] }] }],
+      },
+      metadata: MetadataSchema.parse({ layout: { main: ['work', 'education', 'custom-x1'], sectionSettings } }),
+    }) as unknown as ResumeDocument
+
+  it('is byte-identical with the date moved to the left of the title', () => {
+    const stock = resumeToAtsText(docWith())
+    const moved = { dateAlign: 'left' }
+    expect(resumeToAtsText(docWith({ work: moved, education: moved, 'custom-x1': moved }))).toBe(stock)
+  })
+
+  it('keeps the location with the organisation while it sits on the sub-line', () => {
+    expect(resumeToAtsText(docWith())).toContain('Engineer  ·  Jan 2019 — Mar 2021\nAcme  ·  Austin')
+  })
+
+  it('moves the location up beside the date once the section prints it there', () => {
+    const text = resumeToAtsText(docWith({ work: { locationPlacement: 'with-date' } }))
+    expect(text).toContain('Engineer  ·  Austin  ·  Jan 2019 — Mar 2021\nAcme')
+  })
+})
+
+describe('atsSectionOrder reads the footer strip last', () => {
+  // The strip sits at the foot of the last page, so it is read after the
+  // main column and after the sidebar - and after the main column alone in a
+  // single-column resume, where the sidebar is folded away.
+  it('follows the sidebar in a two-column resume', () => {
+    expect(atsSectionOrder(['work'], ['skills'], true, ['languages'])).toEqual(['work', 'skills', 'languages'])
+  })
+
+  it('follows the main column in a single-column resume', () => {
+    expect(atsSectionOrder(['work'], ['skills'], false, ['languages'])).toEqual(['work', 'languages'])
+  })
+
+  it('reads as before when no strip is given', () => {
+    expect(atsSectionOrder(['work'], ['skills'], true)).toEqual(['work', 'skills'])
+  })
+})
+
+describe('resumeToAtsText reads the footer strip last', () => {
+  // A section moved to the footer strip leaves the main flow and the sidebar
+  // and is read after both, in the order the strip lists it: the text a
+  // parser reads follows the layout, footer last, and no section is dropped.
+  const at = (text: string, label: string) => text.lastIndexOf(`\n${label}\n=`)
+
+  it('lists footer sections last, after the sidebar', () => {
+    const doc = createDocument({ sample: true })
+    doc.metadata.layout.footer = ['skills', 'languages']
+    doc.metadata.layout.main = doc.metadata.layout.main.filter((k) => k !== 'skills' && k !== 'languages')
+    const { main, footer } = resolveOrder(doc)
+    expect(footer).toEqual(['skills', 'languages'])
+    expect(main).not.toContain('skills')
+    expect(main).not.toContain('languages')
+    const text = resumeToAtsText(doc)
+    expect(at(text, 'Education')).toBeGreaterThan(-1)
+    expect(at(text, 'Skills')).toBeGreaterThan(at(text, 'Education'))
+    expect(at(text, 'Languages')).toBeGreaterThan(at(text, 'Skills'))
+  })
+
+  it('reads a footer key once, last, even when the body lists it first', () => {
+    const doc = createDocument({ sample: true })
+    doc.metadata.layout.footer = ['skills']
+    doc.metadata.layout.main = ['skills', ...doc.metadata.layout.main.filter((k) => k !== 'skills')]
+    const text = resumeToAtsText(doc)
+    expect(text.indexOf('\nSkills\n=')).toBe(text.lastIndexOf('\nSkills\n='))
+    expect(at(text, 'Skills')).toBeGreaterThan(at(text, 'Education'))
+  })
+})
+
+/**
+ * A course that has not finished yet reaches the text a parser reads. Every
+ * surface formats its dates with the one shared formatter, so a graduation
+ * the page states as expected cannot be missing here - and an entry stored
+ * before the field existed has to serialize exactly as it always did.
+ */
+describe('resumeToAtsText prints a course still under way', () => {
+  const eduDoc = (over: Record<string, unknown> = {}): ResumeDocument =>
+    ({
+      id: 'res-2',
+      title: 'T',
+      createdAt: 0,
+      updatedAt: 0,
+      content: {
+        basics: { name: 'Priya Nair', profiles: [], location: {} },
+        work: [],
+        education: [
+          {
+            id: 'e1',
+            institution: 'Institute of Technology',
+            area: 'Computer Science',
+            studyType: 'Integrated M.Tech',
+            location: 'Hyderabad, India',
+            startDate: '2022-08',
+            endDate: '2027-05',
+            score: '8.9 CGPA',
+            url: '',
+            summary: '',
+            courses: [],
+            ...over,
+          },
+        ],
+        projects: [],
+        skills: [],
+        languages: [],
+        certificates: [],
+        awards: [],
+        publications: [],
+        volunteer: [],
+        interests: [],
+        references: [],
+        custom: [],
+      },
+      metadata: MetadataSchema.parse({ layout: { main: ['education'] } }),
+    }) as unknown as ResumeDocument
+
+  it('names a finish that has not happened as expected', () => {
+    expect(resumeToAtsText(eduDoc({ status: 'pursuing' }))).toContain('Expected May 2027')
+  })
+
+  it('reads a course with no finish date as one word', () => {
+    const text = resumeToAtsText(eduDoc({ status: 'pursuing', endDate: '' }))
+    expect(text).toContain('Pursuing')
+    expect(text).not.toContain('Present')
+  })
+
+  it('leaves a finished course exactly as it was', () => {
+    const text = resumeToAtsText(eduDoc({ startDate: '2019-09', endDate: '2023-05' }))
+    expect(text).toContain('Sep 2019 — May 2023')
+    expect(text).not.toContain('Expected')
+  })
+
+  it('is byte-identical whatever the entry\'s level says', () => {
+    // The level names the fields in the editor and nowhere else: it must not
+    // reach a single character a parser reads.
+    const plain = resumeToAtsText(eduDoc({ startDate: '2019-09', endDate: '2023-05' }))
+    for (const level of ['degree', 'diploma', 'intermediate', 'secondary', 'certificate']) {
+      expect(resumeToAtsText(eduDoc({ startDate: '2019-09', endDate: '2023-05', level }))).toBe(plain)
+    }
+  })
+})

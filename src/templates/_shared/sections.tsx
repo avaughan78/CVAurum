@@ -5,26 +5,93 @@
  * (<Ed>) and write straight back to the store; otherwise they render plain so
  * print/thumbnail stay clean.
  */
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode, type FocusEvent } from 'react'
+import { runItemDelete } from './itemActions'
+import { Fragment, lazy, Suspense, useEffect, useRef, useState, type ReactNode, type FocusEvent } from 'react'
 import { createPortal } from 'react-dom'
+import { Trash2, ChevronUp, ChevronDown } from 'lucide-react'
 import type { ResumeDocument } from '@/types/document'
 import type { TemplateConfig } from '@/types/template'
-import { formatDateRange, formatDate, htmlToText, safeHref } from '@/lib/utils'
-import { pushNewItem, ADD_LABEL } from '@/lib/sections'
-import { Chips, Dots, LevelBar, Stars, RichText, prettyUrl } from './atoms'
-import { Ed, type EditFn } from './Editable'
-import { CanvasDate } from './CanvasDate'
+import { currentYearMonth, entryDateOptions, formatDateRange, formatDate, htmlEscape, htmlToText, safeHref, sectionDateOptions, uid } from '@/lib/utils'
+import type { DateOptions, DateRangeOptions } from '@/lib/utils'
+import { pushNewItem, removeItem, moveItem, sectionHasContent, entryBadgeOn, metaColumnOn, ADD_LABEL } from '@/lib/sections'
+import { railLabel, type RailLabel } from '@/lib/rail'
+import { Chips, Deco, Dots, LevelBar, Stars, RichText, prettyUrl, linkWords, ringPath } from './atoms'
+import { Ed, type EditFn, type MetaEditFn } from './Editable'
+import { LinkButton } from './LinkButton'
+import { CanvasDate, type RailValue } from './CanvasDate'
 import { usePopoverA11y } from './popoverA11y'
+import { dateAlignOf, entryMetaOf, entryOrderOf, linkStyleOf, LOCATION_DATE_SEPARATOR } from './sectionClasses'
+import { keywordChunks } from '@/lib/keywordChunks'
+
+/**
+ * A keyword list where each term is its own element.
+ *
+ * Rendered as separate spans purely so a line break can be kept from falling
+ * inside a term - `keywordFit.ts` marks the ones that fit unbreakable. The
+ * text is character-for-character what `items.join(sep)` produced before, so
+ * everything downstream (copy, search, the exported text layer) is unchanged.
+ *
+ * The separator travels WITH the term before it, and only the space after it
+ * is left as a break opportunity. Otherwise a wrap can fall on the space in
+ * front of a separator and start the next line with it - measured on a real
+ * export, three lines began " . ", which reads as a bullet marker to anything
+ * parsing the text rather than as a list separator.
+ */
+/** The string a document puts between keywords. */
+const KEYWORD_SEPARATORS: Record<string, string> = {
+  middot: ' \u00b7 ',
+  comma: ', ',
+  pipe: ' | ',
+  slash: ' / ',
+  space: '  ',
+}
+export function keywordSep(doc: ResumeDocument): string {
+  return KEYWORD_SEPARATORS[doc.metadata.layout.keywordSeparator] ?? ' \u00b7 '
+}
+
+function KeywordList({ items, sep }: { items: string[]; sep: string }) {
+  const glued = sep.replace(/\s+$/, '')
+  return (
+    <>
+      {items.map((k, i) => {
+        const last = i === items.length - 1
+        // A term too wide to keep whole still must not break badly:
+        // keywordChunks decides which spaces inside it may take a line break,
+        // keeping the separator with the last word and a lone connector with
+        // the word it joins. Pieces rejoin with single spaces and reproduce
+        // the term exactly.
+        const pieces = keywordChunks(k, last ? '' : glued)
+        return (
+          <Fragment key={i}>
+            <span className="rm-kw">
+              {pieces.map((piece, pi) => (
+                <Fragment key={pi}>
+                  {pi > 0 ? ' ' : null}
+                  {piece.includes(' ') ? <span className="rm-kw-tail">{piece}</span> : piece}
+                </Fragment>
+              ))}
+            </span>
+            {last ? null : ' '}
+          </Fragment>
+        )
+      })}
+    </>
+  )
+}
 
 const has = (s?: string) => !!s && htmlToText(s).length > 0
 /** Any of these values carries real text? (strings or string arrays) */
 const anyText = (...vals: Array<string | string[] | undefined>) =>
-  vals.some((v) => (Array.isArray(v) ? v.some((x) => htmlToText(x).trim().length > 0) : !!v && htmlToText(v).trim().length > 0))
+  vals.some((v) =>
+    Array.isArray(v) ? v.some((x) => htmlToText(x).trim().length > 0) : !!v && htmlToText(v).trim().length > 0
+  )
 
 /** Per-section visibility + style overrides (undefined = shown / template default). */
 export type SecOpts = {
   showBullets?: boolean
   showDates?: boolean
+  /** End each date range with its length, "(2 yrs 3 mos)". Opt-in. */
+  showDuration?: boolean
   showLocation?: boolean
   showSummary?: boolean
   bulletStyle?: string
@@ -32,24 +99,174 @@ export type SecOpts = {
   showKeywords?: boolean
   headingStyle?: string
   skillsStyle?: string
+  /** How an entry's own keyword tags look (projects). */
+  tagStyle?: string
+  /** How an entry's visible URL line is drawn (projects); 'none' prints no
+   *  line at all (linkStyleOf reads it). */
+  linkStyle?: string
   entryLayout?: string
   showBadges?: boolean
   scoreStyle?: string
+  /** Which field leads an entry and which is bold (entryOrderOf reads them). */
+  entryOrder?: string
+  entryEmphasis?: string
+  /** Where the location prints and which edge the date sits on
+   *  (entryMetaOf reads them). */
+  locationPlacement?: string
+  dateAlign?: string
+  /** entry logo / letter-badge size and shape (the section's own overrides) */
+  badgeSize?: string
+  badgeShape?: string
+  /** Writes those two back. Present only in edit mode, and only when the
+   *  caller can reach section metadata - the canvas logo menu uses it so the
+   *  mark can be styled where it is seen, not only from the side panel. */
+  setBadge?: (key: 'badgeSize' | 'badgeShape', v: string) => void
+  /** Document-level, carried here because this bag is the channel that
+   *  reaches an entry row - the link card says whether the result will be
+   *  clickable, and it should not say so when the author turned that off. */
+  linksClickable?: boolean
+  /** Document-level too: how every date reads (month style, separator,
+   *  present word, language), handed to the shared formatter. */
+  dates?: DateOptions
+  /** Document-level: whether an entry hands its dates to a column of its
+   *  own - a gutter of decorative years on the left, or a margin holding
+   *  the real date on the right. 'none' anywhere it does not apply. */
+  metaColumn?: string
 }
 const show = (v?: boolean) => v !== false
+/** The section leads its entries with the organisation rather than the
+ *  title: the two fields swap slots, and both stay editable where they land.
+ *  Which one is bold is the stylesheet's (sec-emph-sub on the section). */
+const leadsWithOrg = (opts?: SecOpts) => entryOrderOf(opts).lead === 'org'
+/** The section puts an entry's location beside its date instead of on the
+ *  sub-line under the title. The field changes slot and stays editable
+ *  where it lands; which edge the date itself sits on is the stylesheet's. */
+const locBesideDate = (opts?: SecOpts) => entryMetaOf(opts).locWithDate
+/** Which column, if any, this section's entries hand their dates to. */
+const metaColumnOf = (opts?: SecOpts): 'none' | 'gutter' | 'margin' =>
+  opts?.metaColumn === 'gutter' || opts?.metaColumn === 'margin' ? opts.metaColumn : 'none'
+/** The four-digit year a stored date opens with ('2021-03' -> '2021'). */
+/**
+ * The gutter's cell for one entry: a big year over a short word, both drawn
+ * as ink only (the Deco atom). The entry's real date line stays where it
+ * always was, in the content column, so the year is never the only copy of
+ * a fact - a parser reads the date and never sees this.
+ *
+ * The label arrives already resolved (`railLabel`), so the defaults and the
+ * author's own overrides are decided in one pure place rather than here.
+ */
+function GutterCell({ rail, edit }: { rail: RailLabel; edit?: boolean }) {
+  // On the canvas the numerals are the thing an author reaches for when they
+  // want to change them, so the cell opens the entry's own date control -
+  // the popover that carries the Rail row (year and word) - by pressing the
+  // date button of the entry it belongs to. The numerals themselves stay
+  // decoration: editing text inside aria-hidden content is a trap for a
+  // screen reader, and the popover already has the two fields.
+  const open = (el: HTMLElement) => {
+    const button = el.closest('.rm-item')?.querySelector<HTMLButtonElement>('.rm-date-edit')
+    button?.click()
+  }
+  const editing = edit
+    ? {
+        role: 'button' as const,
+        tabIndex: 0,
+        title: 'Year and word on the rail — click to edit',
+        'aria-label': 'Edit the year and the word on the rail',
+        onClick: (e: React.MouseEvent<HTMLDivElement>) => open(e.currentTarget),
+        onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            open(e.currentTarget)
+          }
+        },
+      }
+    : {}
+  return (
+    <div className="rm-meta-cell" {...editing}>
+      <Deco className="rm-year">{rail.year}</Deco>
+      {rail.word ? <Deco className="rm-year-sub">{rail.word}</Deco> : null}
+    </div>
+  )
+}
 
 type Apply = (c: ResumeDocument['content'], v: string) => void
-/** A date range that's click-to-edit on the canvas (and plain text in print). */
-function rangeDate(edit: EditFn | undefined, visible: boolean, start: string, end: string, applyStart: Apply, applyEnd: Apply): ReactNode {
-  if (!visible) return undefined
-  if (!edit) return formatDateRange(start, end) || undefined
-  return <CanvasDate edit={edit} range start={start} end={end} applyStart={applyStart} applyEnd={applyEnd} />
+/**
+ * What the entry's date popover needs to offer the rail's two fields: which
+ * section decides the automatic word, how far along the entry is, what the
+ * author already stored, and where to write a change back. Built only where
+ * the rail is the document's date column - `on` carries that answer, so a
+ * template with no rail never shows the row.
+ */
+type RailCtl = {
+  on: boolean
+  sectionKey: string
+  status?: string
+  value?: RailValue
+  apply: (c: ResumeDocument['content'], rail: RailValue) => void
 }
-/** A single date that's click-to-edit on the canvas. */
-function singleDate(edit: EditFn | undefined, visible: boolean, date: string, applyDate: Apply): ReactNode {
+/** A date range that's click-to-edit on the canvas (and plain text in print). */
+function rangeDate(
+  edit: EditFn | undefined,
+  visible: boolean,
+  start: string,
+  end: string,
+  applyStart: Apply,
+  applyEnd: Apply,
+  dates?: DateRangeOptions,
+  rail?: RailCtl
+): ReactNode {
   if (!visible) return undefined
-  if (!edit) return date ? formatDate(date) : undefined
-  return <CanvasDate edit={edit} start={date} applyStart={applyDate} />
+  if (!edit) return formatDateRange(start, end, dates) || undefined
+  return (
+    <CanvasDate
+      edit={edit}
+      range
+      start={start}
+      end={end}
+      applyStart={applyStart}
+      applyEnd={applyEnd}
+      dateOpts={dates}
+      railOn={rail?.on}
+      rail={rail?.value}
+      applyRail={rail?.apply}
+      sectionKey={rail?.sectionKey}
+      status={rail?.status}
+    />
+  )
+}
+/** The document's date settings, plus the time span a section asked for,
+ *  read against this render's today. */
+const spanOpts = (opts?: SecOpts) => sectionDateOptions(opts, currentYearMonth(), opts?.dates)
+/** Those, plus how far along ONE entry is: a course still under way names
+ *  its finish as expected. The formatter is the shared one, so the string
+ *  the canvas shows is the string the PDF paints, the Word file writes and
+ *  the ATS text lists. */
+const progressOpts = (opts: SecOpts | undefined, status?: string) =>
+  entryDateOptions(spanOpts(opts), status, currentYearMonth())
+/** A single date that's click-to-edit on the canvas. */
+function singleDate(
+  edit: EditFn | undefined,
+  visible: boolean,
+  date: string,
+  applyDate: Apply,
+  dates?: DateOptions,
+  rail?: RailCtl
+): ReactNode {
+  if (!visible) return undefined
+  if (!edit) return date ? formatDate(date, dates) : undefined
+  return (
+    <CanvasDate
+      edit={edit}
+      start={date}
+      applyStart={applyDate}
+      dateOpts={dates}
+      railOn={rail?.on}
+      rail={rail?.value}
+      applyRail={rail?.apply}
+      sectionKey={rail?.sectionKey}
+      status={rail?.status}
+    />
+  )
 }
 
 type ProfStyle = 'dots' | 'bars' | 'stars' | 'text' | 'none'
@@ -62,6 +279,45 @@ function Proficiency({ rating, style }: { rating?: number; style: ProfStyle }) {
   return <Dots value={rating} />
 }
 
+/** A 0-5 level as the whole number a ring shows in its centre. */
+function ringPct(rating: number): number {
+  return Math.round((rating / 5) * 100)
+}
+
+/** A ring meter. The track and the arc are sibling svgs with one fill each,
+ *  set by CSS on the svg root, which is where the painter reads a fill. The
+ *  number in the middle is decoration a parser never sees; the label under
+ *  it is the skill's real name. A level of zero draws the track alone. */
+function Ring({
+  pct,
+  label,
+  id,
+  children,
+}: {
+  pct: number
+  label: ReactNode
+  id?: string
+  children?: ReactNode
+}) {
+  const r = 24
+  const size = 60
+  return (
+    <div className="rm-ring" data-item-id={id}>
+      <svg className="rm-ring-track" viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
+        <path d={ringPath(size / 2, size / 2, r, 0, 360)} />
+      </svg>
+      {pct > 0 ? (
+        <svg className="rm-ring-arc" viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
+          <path d={ringPath(size / 2, size / 2, r, 0, (pct / 100) * 360)} />
+        </svg>
+      ) : null}
+      <Deco className="rm-ring-value">{pct}</Deco>
+      {label}
+      {children}
+    </div>
+  )
+}
+
 function Bullets({
   items,
   edit,
@@ -69,6 +325,7 @@ function Bullets({
   onAdd,
   onRemove,
   onInsertAfter,
+  onInsertLines,
   onPruneEmpty,
 }: {
   items: string[]
@@ -77,11 +334,15 @@ function Bullets({
   onAdd?: () => void
   onRemove?: (bi: number) => void
   onInsertAfter?: (bi: number) => void
+  /** A list pasted into bullet `bi` becomes one bullet per line — after it, or
+   *  in its place when the bullet the paste landed in was still empty. */
+  onInsertLines?: (bi: number, lines: string[], replaceCurrent: boolean) => void
   onPruneEmpty?: () => void
 }) {
   const ulRef = useRef<HTMLUListElement>(null)
   const pendingFocus = useRef<number | null>(null)
   const deleting = useRef(false)
+  const pasting = useRef(false)
   useEffect(() => {
     if (pendingFocus.current == null || !ulRef.current) return
     const eds = ulRef.current.querySelectorAll<HTMLElement>('.rm-bullet-row .rm-editable')
@@ -94,7 +355,7 @@ function Bullets({
   // from the printed resume (breaking WYSIWYG). Skipped mid-delete so it can't
   // re-index a splice that's already in flight.
   const onListBlur = (e: FocusEvent<HTMLUListElement>) => {
-    if (!onPruneEmpty || deleting.current) return
+    if (!onPruneEmpty || deleting.current || pasting.current) return
     const next = e.relatedTarget as Node | null
     if (next && ulRef.current?.contains(next)) return
     if (items.some((h) => htmlToText(h).trim().length === 0)) onPruneEmpty()
@@ -122,7 +383,37 @@ function Bullets({
             edit={edit}
             value={h}
             rich
-            onEnter={onInsertAfter ? () => { pendingFocus.current = bi + 1; onInsertAfter(bi) } : undefined}
+            onEnter={
+              onInsertAfter
+                ? () => {
+                    pendingFocus.current = bi + 1
+                    onInsertAfter(bi)
+                  }
+                : undefined
+            }
+            onPasteLines={
+              onInsertLines
+                ? (lines) => {
+                    const empty = htmlToText(h).trim().length === 0
+                    pendingFocus.current = bi + lines.length - (empty ? 1 : 0)
+                    // Leave the pasted-into field BEFORE the list changes under
+                    // it. A focused editable is never rewritten from props (that
+                    // would eat the caret), so when the paste lands in an empty
+                    // bullet — the one the lines replace — the field keeps its
+                    // blank DOM, and the focus move below commits that blank
+                    // back over the first pasted line. Blurring first lets the
+                    // field take its new text; the guard stops the departure
+                    // from pruning the very bullet we are about to replace.
+                    const active = document.activeElement as HTMLElement | null
+                    if (active && ulRef.current?.contains(active)) {
+                      pasting.current = true
+                      active.blur()
+                      pasting.current = false
+                    }
+                    onInsertLines(bi, lines, empty)
+                  }
+                : undefined
+            }
             apply={(c, v) => setItem?.(c, bi, v)}
             placeholder="e.g. Cut deploy time 40% by automating the CI pipeline"
           />
@@ -156,7 +447,10 @@ function Bullets({
             type="button"
             className="rm-add-btn"
             onMouseDown={stop}
-            onClick={() => { pendingFocus.current = items.length; onAdd() }}
+            onClick={() => {
+              pendingFocus.current = items.length
+              onAdd()
+            }}
             title="Add a bullet"
           >
             + bullet
@@ -185,7 +479,73 @@ const LazyCropper = lazy(() => import('@/components/editor/ImageCropper').then((
  * through the same crop → downscale flow as the panel's logo picker, and the
  * result is a small local data URI — nothing ever leaves the device.
  */
-function CanvasLogo({ logo, badge, onChange }: { logo?: string; badge?: string; onChange: (v: string) => void }) {
+const MARK_SIZES = [
+  { v: '', label: 'Auto' },
+  { v: 's', label: 'S' },
+  { v: 'm', label: 'M' },
+  { v: 'l', label: 'L' },
+]
+const MARK_SHAPES = [
+  { v: '', label: 'Auto', title: 'Template default shape' },
+  { v: 'rounded', label: '▢', title: 'Rounded corners' },
+  { v: 'circle', label: '◯', title: 'Circle' },
+  { v: 'square', label: '□', title: 'Square' },
+]
+
+/** One row of the canvas mark menu: a label and its four small toggles. */
+function MarkRow({
+  label,
+  value,
+  options,
+  onPick,
+}: {
+  label: string
+  value?: string
+  options: { v: string; label: string; title?: string }[]
+  onPick: (v: string) => void
+}) {
+  return (
+    <div className="flex items-center gap-1 px-2 py-1">
+      <span className="w-9 shrink-0 text-[11px] text-muted-foreground">{label}</span>
+      <div className="grid flex-1 grid-cols-4 gap-1">
+        {options.map((o) => (
+          <button
+            key={o.v || 'auto'}
+            type="button"
+            role="menuitemradio"
+            aria-checked={(value ?? '') === o.v}
+            title={o.title || o.label}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onPick(o.v)}
+            className={`min-w-0 truncate rounded-md border px-1 py-1 text-[11px] font-medium transition ${
+              (value ?? '') === o.v
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border text-muted-foreground hover:border-primary/50 hover:text-foreground'
+            }`}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function CanvasLogo({
+  logo,
+  badge,
+  onChange,
+  size,
+  shape,
+  setBadge,
+}: {
+  logo?: string
+  badge?: string
+  onChange: (v: string) => void
+  size?: string
+  shape?: string
+  setBadge?: (key: 'badgeSize' | 'badgeShape', v: string) => void
+}) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [menu, setMenu] = useState<{ top: number; left: number } | null>(null)
   const [cropSrc, setCropSrc] = useState<string | null>(null)
@@ -193,7 +553,12 @@ function CanvasLogo({ logo, badge, onChange }: { logo?: string; badge?: string; 
   usePopoverA11y(menu != null, () => setMenu(null), menuRef)
 
   const pick = (file?: File) => {
-    if (!file || !file.type.startsWith('image/')) return
+    // Deliberately permissive about the TYPE. An .ai file is reported as
+    // application/postscript (or nothing at all), so this test dropped it in
+    // silence - the picker simply appeared to do nothing. The cropper decodes
+    // the file and says plainly when it cannot, which is the useful answer.
+    // Video and audio are still refused: nothing here can make sense of them.
+    if (!file || /^(video|audio)\//.test(file.type)) return
     const reader = new FileReader()
     reader.onload = () => setCropSrc(String(reader.result))
     reader.readAsDataURL(file)
@@ -210,9 +575,16 @@ function CanvasLogo({ logo, badge, onChange }: { logo?: string; badge?: string; 
 
   const onClick = (e: React.MouseEvent) => {
     e.stopPropagation()
-    if (logo) {
+    // A letter badge is just as stylable as an uploaded mark, so it opens the
+    // menu rather than jumping straight to the file picker - the picker is
+    // still one click away inside it. Only a genuinely empty slot (the hover
+    // "+ Logo" chip) skips ahead, where picking a file is the whole point.
+    if (logo || badge) {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-      setMenu({ top: Math.min(r.bottom + 6, window.innerHeight - 96), left: Math.max(8, Math.min(r.left, window.innerWidth - 176)) })
+      setMenu({
+        top: Math.min(r.bottom + 6, window.innerHeight - 240),
+        left: Math.max(8, Math.min(r.left, window.innerWidth - 248)),
+      })
     } else {
       inputRef.current?.click()
     }
@@ -232,58 +604,315 @@ function CanvasLogo({ logo, badge, onChange }: { logo?: string; badge?: string; 
         {logo ? (
           <img className="rm-item-logo" src={logo} alt="" aria-hidden />
         ) : badge ? (
-          <span className="rm-item-badge" aria-hidden>{badge}</span>
+          <span className="rm-item-badge" aria-hidden>
+            {badge}
+          </span>
         ) : (
-          <span className="rm-logo-add" aria-hidden>+ Logo</span>
+          <span className="rm-logo-add" aria-hidden>
+            + Logo
+          </span>
         )}
       </button>
-      <input ref={inputRef} type="file" accept="image/*" className="hidden" aria-label="Logo image" onChange={(e) => { pick(e.target.files?.[0] ?? undefined); e.target.value = '' }} />
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        aria-label="Logo image"
+        onChange={(e) => {
+          pick(e.target.files?.[0] ?? undefined)
+          e.target.value = ''
+        }}
+      />
       {menu &&
         createPortal(
           <>
             <div className="fixed inset-0 z-[60]" onClick={() => setMenu(null)} />
-            <div ref={menuRef} role="menu" aria-label="Logo options" tabIndex={-1} className="fixed z-[61] w-40 rounded-lg border border-border bg-surface p-1 text-foreground shadow-float" style={{ top: menu.top, left: menu.left }}>
-              <button type="button" role="menuitem" className="flex w-full items-center rounded-md px-2 py-1.5 text-sm hover:bg-muted" onClick={() => { setMenu(null); inputRef.current?.click() }}>
-                Replace logo
+            <div
+              ref={menuRef}
+              role="menu"
+              aria-label="Logo options"
+              tabIndex={-1}
+              className="fixed z-[61] w-56 rounded-lg border border-border bg-surface p-1 text-foreground shadow-float"
+              style={{ top: menu.top, left: menu.left }}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                className="flex w-full items-center rounded-md px-2 py-1.5 text-sm hover:bg-muted"
+                onClick={() => {
+                  setMenu(null)
+                  inputRef.current?.click()
+                }}
+              >
+                {logo ? 'Replace logo' : 'Add logo'}
               </button>
-              <button type="button" role="menuitem" className="flex w-full items-center rounded-md px-2 py-1.5 text-sm text-danger hover:bg-danger/10" onClick={() => { setMenu(null); onChange('') }}>
-                Remove logo
-              </button>
+              {logo ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="flex w-full items-center rounded-md px-2 py-1.5 text-sm text-danger hover:bg-danger/10"
+                  onClick={() => {
+                    setMenu(null)
+                    onChange('')
+                  }}
+                >
+                  Remove logo
+                </button>
+              ) : null}
+              {/* Size and shape live here because this is where the author is
+                  looking at the mark. They stay open while being tried, so a
+                  size can be compared against the page without reopening. */}
+              {setBadge ? (
+                <>
+                  <div className="my-1 border-t border-border" />
+                  <MarkRow label="Size" value={size} options={MARK_SIZES} onPick={(v) => setBadge('badgeSize', v)} />
+                  <MarkRow
+                    label="Shape"
+                    value={shape}
+                    options={MARK_SHAPES}
+                    onPick={(v) => setBadge('badgeShape', v)}
+                  />
+                  <p className="px-2 pb-1 pt-0.5 text-[10px] leading-snug text-muted-foreground">
+                    Applies to every entry in this section.
+                  </p>
+                </>
+              ) : null}
             </div>
           </>,
-          document.body,
+          document.body
         )}
       {cropSrc &&
         // Portaled OUT of .rm-root: inside it the dialog inherits the resume's
         // print ink color, which is illegible on the app's dark-mode surface.
         createPortal(
           <Suspense fallback={null}>
-            <LazyCropper src={cropSrc} onCancel={() => setCropSrc(null)} onSave={onCropSave} />
+            <LazyCropper kind="logo" src={cropSrc} onCancel={() => setCropSrc(null)} onSave={onCropSave} />
           </Suspense>,
-          document.body,
+          document.body
         )}
     </>
   )
 }
 
-function ItemHead({ title, date, badge, logo, edit, setLogo }: { title: ReactNode; date?: ReactNode; badge?: string; logo?: string; edit?: EditFn; setLogo?: Apply }) {
+/**
+ * Does this section print an entry's date at the end of its sub-line - the
+ * company line - rather than on the head row? Only where no date column has
+ * taken the date: a gutter or a margin column holds it already.
+ */
+function dateInSub(opts?: SecOpts): boolean {
+  return opts?.dateAlign === 'inline' && metaColumnOf(opts) === 'none'
+}
+
+/** The date, closing the sub-line after a middle dot. The dot is real text,
+ *  so the file reads "Vertex Labs · San Francisco · Mar 2021 - Present". */
+function SubDate({ children }: { children: ReactNode }) {
+  return (
+    <span className="rm-sub-date">
+      <span className="rm-meta-sep"> · </span>
+      {children}
+    </span>
+  )
+}
+
+function ItemHead({
+  title,
+  date,
+  loc,
+  rail,
+  badge,
+  logo,
+  edit,
+  setLogo,
+  href,
+  setHref,
+  linkLabel,
+  linkExtra,
+  opts,
+}: {
+  title: ReactNode
+  date?: ReactNode
+  /** The entry's location, when the section puts it beside the date rather
+   *  than on the sub-line under the title. Editable where it lands. */
+  loc?: ReactNode
+  /** The rail's label for this entry, already resolved - the numerals and
+   *  the word under them - or null when the entry has no year to stand on. */
+  rail?: RailLabel | null
+  badge?: string
+  logo?: string
+  edit?: EditFn
+  setLogo?: Apply
+  /** The section's own settings - the mark's size and shape, and the setter
+   *  the canvas menu writes them back through. */
+  opts?: SecOpts
+  href?: string
+  /** Present when this entry's link can be edited from the canvas. */
+  setHref?: (c: ResumeDocument['content'], v: string) => void
+  linkLabel?: string
+  /** Extra actions for this entry's link popover - a project uses it to add
+   *  a further named link, which has nowhere else to be created from. */
+  linkExtra?: ReactNode
+}) {
   // A real uploaded logo wins over the letter badge. Locally-encoded only —
   // remote URLs would break the zero-external-requests promise.
   const logoOk = logo && /^(data:image\/|blob:)/i.test(logo) ? logo : undefined
+  const column = metaColumnOf(opts)
+  // The margin takes the entry's own date - and the location, where the
+  // section put it beside the date - out of the head row. It is the same
+  // reading one column further right, and it must print exactly once, so
+  // the head row prints neither when the margin has them.
+  const inMargin = column === 'margin' && !!(date || loc)
+  // The cell is a SIBLING of the head row rather than something inside it:
+  // the stylesheet makes the entry itself the two-cell grid, so the cell has
+  // to be the entry's own child to land in the meta column.
+  // The gutter's year is the entry's own date said again, in ink. A section
+  // that switched its dates OFF hid that fact, and the gutter must not print
+  // it back: it is decoration, so no parser, Word file or ATS text could
+  // account for it. Same flag the date itself answers.
+  const cell =
+    column === 'gutter' && rail && show(opts?.showDates) ? (
+      <GutterCell rail={rail} edit={!!edit} />
+    ) : inMargin ? (
+      <div className="rm-meta-cell">
+        {loc}
+        {date}
+      </div>
+    ) : null
   return (
-    <div className="rm-item-head">
-      {edit && setLogo ? (
-        <CanvasLogo logo={logoOk} badge={badge} onChange={(v) => edit((c) => setLogo(c, v))} />
-      ) : logoOk ? (
-        <img className="rm-item-logo" src={logoOk} alt="" aria-hidden />
-      ) : badge ? (
-        <span className="rm-item-badge" aria-hidden>
-          {badge}
-        </span>
-      ) : null}
-      <div className="rm-item-title">{title}</div>
-      {date ? <div className="rm-item-date">{date}</div> : null}
-    </div>
+    <>
+      <div className="rm-item-head">
+        {edit && setLogo ? (
+          <CanvasLogo
+            logo={logoOk}
+            badge={badge}
+            onChange={(v) => edit((c) => setLogo(c, v))}
+            size={opts?.badgeSize}
+            shape={opts?.badgeShape}
+            setBadge={opts?.setBadge}
+          />
+        ) : logoOk ? (
+          <img className="rm-item-logo" src={logoOk} alt="" aria-hidden />
+        ) : badge ? (
+          <span className="rm-item-badge" aria-hidden>
+            {badge}
+          </span>
+        ) : null}
+        {/* An entry with a link makes its own TITLE the link, so the author gets
+            a hyperlink whose display text is whatever they wrote - rather than a
+            bare URL printed underneath it. The exporter turns any anchor into a
+            clickable region, so this is live in the PDF too. On the canvas the
+            click is swallowed: the title is being edited, not followed. */}
+        <div className="rm-item-title">
+          {href ? (
+            <a className="rm-title-link" href={href} onClick={edit ? (e) => e.preventDefault() : undefined}>
+              {title}
+            </a>
+          ) : (
+            title
+          )}
+          {edit && setHref ? (
+            <LinkButton
+              href={href}
+              label={linkLabel || 'this entry'}
+              text={linkLabel}
+              clickable={opts?.linksClickable !== false}
+              extra={linkExtra}
+              onChange={(v) => edit((c) => setHref(c, v))}
+            />
+          ) : null}
+        </div>
+        {/* The head row's right-hand slot. With the section placing the
+            location here it leads the date, and the glyph between them is real
+            text - marking it decoration would drop it from the exported text
+            layer and run "Austin, TX" straight into "Jan 2019". */}
+        {inMargin ? null : loc ? (
+          <div className="rm-item-date rm-item-meta">
+            {loc}
+            {date ? (
+              <>
+                <span className="rm-meta-sep">{LOCATION_DATE_SEPARATOR}</span>
+                {date}
+              </>
+            ) : null}
+          </div>
+        ) : date ? (
+          <div className="rm-item-date">{date}</div>
+        ) : null}
+      </div>
+      {cell}
+    </>
+  )
+}
+
+/**
+ * On-canvas item delete (edit mode only): a small ghost trash button that sits
+ * in the item's right gutter, revealed on hover/focus. Splices the item out via
+ * the SAME store mutation the side panel's Trash2 delete uses — see removeItem
+ * in lib/sections.ts — so there's one splice-by-id implementation, not two.
+ * Never rendered in print/thumbnail (no `edit` there).
+ */
+/**
+ * Move this entry up or down, on the canvas.
+ *
+ * Entries could be dragged in the side panel and nowhere else, so reordering
+ * meant leaving the document you were looking at. Buttons rather than drag:
+ * entries are stacked, a drag inside markup that is largely contentEditable
+ * fights text selection, and two buttons are reachable from the keyboard for
+ * free.
+ */
+function ItemMove({ edit, sectionKey, id, label }: { edit?: EditFn; sectionKey: string; id?: string; label: string }) {
+  if (!edit || !id) return null
+  const move = (delta: number) => edit((c) => moveItem(c, sectionKey, id, delta))
+  return (
+    <span className="rm-item-move no-print" contentEditable={false}>
+      <button
+        type="button"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => move(-1)}
+        aria-label={`Move ${label} earlier`}
+        title={`Move ${label} up`}
+      >
+        <ChevronUp />
+      </button>
+      <button
+        type="button"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => move(1)}
+        aria-label={`Move ${label} later`}
+        title={`Move ${label} down`}
+      >
+        <ChevronDown />
+      </button>
+    </span>
+  )
+}
+
+function ItemDelete({
+  edit,
+  sectionKey,
+  id,
+  label,
+}: {
+  edit?: EditFn
+  sectionKey: string
+  id?: string
+  label: string
+}) {
+  if (!edit || !id) return null
+  return (
+    <button
+      type="button"
+      className="rm-item-del no-print"
+      contentEditable={false}
+      onMouseDown={(e) => e.preventDefault()}
+      // In the editor: says what went, with an Undo right there
+      // (itemActions.ts, store/deleteItem.ts).
+      onClick={() => runItemDelete(edit, sectionKey, id)}
+      aria-label={`Remove ${label}`}
+      title={`Remove ${label}`}
+    >
+      <Trash2 />
+    </button>
   )
 }
 
@@ -292,6 +921,22 @@ function ItemHead({ title, date, badge, logo, edit, setLogo }: { title: ReactNod
  * each chip is editable text + an × to remove, with a "+" to add, blank chips
  * pruned when focus leaves. Without `edit` it renders plain, print-clean chips.
  */
+/** Drag payload naming the list a keyword came from, so another group can
+ *  adopt it. A plain text/plain drop stays an ordinary in-list move. */
+const KW_MIME = 'application/x-cvaurum-keyword'
+
+/**
+ * The keyword currently being dragged, shared by every list on the page.
+ *
+ * `dataTransfer` alone is not enough to carry this. Its payload is readable on
+ * DROP but not reliably on DRAGOVER, which is where a list has to decide
+ * whether to accept the drop at all - and automated drags populate it not at
+ * all, so the behaviour could not be tested. The transfer object is still
+ * filled in, because a drag that leaves the page entirely should still carry
+ * its text somewhere useful.
+ */
+let activeKeywordDrag: { listId: string; index: number; text: string } | null = null
+
 function EditableChips({
   items,
   edit,
@@ -301,6 +946,13 @@ function EditableChips({
   onPruneEmpty,
   addLabel = '+ skill',
   placeholder = 'Skill',
+  variant = 'chips',
+  sep,
+  lead = '',
+  className = '',
+  onMove,
+  listId,
+  onAdopt,
 }: {
   items: string[]
   edit?: EditFn
@@ -310,16 +962,54 @@ function EditableChips({
   onPruneEmpty?: () => void
   addLabel?: string
   placeholder?: string
+  /** Match the style the document actually uses, so the canvas shows what the
+   *  export will show. 'inline' renders the keywords as running text with the
+   *  same separator the preview uses. */
+  variant?: 'chips' | 'inline'
+  /** what separates the words when the list is only being read */
+  sep?: string
+  /** Text before the first keyword in the inline variant (the ": " after a
+   *  group name), so editing does not change the punctuation. */
+  lead?: string
+  /** Extra class on the list container, in every one of its three shapes -
+   *  the view chips, the view running text, and the editing surface. Carries
+   *  the section's chosen tag look (rm-tags-*), so the canvas, the print
+   *  sheet and the PDF (which paints computed styles) agree. */
+  className?: string
+  /** Move the keyword at `from` to `to`. Absent means this list cannot be
+   *  reordered, and no affordance is shown for it. */
+  onMove?: (from: number, to: number) => void
+  /** Identifies this list so a keyword can be dragged into a DIFFERENT one.
+   *  Absent means keywords stay inside their own list. */
+  listId?: string
+  /** Take the keyword `text`, which came from the list `fromId`, and put it at
+   *  `toIndex` in this one. The source list removes it itself. */
+  onAdopt?: (fromId: string, fromIndex: number, text: string, toIndex: number) => void
 }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const pendingFocus = useRef<number | null>(null)
   const deleting = useRef(false)
+  const [grabbed, setGrabbed] = useState<number | null>(null)
+  // Touch cannot drag (HTML5 drag never starts from a finger), so the grip
+  // picks a keyword up on a tap and the next tapped keyword takes it.
+  const [picked, setPicked] = useState<number | null>(null)
   useEffect(() => {
     if (pendingFocus.current == null || !wrapRef.current) return
     const eds = wrapRef.current.querySelectorAll<HTMLElement>('.rm-chip-edit .rm-editable')
     eds[pendingFocus.current]?.focus()
     pendingFocus.current = null
   })
+
+  // Reordering. A chip is draggable only while its HANDLE is held: the keyword
+  // itself is contentEditable, and a permanently draggable chip turns an
+  // ordinary attempt to select a word into a drag of the whole chip.
+  //
+  // Declared with the other hooks, ABOVE the read-only early return below.
+  // It used to sit after it, so this component ran six hooks while editing
+  // and five while not: switching the canvas into exact-preview threw
+  // "Rendered fewer hooks than expected" and took the whole editor route
+  // down with it, losing the open document.
+  const dragFrom = useRef<number | null>(null)
 
   const onWrapBlur = (e: FocusEvent<HTMLDivElement>) => {
     if (!onPruneEmpty || deleting.current) return
@@ -330,20 +1020,219 @@ function EditableChips({
 
   if (!edit) {
     const visible = items.filter((k) => (k || '').trim().length > 0)
-    return visible.length ? <Chips items={visible} /> : null
+    if (!visible.length) return null
+    return variant === 'inline' ? (
+      <span className={`rm-skill-inline${className ? ` ${className}` : ''}`}>
+        {lead}
+        <KeywordList items={visible} sep={sep ?? " · "} />
+      </span>
+    ) : (
+      <Chips items={visible} className={className} />
+    )
   }
 
   const stop = (e: { preventDefault: () => void }) => e.preventDefault()
+
+  /**
+   * Commit whatever is being edited BEFORE the list order changes.
+   *
+   * Each keyword is a contentEditable that only takes a new value from props
+   * while it is NOT focused. Move the list under a focused one and it keeps
+   * the text it was showing, then writes that text back at its new index on
+   * blur: reordering ["TypeScript", "Go"] produced ["Go", "Go"], losing a
+   * keyword outright. Blurring first makes the pending edit land on the index
+   * it was actually typed into.
+   */
+  const commitBeforeMove = () => {
+    const el = document.activeElement as HTMLElement | null
+    if (el && wrapRef.current?.contains(el)) el.blur()
+  }
+  const dragProps = (ki: number) =>
+    onMove
+      ? {
+          onDragStart: (e: React.DragEvent) => {
+            dragFrom.current = ki
+            e.dataTransfer.effectAllowed = 'move'
+            // Carries which LIST the keyword came from, so another group can
+            // adopt it. Firefox also needs a payload for the drag to start.
+            e.dataTransfer.setData('text/plain', items[ki] ?? '')
+            if (listId) {
+              const payload = { listId, index: ki, text: items[ki] ?? '' }
+              activeKeywordDrag = payload
+              e.dataTransfer.setData(KW_MIME, JSON.stringify(payload))
+            }
+          },
+          onDragOver: (e: React.DragEvent) => {
+            // A keyword from ANOTHER group is welcome even though this list did
+            // not start the drag, so the check cannot be "did I start it".
+            const foreign = !!onAdopt && !!activeKeywordDrag && activeKeywordDrag.listId !== listId
+            if (!foreign && (dragFrom.current === null || dragFrom.current === ki)) return
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'move'
+          },
+          onDrop: (e: React.DragEvent) => {
+            e.preventDefault()
+            const from = dragFrom.current
+            dragFrom.current = null
+            setGrabbed(null)
+            const dragged = activeKeywordDrag
+            activeKeywordDrag = null
+            if (onAdopt && dragged && dragged.listId !== listId) {
+              commitBeforeMove()
+              onAdopt(dragged.listId, dragged.index, dragged.text, ki)
+              return
+            }
+            if (from !== null && from !== ki) {
+              commitBeforeMove()
+              onMove(from, ki)
+            }
+          },
+          onDragEnd: () => {
+            dragFrom.current = null
+            activeKeywordDrag = null
+            setGrabbed(null)
+          },
+          // Alt+arrows do the same without a mouse, which is the only way a
+          // keyboard user can reorder at all.
+          onKeyDown: (e: React.KeyboardEvent) => {
+            // Alt+Arrow alone is the browser's Back and Forward, so the move
+            // shortcut takes Shift too.
+            if (!e.altKey || !e.shiftKey || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return
+            const to = e.key === 'ArrowLeft' ? ki - 1 : ki + 1
+            if (to < 0 || to >= items.length) return
+            e.preventDefault()
+            commitBeforeMove()
+            pendingFocus.current = to
+            onMove(ki, to)
+          },
+        }
+      : {}
+  const handle = (ki: number, k: string) =>
+    onMove ? (
+      <button
+        type="button"
+        className="rm-kw-grip no-print"
+        aria-label={`Reorder ${k || placeholder}. Hold Alt and Shift and press the left or right arrow key to move it.`}
+        title="Drag to reorder (or Alt + Shift + arrow keys)"
+        onMouseDown={() => setGrabbed(ki)}
+        onMouseUp={() => setGrabbed(null)}
+        onClick={() => {
+          if (!window.matchMedia?.('(pointer: coarse)').matches) return
+          setPicked((p) => (p === ki ? null : ki))
+        }}
+      >
+        &#10247;
+      </button>
+    ) : null
+
+  if (variant === 'inline') {
+    return (
+      <span
+        className={`rm-skill-inline rm-inline-edit${className ? ` ${className}` : ''}`}
+        ref={wrapRef as unknown as React.Ref<HTMLSpanElement>}
+        onBlur={onWrapBlur}
+      >
+        {lead}
+        {items.map((k, ki) => (
+          <span
+            key={ki}
+            className={`rm-kw-edit${picked === ki ? ' is-picked' : ''}`}
+            draggable={grabbed === ki}
+            {...dragProps(ki)}
+            onClickCapture={() => {
+              if (picked === null || picked === ki || !onMove) return
+              commitBeforeMove()
+              onMove(picked, ki)
+              setPicked(null)
+            }}
+          >
+            {ki > 0 ? <span className="rm-kw-sep"> · </span> : null}
+            {handle(ki, k)}
+            <Ed
+              edit={edit}
+              value={k}
+              apply={(c, v) => setItem?.(c, ki, v)}
+              placeholder={placeholder}
+              spellCheck={false}
+              onEnter={
+                onAdd
+                  ? () => {
+                      pendingFocus.current = items.length
+                      onAdd()
+                    }
+                  : undefined
+              }
+            />
+            {onRemove && (
+              <button
+                type="button"
+                className="rm-kw-x no-print"
+                aria-label={`Remove ${k || placeholder}`}
+                onMouseDown={(e) => {
+                  deleting.current = true
+                  stop(e)
+                }}
+                onClick={() => {
+                  // Blur first, as the pill list does: a focused keyword keeps
+                  // its own text and writes it back on blur, so removing it
+                  // while focused (a tap must focus it to reach this cross)
+                  // wrote "Go" over the word that took its place (measured).
+                  ;(document.activeElement as HTMLElement | null)?.blur()
+                  onRemove(ki)
+                  deleting.current = false
+                }}
+              >
+                ×
+              </button>
+            )}
+          </span>
+        ))}
+        {onAdd && (
+          <button
+            type="button"
+            className="rm-add-btn no-print"
+            onMouseDown={stop}
+            onClick={() => {
+              pendingFocus.current = items.length
+              onAdd()
+            }}
+          >
+            {addLabel}
+          </button>
+        )}
+      </span>
+    )
+  }
   return (
-    <div className="rm-chips rm-chips-edit" ref={wrapRef} onBlur={onWrapBlur}>
+    <div className={`rm-chips rm-chips-edit${className ? ` ${className}` : ''}`} ref={wrapRef} onBlur={onWrapBlur}>
       {items.map((k, ki) => (
-        <span key={ki} className="rm-chip rm-chip-edit">
+        <span
+          key={ki}
+          className={`rm-chip rm-chip-edit${picked === ki ? ' is-picked' : ''}`}
+          draggable={grabbed === ki}
+          {...dragProps(ki)}
+          onClickCapture={() => {
+            if (picked === null || picked === ki || !onMove) return
+            commitBeforeMove()
+            onMove(picked, ki)
+            setPicked(null)
+          }}
+        >
+          {handle(ki, k)}
           <Ed
             edit={edit}
             value={k}
             apply={(c, v) => setItem?.(c, ki, v)}
             placeholder={placeholder}
-            onEnter={onAdd ? () => { pendingFocus.current = items.length; onAdd() } : undefined}
+            spellCheck={false}
+            onEnter={
+              onAdd
+                ? () => {
+                    pendingFocus.current = items.length
+                    onAdd()
+                  }
+                : undefined
+            }
           />
           {onRemove && (
             <button
@@ -371,7 +1260,10 @@ function EditableChips({
           className="rm-add-btn no-print"
           contentEditable={false}
           onMouseDown={stop}
-          onClick={() => { pendingFocus.current = items.length; onAdd() }}
+          onClick={() => {
+            pendingFocus.current = items.length
+            onAdd()
+          }}
           title="Add a skill"
         >
           {addLabel}
@@ -383,57 +1275,197 @@ function EditableChips({
 
 /* --------------------------------------------------------------- renderers */
 
-function Summary({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
-  return (
+function Summary({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
+  const gutter = metaColumnOf(opts) === 'gutter'
+  const text = (
     <Ed
       edit={edit}
       value={doc.content.basics.summary ?? ''}
       rich
       multiline
       as="div"
-      className="rm-item"
-      apply={(c, v) => { c.basics.summary = v }}
+      className={gutter ? 'rm-summary-text' : 'rm-item'}
+      apply={(c, v) => {
+        c.basics.summary = v
+      }}
       placeholder="2–3 lines: who you are, your specialty, one standout win — e.g. “Data analyst, 4 yrs — built dashboards that cut reporting time 60%.”"
     />
   )
+  if (!gutter) return text
+  // The opening paragraph has no date, so the gutter stays EMPTY beside it.
+  // It used to be handed the author's initials, which printed a lettered
+  // block against the first paragraph that said nothing a reader could use
+  // (owner review, 2026-09-07). The entry wrapper stays, so the paragraph
+  // still starts on the text column's own left edge: the gutter rules put
+  // every child that is not the meta cell in the second column, and with no
+  // cell at all the first column is simply blank.
+  return <div className="rm-item">{text}</div>
 }
 
 function Work({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
+  // One reading of "now" for every entry in this section, so a render can
+  // never word one entry against a different today than the next.
+  const today = currentYearMonth()
   return (
     <>
       {doc.content.work.map((w, i) => {
         if (!edit && !anyText(w.position, w.name, w.summary, w.highlights)) return null
-        return (
-        <article className={`rm-item rm-keep${markClass(w.logo, opts?.showBadges ? badgeLetter(w.name || w.position) : undefined)}`} key={w.id}>
-          <ItemHead
-            badge={opts?.showBadges ? badgeLetter(w.name || w.position) : undefined}
-            logo={w.logo}
-            edit={edit}
-            setLogo={(c, v) => { c.work[i].logo = v }}
-            title={<Ed edit={edit} value={w.position} apply={(c, v) => { c.work[i].position = v }} placeholder="Job title — e.g. Product Manager" />}
-            date={rangeDate(edit, show(opts?.showDates), w.startDate, w.endDate, (c, v) => { c.work[i].startDate = v }, (c, v) => { c.work[i].endDate = v })}
-          />
-          <div className="rm-item-sub">
-            <Ed edit={edit} value={w.name} apply={(c, v) => { c.work[i].name = v }} className="rm-item-org" placeholder="Company — e.g. Acme Corp" />
-            {show(opts?.showLocation) && (edit || w.location) ? <Ed edit={edit} value={w.location} apply={(c, v) => { c.work[i].location = v }} className="rm-item-loc" placeholder="Location" /> : null}
-          </div>
-          {show(opts?.showSummary) && (has(w.summary) || edit) ? (
-            <div className="rm-item-summary">
-              <Ed edit={edit} value={w.summary} rich multiline as="div" apply={(c, v) => { c.work[i].summary = v }} placeholder="Brief role overview — scope, team, mission (optional)" />
-            </div>
-          ) : null}
-          {show(opts?.showBullets) ? (
-            <Bullets
-              items={w.highlights}
+        const orgFirst = leadsWithOrg(opts)
+        const withDate = locBesideDate(opts)
+        const place =
+          show(opts?.showLocation) && (edit || w.location) ? (
+            <Ed
               edit={edit}
-              setItem={(c, bi, v) => { c.work[i].highlights[bi] = v }}
-              onAdd={edit ? () => edit((c) => { c.work[i].highlights.push('') }) : undefined}
-              onRemove={edit ? (bi) => edit((c) => { c.work[i].highlights.splice(bi, 1) }) : undefined}
-              onInsertAfter={edit ? (bi) => edit((c) => { c.work[i].highlights.splice(bi + 1, 0, '') }) : undefined}
-              onPruneEmpty={edit ? () => edit((c) => { c.work[i].highlights = c.work[i].highlights.filter((h) => htmlToText(h).trim().length > 0) }) : undefined}
+              value={w.location}
+              apply={(c, v) => {
+                c.work[i].location = v
+              }}
+              className="rm-item-loc"
+              placeholder="Location"
             />
-          ) : null}
-        </article>
+          ) : null
+        const position = (className?: string) => (
+          <Ed
+            edit={edit}
+            value={w.position}
+            apply={(c, v) => {
+              c.work[i].position = v
+            }}
+            className={className}
+            placeholder="Job title — e.g. Product Manager"
+          />
+        )
+        const company = (className?: string) => (
+          <Ed
+            edit={edit}
+            value={w.name}
+            apply={(c, v) => {
+              c.work[i].name = v
+            }}
+            className={className}
+            placeholder="Company — e.g. Acme Corp"
+          />
+        )
+        // Resolved once: the head row draws it, unless the section puts
+        // dates at the end of the sub-line (dateAlign inline).
+        const when = rangeDate(
+          edit,
+          show(opts?.showDates),
+          w.startDate,
+          w.endDate,
+          (c, v) => {
+            c.work[i].startDate = v
+          },
+          (c, v) => {
+            c.work[i].endDate = v
+          },
+          spanOpts(opts),
+          {
+            on: metaColumnOf(opts) === 'gutter',
+            sectionKey: 'work',
+            value: w.rail,
+            apply: (c, r) => {
+              c.work[i].rail = r
+            },
+          }
+        )
+        return (
+          <article
+            className={`rm-item rm-keep${markClass(w.logo, entryBadgeOn(w, opts) ? badgeLetter(w.name || w.position) : undefined)}`}
+            key={w.id}
+            data-item-id={w.id}
+          >
+            <ItemHead
+              opts={opts}
+              badge={entryBadgeOn(w, opts) ? badgeLetter(w.name || w.position) : undefined}
+              href={safeHref(w.url)}
+              setHref={(c, val) => {
+                c.work[i].url = val
+              }}
+              linkLabel={w.position || w.name}
+              rail={railLabel('work', w, today)}
+              logo={w.logo}
+              edit={edit}
+              setLogo={(c, v) => {
+                c.work[i].logo = v
+              }}
+              title={orgFirst ? company() : position()}
+              loc={withDate ? place : undefined}
+              date={dateInSub(opts) ? undefined : when}
+            />
+            <div className="rm-item-sub">
+              {orgFirst ? position('rm-item-org') : company('rm-item-org')}
+              {withDate ? null : place}
+              {dateInSub(opts) && when ? <SubDate>{when}</SubDate> : null}
+            </div>
+            {show(opts?.showSummary) && (has(w.summary) || edit) ? (
+              <div className="rm-item-summary">
+                <Ed
+                  edit={edit}
+                  value={w.summary}
+                  rich
+                  multiline
+                  as="div"
+                  apply={(c, v) => {
+                    c.work[i].summary = v
+                  }}
+                  placeholder="Brief role overview — scope, team, mission (optional)"
+                />
+              </div>
+            ) : null}
+            {show(opts?.showBullets) ? (
+              <Bullets
+                items={w.highlights}
+                edit={edit}
+                setItem={(c, bi, v) => {
+                  c.work[i].highlights[bi] = v
+                }}
+                onAdd={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          c.work[i].highlights.push('')
+                        })
+                    : undefined
+                }
+                onRemove={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.work[i].highlights.splice(bi, 1)
+                        })
+                    : undefined
+                }
+                onInsertAfter={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.work[i].highlights.splice(bi + 1, 0, '')
+                        })
+                    : undefined
+                }
+                onInsertLines={
+                  edit
+                    ? (bi, lines, replace) =>
+                        edit((c) => {
+                          const safe = lines.map(htmlEscape)
+                          c.work[i].highlights.splice(replace ? bi : bi + 1, replace ? 1 : 0, ...safe)
+                        })
+                    : undefined
+                }
+                onPruneEmpty={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          c.work[i].highlights = c.work[i].highlights.filter((h) => htmlToText(h).trim().length > 0)
+                        })
+                    : undefined
+                }
+              />
+            ) : null}
+            <ItemMove edit={edit} sectionKey="work" id={w.id} label={ADD_LABEL.work} />
+            <ItemDelete edit={edit} sectionKey="work" id={w.id} label={ADD_LABEL.work} />
+          </article>
         )
       })}
     </>
@@ -441,41 +1473,164 @@ function Work({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: 
 }
 
 function Education({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
+  // One reading of "now" for every entry in this section, so a render can
+  // never word one entry against a different today than the next.
+  const today = currentYearMonth()
   return (
     <>
       {doc.content.education.map((e, i) => {
         if (!edit && !anyText(e.institution, e.area, e.studyType)) return null
-        const title = [e.studyType, e.area].filter(Boolean).join(', ') || e.institution
-        return (
-          <article className={`rm-item rm-keep${markClass(e.logo, opts?.showBadges ? badgeLetter(e.institution || e.area) : undefined)}`} key={e.id}>
-            <ItemHead
-            badge={opts?.showBadges ? badgeLetter(e.institution || e.area) : undefined}
-            logo={e.logo}
+        const degree = [e.studyType, e.area].filter(Boolean).join(', ')
+        const title = degree || e.institution
+        const orgFirst = leadsWithOrg(opts)
+        // Organisation first, in print, with no school typed: the head line
+        // would be empty while the degree sat in the sub-line under it. The
+        // head falls back to the degree, exactly as the title-first head
+        // already falls back to the institution, and the sub-line is then
+        // dropped so the degree is not printed twice. Edit mode keeps both
+        // fields where they land - each shows its own placeholder there, so
+        // there is no empty line to fall back from.
+        const headIsDegree = orgFirst && !edit && !e.institution && !!degree
+        const withDate = locBesideDate(opts)
+        const place =
+          show(opts?.showLocation) && (edit || e.location) ? (
+            <Ed
+              edit={edit}
+              value={e.location}
+              apply={(c, v) => {
+                c.education[i].location = v
+              }}
+              className="rm-item-loc"
+              placeholder="Location"
+            />
+          ) : null
+        // Degree + field are BOTH on the canvas (they both print) -
+        // hiding studyType here broke WYSIWYG and invited retyping
+        // the degree into the field box.
+        const degreeFields = edit ? (
+          <>
+            <Ed
+              edit={edit}
+              value={e.studyType}
+              apply={(c, v) => {
+                c.education[i].studyType = v
+              }}
+              placeholder="Degree — e.g. B.S."
+            />
+            <span aria-hidden>{', '}</span>
+            <Ed
+              edit={edit}
+              value={e.area}
+              apply={(c, v) => {
+                c.education[i].area = v
+              }}
+              placeholder="Field — e.g. Computer Science"
+            />
+          </>
+        ) : null
+        const school = (className?: string) => (
+          <Ed
             edit={edit}
-            setLogo={(c, v) => { c.education[i].logo = v }}
-              title={
-                edit ? (
-                  // Degree + field are BOTH on the canvas (they both print) —
-                  // hiding studyType here broke WYSIWYG and invited retyping
-                  // the degree into the field box.
-                  <>
-                    <Ed edit={edit} value={e.studyType} apply={(c, v) => { c.education[i].studyType = v }} placeholder="Degree — e.g. B.S." />
-                    <span aria-hidden>{', '}</span>
-                    <Ed edit={edit} value={e.area} apply={(c, v) => { c.education[i].area = v }} placeholder="Field — e.g. Computer Science" />
-                  </>
-                ) : (
-                  title
-                )
-              }
-              date={rangeDate(edit, show(opts?.showDates), e.startDate, e.endDate, (c, v) => { c.education[i].startDate = v }, (c, v) => { c.education[i].endDate = v })}
+            value={e.institution}
+            apply={(c, v) => {
+              c.education[i].institution = v
+            }}
+            className={className}
+            placeholder="School — e.g. State University"
+          />
+        )
+        // Resolved once: the head row draws it, unless the section puts
+        // dates at the end of the sub-line (dateAlign inline).
+        const when = rangeDate(
+          edit,
+          show(opts?.showDates),
+          e.startDate,
+          e.endDate,
+          (c, v) => {
+            c.education[i].startDate = v
+          },
+          (c, v) => {
+            c.education[i].endDate = v
+          },
+          progressOpts(opts, e.status),
+          {
+            on: metaColumnOf(opts) === 'gutter',
+            sectionKey: 'education',
+            status: e.status,
+            value: e.rail,
+            apply: (c, r) => {
+              c.education[i].rail = r
+            },
+          }
+        )
+        return (
+          <article
+            className={`rm-item rm-keep${markClass(e.logo, entryBadgeOn(e, opts) ? badgeLetter(e.institution || e.area) : undefined)}`}
+            key={e.id}
+            data-item-id={e.id}
+          >
+            <ItemHead
+              opts={opts}
+              badge={entryBadgeOn(e, opts) ? badgeLetter(e.institution || e.area) : undefined}
+              href={safeHref(e.url)}
+              setHref={(c, val) => {
+                c.education[i].url = val
+              }}
+              linkLabel={e.institution || e.area}
+              rail={railLabel('education', e, today)}
+              logo={e.logo}
+              edit={edit}
+              setLogo={(c, v) => {
+                c.education[i].logo = v
+              }}
+              title={orgFirst ? (headIsDegree ? degree : school()) : edit ? degreeFields : title}
+              loc={withDate ? place : undefined}
+              date={dateInSub(opts) ? undefined : when}
             />
             <div className="rm-item-sub">
-              <Ed edit={edit} value={e.institution} apply={(c, v) => { c.education[i].institution = v }} className="rm-item-org" placeholder="School — e.g. State University" />
-              {show(opts?.showLocation) && (edit || e.location) ? <Ed edit={edit} value={e.location} apply={(c, v) => { c.education[i].location = v }} className="rm-item-loc" placeholder="Location" /> : null}
-              {edit || e.score ? <Ed edit={edit} value={e.score} apply={(c, v) => { c.education[i].score = v }} className="rm-item-score" placeholder="GPA" /> : null}
+              {orgFirst ? (
+                // The degree pair under a leading school. Wrapped so the
+                // sub-line's org slot is one element, as it is for a company.
+                // Nothing here once the head line has taken the degree.
+                !headIsDegree && (edit || degree) ? (
+                  <span className="rm-item-org">{edit ? degreeFields : degree}</span>
+                ) : null
+              ) : (
+                school('rm-item-org')
+              )}
+              {withDate ? null : place}
+              {edit || e.score ? (
+                <Ed
+                  edit={edit}
+                  value={e.score}
+                  apply={(c, v) => {
+                    c.education[i].score = v
+                  }}
+                  className="rm-item-score"
+                  placeholder="GPA"
+                />
+              ) : null}
+              {dateInSub(opts) && when ? <SubDate>{when}</SubDate> : null}
             </div>
-            {has(e.summary) ? <RichText html={e.summary} /> : null}
-            {e.courses?.length ? <div className="rm-skill-inline">{e.courses.join(' · ')}</div> : null}
+            {has(e.summary) || edit ? (
+              <Ed
+                edit={edit}
+                value={e.summary ?? ''}
+                apply={(c, val) => {
+                  c.education[i].summary = val
+                }}
+                rich
+                multiline
+                placeholder="Summary"
+              />
+            ) : null}
+            {e.courses?.length ? (
+              <div className="rm-skill-inline">
+                <KeywordList items={e.courses} sep={keywordSep(doc)} />
+              </div>
+            ) : null}
+            <ItemMove edit={edit} sectionKey="education" id={e.id} label={ADD_LABEL.education} />
+            <ItemDelete edit={edit} sectionKey="education" id={e.id} label={ADD_LABEL.education} />
           </article>
         )
       })}
@@ -484,102 +1639,424 @@ function Education({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; op
 }
 
 function Projects({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
+  // One reading of "now" for every entry in this section, so a render can
+  // never word one entry against a different today than the next.
+  const today = currentYearMonth()
+  // How this section's entry tags look. Unset adds no class, so the chips the
+  // template draws stand. The branch is the skills renderer's own: 'inline'
+  // and 'stacked' both run the keywords together as text and differ only in
+  // whether that run takes a line of its own, and every other look reuses the
+  // chip markup restyled by CSS.
+  const tagClass = opts?.tagStyle ? `rm-tags-${opts.tagStyle}` : ''
+  const tagVariant = opts?.tagStyle === 'inline' || opts?.tagStyle === 'stacked' ? 'inline' : 'chips'
+  // How this section draws the URL line under a title. 'none' prints none at
+  // all - and the Word file and the ATS text drop the address with it, since
+  // they read the document. The title keeps its own link either way: that is
+  // where a project link is SET, so turning the line off is never a one-way
+  // door.
+  const linkMode = linkStyleOf(opts)
+  const linkClass = linkMode === 'tag' || linkMode === 'plain' ? ` rm-link-${linkMode}` : ''
   return (
     <>
       {doc.content.projects.map((p, i) => {
         if (!edit && !anyText(p.name, p.description, p.highlights)) return null
         return (
-        <article className={`rm-item rm-keep${markClass(undefined, opts?.showBadges ? badgeLetter(p.name) : undefined)}`} key={p.id}>
-          <ItemHead
-            badge={opts?.showBadges ? badgeLetter(p.name) : undefined}
-            title={edit ? <Ed edit={edit} value={p.name} apply={(c, v) => { c.projects[i].name = v }} placeholder="Project name" /> : safeHref(p.url) ? <a href={safeHref(p.url)}>{p.name}</a> : p.name}
-            date={rangeDate(edit, show(opts?.showDates), p.startDate, p.endDate, (c, v) => { c.projects[i].startDate = v }, (c, v) => { c.projects[i].endDate = v })}
-          />
-          {edit ? (
-            <div className="rm-item-link">
-              <Ed edit={edit} value={p.url} apply={(c, v) => { c.projects[i].url = v }} placeholder="Project link (e.g. github.com/you/project)" />
-            </div>
-          ) : p.url ? (
-            <div className="rm-item-link">{safeHref(p.url) ? <a href={safeHref(p.url)}>{prettyUrl(p.url)}</a> : prettyUrl(p.url)}</div>
-          ) : null}
-          {edit || p.description ? (
-            <div className="rm-item-summary">
-              <Ed edit={edit} value={p.description} apply={(c, v) => { c.projects[i].description = v }} placeholder="One-line description" />
-            </div>
-          ) : null}
-          {show(opts?.showBullets) ? (
-            <Bullets
-              items={p.highlights}
+          <article
+            className={`rm-item rm-keep${markClass(undefined, opts?.showBadges ? badgeLetter(p.name) : undefined)}`}
+            key={p.id}
+            data-item-id={p.id}
+          >
+            <ItemHead
+              opts={opts}
+              badge={opts?.showBadges ? badgeLetter(p.name) : undefined}
+              href={safeHref(p.url)}
+              setHref={(c, val) => {
+                c.projects[i].url = val
+              }}
+              linkLabel={p.name}
+              rail={railLabel('projects', p, today)}
+              linkExtra={
+                edit ? (
+                  <button
+                    type="button"
+                    className="mb-2 w-full rounded-md border border-border px-2 py-1 text-xs hover:bg-muted"
+                    onClick={() =>
+                      edit((c) => {
+                        const list = (c.projects[i].links ??= [])
+                        // Seeded with a name: a link with neither name nor
+                        // address does not render, so a blank one would be
+                        // created and then be unreachable.
+                        list.push({ id: uid(), label: 'Link', url: '' })
+                      })
+                    }
+                  >
+                    + Add another link
+                  </button>
+                ) : undefined
+              }
+              // Without this the head had no `edit`, so a project's title
+              // carried neither the link button nor the mark control - every
+              // other entry type had both. A project link could only be typed
+              // into the URL line underneath, which is the one place it should
+              // NOT have had to be.
               edit={edit}
-              setItem={(c, bi, v) => { c.projects[i].highlights[bi] = v }}
-              onAdd={edit ? () => edit((c) => { c.projects[i].highlights.push('') }) : undefined}
-              onRemove={edit ? (bi) => edit((c) => { c.projects[i].highlights.splice(bi, 1) }) : undefined}
-              onInsertAfter={edit ? (bi) => edit((c) => { c.projects[i].highlights.splice(bi + 1, 0, '') }) : undefined}
-              onPruneEmpty={edit ? () => edit((c) => { c.projects[i].highlights = c.projects[i].highlights.filter((h) => htmlToText(h).trim().length > 0) }) : undefined}
+              title={
+                edit ? (
+                  <Ed
+                    edit={edit}
+                    value={p.name}
+                    apply={(c, v) => {
+                      c.projects[i].name = v
+                    }}
+                    placeholder="Project name"
+                  />
+                ) : (
+                  p.name
+                )
+              }
+              date={rangeDate(
+                edit,
+                show(opts?.showDates),
+                p.startDate,
+                p.endDate,
+                (c, v) => {
+                  c.projects[i].startDate = v
+                },
+                (c, v) => {
+                  c.projects[i].endDate = v
+                },
+                spanOpts(opts),
+                {
+                  on: metaColumnOf(opts) === 'gutter',
+                  sectionKey: 'projects',
+                  value: p.rail,
+                  apply: (c, r) => {
+                    c.projects[i].rail = r
+                  },
+                }
+              )}
             />
-          ) : null}
-          {show(opts?.showKeywords) ? (
-            edit ? (
-              <EditableChips
-                items={p.keywords ?? []}
+            {/* The link line shows only when there IS a link. It used to be an
+                always-present empty slot in edit mode - a mystery field - and
+                it duplicated the title's own link editor, so two controls
+                wrote one value and each undid the other. The title's chain
+                button is where a project link is SET; this line displays it. */}
+            {p.url && linkMode !== 'none' ? (
+              <div className={`rm-item-link${linkClass}`}>
+                {/* Same words in both modes - the edit branch used to show the
+                    raw address while print showed the tidied one, which is up
+                    to a line-wrap of divergence. On the canvas the words are
+                    the control, like every other named link. */}
+                {edit ? (
+                  <LinkButton
+                    href={p.url}
+                    label={p.name || 'this project'}
+                    clickable={opts?.linksClickable !== false}
+                    renderTrigger={(open) => (
+                      <a
+                        className="rm-named-link rm-tag-link is-editable"
+                        href={safeHref(p.url)}
+                        role="button"
+                        tabIndex={0}
+                        title={`Edit this link: ${p.url}`}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            open(e)
+                          }
+                        }}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          open(e)
+                        }}
+                      >
+                        {prettyUrl(p.url, doc.metadata.links?.display)}
+                      </a>
+                    )}
+                    onChange={(v) =>
+                      edit((c) => {
+                        c.projects[i].url = v
+                      })
+                    }
+                    onRemove={() =>
+                      edit((c) => {
+                        c.projects[i].url = ''
+                      })
+                    }
+                  />
+                ) : safeHref(p.url) ? (
+                  <a className="rm-named-link rm-tag-link" href={safeHref(p.url)}>
+                    {prettyUrl(p.url, doc.metadata.links?.display)}
+                  </a>
+                ) : (
+                  <span className="rm-named-link rm-tag-link">{prettyUrl(p.url, doc.metadata.links?.display)}</span>
+                )}
+              </div>
+            ) : null}
+            {edit || p.description ? (
+              <div className="rm-item-summary">
+                <Ed
+                  edit={edit}
+                  value={p.description}
+                  apply={(c, v) => {
+                    c.projects[i].description = v
+                  }}
+                  rich
+                  placeholder="One-line description"
+                />
+              </div>
+            ) : null}
+            {/* Further named links, after the description: a repository, a demo,
+                a write-up. Printed as short NAMES rather than addresses, which
+                is how a reader scans them - three bare URLs on a line is noise.
+                The exporter turns any anchor into a clickable region, so these
+                are live in the PDF like every other link. */}
+            {(p.links ?? []).some((l) => (l.url || '').trim() || (l.label || '').trim()) ? (
+              <div className="rm-item-links">
+                {(p.links ?? [])
+                  .map((l, at) => ({ l, at }))
+                  .filter(({ l }) => (l.url || '').trim() || (l.label || '').trim())
+                  .map(({ l, at }, li) => {
+                    const shown = linkWords(l.url, l.label, 'short') || prettyUrl(l.url)
+                    const href = safeHref(l.url)
+                    return (
+                      <Fragment key={l.id ?? li}>
+                        {li > 0 ? (
+                          doc.metadata.links?.style === 'tag' ? (
+                            ' '
+                          ) : (
+                            <span className="rm-item-links-sep" aria-hidden> &middot; </span>
+                          )
+                        ) : null}
+                        {edit ? (
+                          // The WORD is the control. A chain button after each
+                          // name would sit in the line's flow, so the canvas
+                          // line would be wider than the printed one and could
+                          // wrap where print does not - and a tap target the
+                          // size of a glyph is no target at all on a phone.
+                          <LinkButton
+                            href={l.url}
+                            label={shown}
+                            text={l.label}
+                            clickable={opts?.linksClickable !== false}
+                            renderTrigger={(open) => (
+                              <a
+                                className="rm-named-link rm-tag-link is-editable"
+                                href={href || undefined}
+                                // A link that has a name but no address yet -
+                                // exactly what Add another link creates - is an
+                                // anchor with no href, which the keyboard
+                                // cannot reach at all. Made focusable in its
+                                // own right, and Space opens it as well as
+                                // Enter, which a bare anchor never does.
+                                role="button"
+                                tabIndex={0}
+                                title={`Edit this link${l.url ? `: ${l.url}` : ''}`}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault()
+                                    e.stopPropagation()
+                                    open(e)
+                                  }
+                                }}
+                                onClick={(e) => {
+                                  e.preventDefault()
+                                  open(e)
+                                }}
+                              >
+                                {shown}
+                              </a>
+                            )}
+                            onChange={(v) =>
+                              edit((c) => {
+                                const t = c.projects[i].links?.[at]
+                                if (t) t.url = v
+                              })
+                            }
+                            onText={(v) =>
+                              edit((c) => {
+                                const t = c.projects[i].links?.[at]
+                                if (t) t.label = v
+                              })
+                            }
+                            onRemove={() =>
+                              edit((c) => {
+                                c.projects[i].links?.splice(at, 1)
+                              })
+                            }
+                          />
+                        ) : href ? (
+                          <a className="rm-named-link rm-tag-link" href={href}>
+                            {shown}
+                          </a>
+                        ) : (
+                          <span className="rm-named-link rm-tag-link">{shown}</span>
+                        )}
+                      </Fragment>
+                    )
+                  })}
+              </div>
+            ) : null}
+
+            {show(opts?.showBullets) ? (
+              <Bullets
+                items={p.highlights}
                 edit={edit}
-                setItem={(c, ki, v) => { (c.projects[i].keywords ??= [])[ki] = v }}
-                onAdd={() => edit((c) => { (c.projects[i].keywords ??= []).push('') })}
-                onRemove={(ki) => edit((c) => { c.projects[i].keywords?.splice(ki, 1) })}
-                onPruneEmpty={() => edit((c) => { c.projects[i].keywords = (c.projects[i].keywords ?? []).filter((k) => (k || '').trim().length > 0) })}
-                addLabel="+ tag"
-                placeholder="Tech"
+                setItem={(c, bi, v) => {
+                  c.projects[i].highlights[bi] = v
+                }}
+                onAdd={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          c.projects[i].highlights.push('')
+                        })
+                    : undefined
+                }
+                onRemove={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.projects[i].highlights.splice(bi, 1)
+                        })
+                    : undefined
+                }
+                onInsertAfter={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.projects[i].highlights.splice(bi + 1, 0, '')
+                        })
+                    : undefined
+                }
+                onInsertLines={
+                  edit
+                    ? (bi, lines, replace) =>
+                        edit((c) => {
+                          const safe = lines.map(htmlEscape)
+                          c.projects[i].highlights.splice(replace ? bi : bi + 1, replace ? 1 : 0, ...safe)
+                        })
+                    : undefined
+                }
+                onPruneEmpty={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          c.projects[i].highlights = c.projects[i].highlights.filter(
+                            (h) => htmlToText(h).trim().length > 0
+                          )
+                        })
+                    : undefined
+                }
               />
-            ) : p.keywords?.length ? <Chips items={p.keywords} /> : null
-          ) : null}
-        </article>
+            ) : null}
+            {show(opts?.showKeywords) ? (
+              edit ? (
+                <EditableChips
+                  sep={keywordSep(doc)}
+                  items={p.keywords ?? []}
+                  edit={edit}
+                  setItem={(c, ki, v) => {
+                    ;(c.projects[i].keywords ??= [])[ki] = v
+                  }}
+                  onAdd={() =>
+                    edit((c) => {
+                      ;(c.projects[i].keywords ??= []).push('')
+                    })
+                  }
+                  onRemove={(ki) =>
+                    edit((c) => {
+                      c.projects[i].keywords?.splice(ki, 1)
+                    })
+                  }
+                  onPruneEmpty={() =>
+                    edit((c) => {
+                      c.projects[i].keywords = (c.projects[i].keywords ?? []).filter((k) => (k || '').trim().length > 0)
+                    })
+                  }
+                  addLabel="+ tag"
+                  placeholder="Tech"
+                  variant={tagVariant}
+                  className={tagClass}
+                />
+              ) : p.keywords?.length ? (
+                // The same component with no edit function: its view form IS
+                // the inline list the skills already print, so the running
+                // text is written once and read the same way in both places.
+                <EditableChips items={p.keywords} variant={tagVariant} className={tagClass} sep={keywordSep(doc)} />
+              ) : null
+            ) : null}
+            <ItemMove edit={edit} sectionKey="projects" id={p.id} label={ADD_LABEL.projects} />
+            <ItemDelete edit={edit} sectionKey="projects" id={p.id} label={ADD_LABEL.projects} />
+          </article>
         )
       })}
     </>
   )
 }
 
-function Skills({ doc, config, edit, opts }: { doc: ResumeDocument; config: TemplateConfig; edit?: EditFn; opts?: SecOpts }) {
-  // The user's per-section display choice wins over the template's default.
-  // tags/grid reuse the chips markup (distinct keyword elements) restyled by CSS.
-  const override = opts?.skillsStyle
-  const style = override ? (override === 'inline' ? 'inline' : 'chips') : config.skills
-  const prof = (opts?.meterStyle ?? doc.metadata.typography.proficiency) as ProfStyle
-  const meter = prof === 'dots' || prof === 'bars' || prof === 'stars'
+/**
+ * The footer strip's row form of the skills: one line per group, the name as
+ * a label and the keywords as a running list. No chips, no meters, whatever
+ * the section's own skills style says - the strip is compact by definition.
+ * On the canvas the label and the list are edited in place, and each row
+ * keeps the entry controls a skill group has anywhere else.
+ */
+function SkillsCompact({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
   return (
     <>
       {doc.content.skills.map((s, i) => {
-        const hasKeywords = s.keywords && s.keywords.length > 0
-        if (!hasKeywords && typeof s.rating === 'number' && meter) {
-          return (
-            <div className="rm-skill-group" key={s.id}>
-              <div className="rm-level">
-                <span className="rm-skill-group-name" style={{ minWidth: '40%' }}>{s.name}</span>
-                <Proficiency rating={s.rating} style={prof} />
-              </div>
-            </div>
-          )
-        }
-        const chipStyle = style === 'chips' || style === 'grouped-chips' || style === 'bars' || style === 'dots'
+        const hasKeywords = !!s.keywords?.length
+        if (!edit && !anyText(s.name) && !hasKeywords) return null
         return (
-          <div className="rm-skill-group" key={s.id}>
-            {s.name || edit ? <Ed edit={edit} value={s.name} apply={(c, v) => { c.skills[i].name = v }} className="rm-skill-group-name" placeholder="Category" /> : null}
-            {edit ? (
-              // Always editable on the canvas — add/edit/remove skills inline,
-              // regardless of the template's display style.
-              <EditableChips
-                items={s.keywords ?? []}
+          <div className="rm-footer-row rm-skill-group" key={s.id} data-item-id={s.id}>
+            {s.name || edit ? (
+              <Ed
                 edit={edit}
-                setItem={(c, ki, v) => { (c.skills[i].keywords ??= [])[ki] = v }}
-                onAdd={() => edit((c) => { (c.skills[i].keywords ??= []).push('') })}
-                onRemove={(ki) => edit((c) => { c.skills[i].keywords?.splice(ki, 1) })}
-                onPruneEmpty={() => edit((c) => { c.skills[i].keywords = (c.skills[i].keywords ?? []).filter((k) => (k || '').trim().length > 0) })}
+                value={s.name}
+                apply={(c, v) => {
+                  c.skills[i].name = v
+                }}
+                className="rm-footer-label"
+                placeholder="Category"
+                chunk
               />
-            ) : hasKeywords && chipStyle ? (
-              <Chips items={s.keywords!} />
-            ) : hasKeywords ? (
-              <span className="rm-skill-inline">{s.name ? ': ' : ''}{s.keywords!.join(' · ')}</span>
             ) : null}
+            {edit ? (
+              <span className="rm-footer-list">
+                <EditableChips
+                  sep={keywordSep(doc)}
+                  variant="inline"
+                  items={s.keywords ?? []}
+                  edit={edit}
+                  setItem={(c, ki, v) => {
+                    ;(c.skills[i].keywords ??= [])[ki] = v
+                  }}
+                  onAdd={() =>
+                    edit((c) => {
+                      ;(c.skills[i].keywords ??= []).push('')
+                    })
+                  }
+                  onRemove={(ki) =>
+                    edit((c) => {
+                      c.skills[i].keywords?.splice(ki, 1)
+                    })
+                  }
+                  onPruneEmpty={() =>
+                    edit((c) => {
+                      c.skills[i].keywords = (c.skills[i].keywords ?? []).filter((k) => (k || '').trim().length > 0)
+                    })
+                  }
+                />
+              </span>
+            ) : hasKeywords ? (
+              <span className="rm-footer-list">
+                <KeywordList items={s.keywords!} sep={keywordSep(doc)} />
+              </span>
+            ) : null}
+            <ItemMove edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+            <ItemDelete edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
           </div>
         )
       })}
@@ -587,90 +2064,904 @@ function Skills({ doc, config, edit, opts }: { doc: ResumeDocument; config: Temp
   )
 }
 
-function Languages({ doc, edit, opts }: { doc: ResumeDocument; config: TemplateConfig; edit?: EditFn; opts?: SecOpts }) {
+function Skills({
+  doc,
+  config,
+  edit,
+  opts,
+  compact,
+}: {
+  doc: ResumeDocument
+  config: TemplateConfig
+  edit?: EditFn
+  opts?: SecOpts
+  compact?: boolean
+}) {
+  // In the footer strip only the row form renders.
+  if (compact) return <SkillsCompact doc={doc} edit={edit} />
+  // The user's per-section display choice wins over the template's default.
+  // tags/grid reuse the chips markup (distinct keyword elements) restyled by CSS.
+  const override = opts?.skillsStyle
+  // 'inline' and 'stacked' both render the keyword LIST as running text; they
+  // differ only in whether that list starts after the group name or beneath
+  // it. Everything else reuses the chip markup, restyled by CSS.
+  const style = override ? (override === 'inline' || override === 'stacked' ? override : 'chips') : config.skills
   const prof = (opts?.meterStyle ?? doc.metadata.typography.proficiency) as ProfStyle
   const meter = prof === 'dots' || prof === 'bars' || prof === 'stars'
+  // Rings: every group with a level gets a ring, and the rings come first. A
+  // group that is only a name and a level lives in its ring; a category that
+  // also lists keywords keeps its chips below, with the ring as its meter, so
+  // nothing the author typed goes missing.
+  const rings = override === 'rings'
+  const ringed = rings ? doc.content.skills.filter((s) => typeof s.rating === 'number') : []
+  return (
+    <>
+      {ringed.length ? (
+        <div className="rm-rings">
+          {ringed.map((s) => {
+            const i = doc.content.skills.indexOf(s)
+            const alone = !(s.keywords && s.keywords.length > 0)
+            return (
+              <Ring
+                key={s.id}
+                id={alone ? s.id : undefined}
+                pct={ringPct(s.rating!)}
+                label={
+                  alone ? (
+                    <Ed
+                      edit={edit}
+                      value={s.name}
+                      apply={(c, v) => {
+                        c.skills[i].name = v
+                      }}
+                      className="rm-ring-label"
+                      placeholder="Skill"
+                      chunk
+                    />
+                  ) : (
+                    // The name is edited where the keywords are; the ring
+                    // follows it.
+                    <span className="rm-ring-label">{s.name}</span>
+                  )
+                }
+              >
+                {alone ? (
+                  <>
+                    <ItemMove edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+                    <ItemDelete edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+                  </>
+                ) : null}
+              </Ring>
+            )
+          })}
+        </div>
+      ) : null}
+      {doc.content.skills.map((s, i) => {
+        const hasKeywords = s.keywords && s.keywords.length > 0
+        const ringHere = rings && typeof s.rating === 'number'
+        if (ringHere && !hasKeywords) return null
+        if (!hasKeywords && typeof s.rating === 'number' && meter) {
+          return (
+            <div className="rm-skill-group" key={s.id} data-item-id={s.id}>
+              <div className="rm-level">
+                <span className="rm-skill-group-name">
+                  {/* Same chunking as a keyword: a group named "BI, Reporting
+                      & Visualisation" wrapped with "&" alone on a line. */}
+                  {keywordChunks(s.name || '', '').map((piece, pi) => (
+                    <Fragment key={pi}>
+                      {pi > 0 ? ' ' : null}
+                      {piece.includes(' ') ? <span className="rm-kw-tail">{piece}</span> : piece}
+                    </Fragment>
+                  ))}
+                </span>
+                <Proficiency rating={s.rating} style={prof} />
+              </div>
+              <ItemMove edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+              <ItemDelete edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+            </div>
+          )
+        }
+        const chipStyle = style === 'chips' || style === 'grouped-chips' || style === 'bars' || style === 'dots'
+        const stacked = style === 'stacked'
+        // A group can carry BOTH a rating and keywords (the common case: user
+        // sets a level in the side panel on a chip group). Meter still applies —
+        // it just gets the keywords rendered below it instead of standing alone.
+        // Under rings the ring above is that meter.
+        const showMeter = meter && typeof s.rating === 'number' && !ringHere
+        const nameEl =
+          s.name || edit ? (
+            <Ed
+              edit={edit}
+              value={s.name}
+              apply={(c, v) => {
+                c.skills[i].name = v
+              }}
+              className="rm-skill-group-name"
+              placeholder="Category"
+              chunk
+            />
+          ) : null
+        return (
+          <div className={`rm-skill-group${stacked ? ' rm-skill-stacked' : ''}`} key={s.id} data-item-id={s.id}>
+            {showMeter ? (
+              <div className="rm-level">
+                {nameEl}
+                <Proficiency rating={s.rating} style={prof} />
+              </div>
+            ) : (
+              nameEl
+            )}
+            {edit ? (
+              // The canvas renders the style the document actually uses, with
+              // the editing affordances laid over it. It used to render chips
+              // whatever the style was, so an inline list looked like pills
+              // while being edited and like running text everywhere else -
+              // the editing surface disagreeing with its own output.
+              <EditableChips
+                  sep={keywordSep(doc)}
+                variant={chipStyle ? 'chips' : 'inline'}
+                // The colon joins the name to the list; stacked puts the
+                // list on its own line, where a leading colon reads as a typo.
+                // So does a meter: it takes the rest of the name's row and
+                // the list opens the next line.
+                lead={!chipStyle && s.name && !stacked && !showMeter ? ': ' : ''}
+                items={s.keywords ?? []}
+                edit={edit}
+                setItem={(c, ki, v) => {
+                  ;(c.skills[i].keywords ??= [])[ki] = v
+                }}
+                onAdd={() =>
+                  edit((c) => {
+                    ;(c.skills[i].keywords ??= []).push('')
+                  })
+                }
+                onRemove={(ki) =>
+                  edit((c) => {
+                    c.skills[i].keywords?.splice(ki, 1)
+                  })
+                }
+                onPruneEmpty={() =>
+                  edit((c) => {
+                    c.skills[i].keywords = (c.skills[i].keywords ?? []).filter((k) => (k || '').trim().length > 0)
+                  })
+                }
+                onMove={(from, to) =>
+                  edit((c) => {
+                    const list = (c.skills[i].keywords ??= [])
+                    const [moved] = list.splice(from, 1)
+                    list.splice(to, 0, moved)
+                  })
+                }
+                listId={s.id}
+                onAdopt={(fromId, fromIndex, text, toIndex) =>
+                  edit((c) => {
+                    // Take it out of the group it came from and put it in this
+                    // one. Removing by INDEX and checking the text still matches:
+                    // the index is what the drag captured, and the text is what
+                    // proves the list has not changed under it.
+                    const src = c.skills.find((g) => g.id === fromId)
+                    if (!src?.keywords) return
+                    const at = src.keywords[fromIndex] === text ? fromIndex : src.keywords.indexOf(text)
+                    if (at < 0) return
+                    src.keywords.splice(at, 1)
+                    const dest = (c.skills[i].keywords ??= [])
+                    dest.splice(Math.min(toIndex, dest.length), 0, text)
+                  })
+                }
+              />
+            ) : hasKeywords && chipStyle ? (
+              <Chips items={s.keywords!} />
+            ) : hasKeywords ? (
+              <span className="rm-skill-inline">
+                {stacked || showMeter || !s.name ? '' : ': '}
+                <KeywordList items={s.keywords!} sep={keywordSep(doc)} />
+              </span>
+            ) : null}
+            <ItemMove edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+            <ItemDelete edit={edit} sectionKey="skills" id={s.id} label={ADD_LABEL.skills} />
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
+/**
+ * The footer strip's row form of the languages: one line, each language
+ * with its fluency in brackets, the rows joined by the same separator a
+ * keyword list uses. No meters here; the strip is a line of text. On the
+ * canvas each name and fluency is edited in place; adding and removing a
+ * language is the section's own "+ Add" row and the side panel.
+ */
+function LanguagesCompact({ doc, edit, prof }: { doc: ResumeDocument; edit?: EditFn; prof: ProfStyle }) {
+  const shown = doc.content.languages.filter((l) => edit || anyText(l.language))
+  if (!shown.length) return null
+  return (
+    <div className="rm-footer-row rm-mini">
+      <span className="rm-footer-list">
+        {shown.map((l, n) => {
+          const i = doc.content.languages.indexOf(l)
+          const fluency = prof !== 'none' && (edit || l.fluency)
+          return (
+            <Fragment key={l.id}>
+              {n > 0 ? <span className="rm-kw-sep"> · </span> : null}
+              <span className="rm-footer-lang">
+                <Ed
+                  edit={edit}
+                  value={l.language}
+                  apply={(c, v) => {
+                    c.languages[i].language = v
+                  }}
+                  className="rm-footer-lang-name"
+                  placeholder="Language"
+                />
+                {fluency ? (
+                  <span className="rm-footer-lang-sub">
+                    {' ('}
+                    <Ed
+                      edit={edit}
+                      value={l.fluency}
+                      apply={(c, v) => {
+                        c.languages[i].fluency = v
+                      }}
+                      placeholder="Fluency"
+                    />
+                    {')'}
+                  </span>
+                ) : null}
+              </span>
+            </Fragment>
+          )
+        })}
+      </span>
+    </div>
+  )
+}
+
+function Languages({
+  doc,
+  edit,
+  opts,
+  compact,
+}: {
+  doc: ResumeDocument
+  config: TemplateConfig
+  edit?: EditFn
+  opts?: SecOpts
+  compact?: boolean
+}) {
+  const prof = (opts?.meterStyle ?? doc.metadata.typography.proficiency) as ProfStyle
+  const meter = prof === 'dots' || prof === 'bars' || prof === 'stars'
+  // In the footer strip only the row form renders.
+  if (compact) return <LanguagesCompact doc={doc} edit={edit} prof={prof} />
   return (
     <>
       {doc.content.languages.map((l, i) => {
         if (!edit && !anyText(l.language)) return null
         return (
-        <div className="rm-mini" key={l.id}>
-          {meter && typeof l.rating === 'number' ? (
-            <div className="rm-level">
-              {edit ? (
-                <Ed edit={edit} value={l.language} apply={(c, v) => { c.languages[i].language = v }} className="rm-mini-title" placeholder="Language" />
-              ) : (
-                <span className="rm-mini-title" style={{ minWidth: '45%' }}>{l.language}</span>
-              )}
-              <Proficiency rating={l.rating} style={prof} />
-            </div>
-          ) : (
-            <div className="rm-item-head">
-              <Ed edit={edit} value={l.language} apply={(c, v) => { c.languages[i].language = v }} className="rm-mini-title" placeholder="Language" />
-              {prof !== 'none' && (edit || l.fluency) ? <Ed edit={edit} value={l.fluency} apply={(c, v) => { c.languages[i].fluency = v }} className="rm-mini-sub" placeholder="Fluency" /> : null}
-            </div>
-          )}
-        </div>
+          <div className="rm-mini" key={l.id} data-item-id={l.id}>
+            {meter && typeof l.rating === 'number' ? (
+              <div className="rm-level">
+                {edit ? (
+                  <Ed
+                    edit={edit}
+                    value={l.language}
+                    apply={(c, v) => {
+                      c.languages[i].language = v
+                    }}
+                    className="rm-mini-title"
+                    placeholder="Language"
+                  />
+                ) : (
+                  <span className="rm-mini-title">{l.language}</span>
+                )}
+                <Proficiency rating={l.rating} style={prof} />
+              </div>
+            ) : (
+              <div className="rm-item-head">
+                <Ed
+                  edit={edit}
+                  value={l.language}
+                  apply={(c, v) => {
+                    c.languages[i].language = v
+                  }}
+                  className="rm-mini-title"
+                  placeholder="Language"
+                />
+                {prof !== 'none' && (edit || l.fluency) ? (
+                  doc.metadata.layout.levelPlacement === 'line' ? (
+                    // On one line the level reads in brackets - real text, so
+                    // the file says "English (Professional)" as the page does.
+                    <span className="rm-mini-sub">
+                      (
+                      <Ed
+                        edit={edit}
+                        value={l.fluency}
+                        apply={(c, v) => {
+                          c.languages[i].fluency = v
+                        }}
+                        placeholder="Fluency"
+                      />
+                      )
+                    </span>
+                  ) : (
+                    <Ed
+                      edit={edit}
+                      value={l.fluency}
+                      apply={(c, v) => {
+                        c.languages[i].fluency = v
+                      }}
+                      className="rm-mini-sub"
+                      placeholder="Fluency"
+                    />
+                  )
+                ) : null}
+              </div>
+            )}
+            <ItemMove edit={edit} sectionKey="languages" id={l.id} label={ADD_LABEL.languages} />
+            <ItemDelete edit={edit} sectionKey="languages" id={l.id} label={ADD_LABEL.languages} />
+          </div>
         )
       })}
     </>
   )
 }
 
-function Certificates({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
+function Certificates({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
   return (
     <>
       {doc.content.certificates.map((cert, i) => {
         if (!edit && !anyText(cert.name, cert.issuer)) return null
+        // Locally-encoded only, like every logo here - a remote URL would
+        // break the zero-external-requests promise.
+        const logoOk = cert.logo && /^(data:image\/|blob:)/i.test(cert.logo) ? cert.logo : undefined
         return (
-        <div className="rm-mini" key={cert.id}>
-          <div className="rm-item-head">
-            <span className="rm-mini-title">{edit ? <Ed edit={edit} value={cert.name} apply={(c, v) => { c.certificates[i].name = v }} placeholder="Certificate" /> : safeHref(cert.url) ? <a href={safeHref(cert.url)}>{cert.name}</a> : cert.name}</span>
-            {edit || cert.date ? <span className="rm-item-date">{singleDate(edit, true, cert.date, (c, v) => { c.certificates[i].date = v })}</span> : null}
+          // The gutter exists only when the mark does - with edit alone it
+          // would be a canvas-only indent the print tree never has. The FIRST
+          // logo is born in the panel's Issuer logo picker; once it exists,
+          // the canvas badge is the full control.
+          <div className={`rm-mini${logoOk ? ' rm-has-mark' : ''}`} key={cert.id} data-item-id={cert.id}>
+            <div className="rm-item-head">
+              {/* The same mark anatomy an entry has: the badge hangs in its
+                  own left gutter, so the name and the issuer line share one
+                  text edge instead of the issuer diving under the logo -
+                  which is what made the first placement read as clutter
+                  (reported live, 2026-08-29). While editing it is the same
+                  CanvasLogo control entries use: change, crop, size, shape. */}
+              {edit ? (
+                // With no logo yet this is the same hover-revealed "+ Logo"
+                // chip an entry shows - absolute in the left margin, so the
+                // canvas item still measures exactly what prints. Click it
+                // and the picker, cropper and size/shape menu are all the
+                // entry's own machinery.
+                <CanvasLogo
+                  logo={logoOk}
+                  onChange={(v) =>
+                    edit((c) => {
+                      c.certificates[i].logo = v
+                    })
+                  }
+                  size={opts?.badgeSize}
+                  shape={opts?.badgeShape}
+                  setBadge={opts?.setBadge}
+                />
+              ) : logoOk ? (
+                <img className="rm-item-logo" src={logoOk} alt="" aria-hidden />
+              ) : null}
+              <span className="rm-mini-title">
+                {edit ? (
+                  <Ed
+                    edit={edit}
+                    value={cert.name}
+                    apply={(c, v) => {
+                      c.certificates[i].name = v
+                    }}
+                    placeholder="Certificate"
+                  />
+                ) : safeHref(cert.url) && !(cert.urlLabel || '').trim() ? (
+                  <a className="rm-title-link" href={safeHref(cert.url)}>
+                    {cert.name}
+                  </a>
+                ) : (
+                  cert.name
+                )}
+              </span>
+              {edit ? (
+                <LinkButton
+                  href={cert.url}
+                  label={cert.name || 'this certificate'}
+                  text={cert.urlLabel}
+                  clickable={opts?.linksClickable !== false}
+                  textPlaceholder='Verify - or leave empty to link the title'
+                  hint='The short word the line ends with, pointing at the credential.'
+                  onChange={(v) =>
+                    edit((c) => {
+                      c.certificates[i].url = v
+                    })
+                  }
+                  onText={(v) =>
+                    edit((c) => {
+                      c.certificates[i].urlLabel = v
+                    })
+                  }
+                  // Clearing the address takes the word with it. Leaving the
+                  // word behind meant a credential carrying a Verify it would
+                  // never print, waiting to reappear if an address came back.
+                  onRemove={() =>
+                    edit((c) => {
+                      c.certificates[i].url = ''
+                      c.certificates[i].urlLabel = ''
+                    })
+                  }
+                />
+              ) : null}
+              {!dateInSub(opts) && (edit || cert.date) ? (
+                <span className="rm-item-date">
+                  {singleDate(
+                    edit,
+                    true,
+                    cert.date,
+                    (c, v) => {
+                      c.certificates[i].date = v
+                    },
+                    opts?.dates
+                  )}
+                </span>
+              ) : null}
+            </div>
+            {/* The date closing the issuer line, when the section asks for
+                it there: "Amazon Web Services · Sep 2024". */}
+            {dateInSub(opts) ? (
+              edit || cert.issuer || cert.date ? (
+                <span className="rm-mini-sub">
+                  {edit || cert.issuer ? (
+                    <Ed
+                      edit={edit}
+                      value={cert.issuer}
+                      apply={(c, v) => {
+                        c.certificates[i].issuer = v
+                      }}
+                      placeholder="Issuer"
+                    />
+                  ) : null}
+                  {!(edit || cert.date) ? null : edit || cert.issuer ? (
+                    <SubDate>
+                      {singleDate(
+                        edit,
+                        true,
+                        cert.date,
+                        (c, v) => {
+                          c.certificates[i].date = v
+                        },
+                        opts?.dates
+                      )}
+                    </SubDate>
+                  ) : (
+                    <span className="rm-sub-date">
+                      {singleDate(
+                        edit,
+                        true,
+                        cert.date,
+                        (c, v) => {
+                          c.certificates[i].date = v
+                        },
+                        opts?.dates
+                      )}
+                    </span>
+                  )}
+                </span>
+              ) : null
+            ) : edit || cert.issuer ? (
+              <Ed
+                edit={edit}
+                value={cert.issuer}
+                apply={(c, v) => {
+                  c.certificates[i].issuer = v
+                }}
+                className="rm-mini-sub"
+                placeholder="Issuer"
+              />
+            ) : null}
+            {/* The short word a credential line ends with - Verify, Badge,
+                Credential. Named, so the reader sees a word rather than an
+                address, which is how the reference CV prints these. */}
+            {/* Shown on the canvas as well as in the export: gating it on
+                print alone meant the page promised something the author could
+                not see while editing it. The word itself is set in the panel,
+                so the click is swallowed here. */}
+            {(cert.urlLabel || '').trim() && safeHref(cert.url) ? (
+              <span className="rm-mini-verify">
+                {doc.metadata.links?.style === 'tag' ? (
+                  ' '
+                ) : (
+                  <span className="rm-mini-verify-sep" aria-hidden>
+                    {' | '}
+                  </span>
+                )}
+                {edit ? (
+                  // The word is the control here too, exactly as a project's
+                  // named links work: clicking Verify opens the card that owns
+                  // both the word and the address it stands for.
+                  <LinkButton
+                    href={cert.url}
+                    label={(cert.urlLabel || '').trim()}
+                    text={cert.urlLabel}
+                    clickable={opts?.linksClickable !== false}
+                    renderTrigger={(open) => (
+                      <a
+                        className="rm-named-link rm-tag-link rm-verify-link is-editable"
+                        href={safeHref(cert.url)}
+                        role="button"
+                        tabIndex={0}
+                        title={`Edit this link: ${cert.url}`}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            open(e)
+                          }
+                        }}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          open(e)
+                        }}
+                      >
+                        {(cert.urlLabel || '').trim()}
+                      </a>
+                    )}
+                    onChange={(v) =>
+                      edit((c) => {
+                        c.certificates[i].url = v
+                      })
+                    }
+                    onText={(v) =>
+                      edit((c) => {
+                        c.certificates[i].urlLabel = v
+                      })
+                    }
+                    onRemove={() =>
+                      edit((c) => {
+                        c.certificates[i].url = ''
+                        c.certificates[i].urlLabel = ''
+                      })
+                    }
+                  />
+                ) : (
+                  <a className="rm-named-link rm-tag-link rm-verify-link" href={safeHref(cert.url)}>
+                    {(cert.urlLabel || '').trim()}
+                  </a>
+                )}
+              </span>
+            ) : null}
+            <ItemMove edit={edit} sectionKey="certificates" id={cert.id} label={ADD_LABEL.certificates} />
+            <ItemDelete edit={edit} sectionKey="certificates" id={cert.id} label={ADD_LABEL.certificates} />
           </div>
-          {edit || cert.issuer ? <Ed edit={edit} value={cert.issuer} apply={(c, v) => { c.certificates[i].issuer = v }} className="rm-mini-sub" placeholder="Issuer" /> : null}
-        </div>
         )
       })}
     </>
   )
 }
 
-function Awards({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
+function Awards({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
   return (
     <>
       {doc.content.awards.map((a, i) => {
         if (!edit && !anyText(a.title, a.awarder, a.summary)) return null
         return (
-        <div className="rm-mini" key={a.id}>
-          <div className="rm-item-head">
-            <Ed edit={edit} value={a.title} apply={(c, v) => { c.awards[i].title = v }} className="rm-mini-title" placeholder="Award" />
-            {edit || a.date ? <span className="rm-item-date">{singleDate(edit, true, a.date, (c, v) => { c.awards[i].date = v })}</span> : null}
+          <div className="rm-mini" key={a.id} data-item-id={a.id}>
+            <div className="rm-item-head">
+              <span className="rm-mini-title">
+                {edit ? (
+                  <Ed
+                    edit={edit}
+                    value={a.title}
+                    apply={(c, v) => {
+                      c.awards[i].title = v
+                    }}
+                    placeholder="Award"
+                  />
+                ) : safeHref(a.url) && !(a.urlLabel || '').trim() ? (
+                  <a className="rm-title-link" href={safeHref(a.url)}>
+                    {a.title}
+                  </a>
+                ) : (
+                  a.title
+                )}
+              </span>
+                            {edit ? (
+                <LinkButton
+                  href={a.url}
+                  label={a.title || 'this award'}
+                  text={a.urlLabel}
+                  clickable={opts?.linksClickable !== false}
+                  textPlaceholder='Verify - or leave empty to link the title'
+                  hint='The short word the line ends with, pointing at the credential.'
+                  onChange={(v) =>
+                    edit((c) => {
+                      c.awards[i].url = v
+                    })
+                  }
+                  onText={(v) =>
+                    edit((c) => {
+                      c.awards[i].urlLabel = v
+                    })
+                  }
+                  // Clearing the address takes the word with it. Leaving the
+                  // word behind meant a credential carrying a Verify it would
+                  // never print, waiting to reappear if an address came back.
+                  onRemove={() =>
+                    edit((c) => {
+                      c.awards[i].url = ''
+                      c.awards[i].urlLabel = ''
+                    })
+                  }
+                />
+              ) : null}
+{!dateInSub(opts) && (edit || a.date) ? (
+                <span className="rm-item-date">
+                  {singleDate(
+                    edit,
+                    true,
+                    a.date,
+                    (c, v) => {
+                      c.awards[i].date = v
+                    },
+                    opts?.dates
+                  )}
+                </span>
+              ) : null}
+            </div>
+            {/* The date closing the awarder line, when the section asks for
+                it there: "Amazon Web Services · Sep 2024". */}
+            {dateInSub(opts) ? (
+              edit || a.awarder || a.date ? (
+                <span className="rm-mini-sub">
+                  {edit || a.awarder ? (
+                    <Ed
+                      edit={edit}
+                      value={a.awarder}
+                      apply={(c, v) => {
+                        c.awards[i].awarder = v
+                      }}
+                      placeholder="Awarder"
+                    />
+                  ) : null}
+                  {!(edit || a.date) ? null : edit || a.awarder ? (
+                    <SubDate>
+                      {singleDate(
+                        edit,
+                        true,
+                        a.date,
+                        (c, v) => {
+                          c.awards[i].date = v
+                        },
+                        opts?.dates
+                      )}
+                    </SubDate>
+                  ) : (
+                    <span className="rm-sub-date">
+                      {singleDate(
+                        edit,
+                        true,
+                        a.date,
+                        (c, v) => {
+                          c.awards[i].date = v
+                        },
+                        opts?.dates
+                      )}
+                    </span>
+                  )}
+                </span>
+              ) : null
+            ) : edit || a.awarder ? (
+              <Ed
+                edit={edit}
+                value={a.awarder}
+                apply={(c, v) => {
+                  c.awards[i].awarder = v
+                }}
+                className="rm-mini-sub"
+                placeholder="Awarder"
+              />
+            ) : null}
+            {/* Same short named link a credential line ends with, so an award
+                that can be checked reads the same way as a certificate. */}
+            {(a.urlLabel || '').trim() && safeHref(a.url) ? (
+              <span className="rm-mini-verify">
+                {doc.metadata.links?.style === 'tag' ? (
+                  ' '
+                ) : (
+                  <span className="rm-mini-verify-sep" aria-hidden>
+                    {' | '}
+                  </span>
+                )}
+                {edit ? (
+                  <LinkButton
+                    href={a.url}
+                    label={(a.urlLabel || '').trim()}
+                    text={a.urlLabel}
+                    clickable={opts?.linksClickable !== false}
+                    renderTrigger={(open) => (
+                      <a
+                        className="rm-named-link rm-tag-link rm-verify-link is-editable"
+                        href={safeHref(a.url)}
+                        role="button"
+                        tabIndex={0}
+                        title={`Edit this link: ${a.url}`}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            open(e)
+                          }
+                        }}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          open(e)
+                        }}
+                      >
+                        {(a.urlLabel || '').trim()}
+                      </a>
+                    )}
+                    onChange={(v) =>
+                      edit((c) => {
+                        c.awards[i].url = v
+                      })
+                    }
+                    onText={(v) =>
+                      edit((c) => {
+                        c.awards[i].urlLabel = v
+                      })
+                    }
+                    onRemove={() =>
+                      edit((c) => {
+                        c.awards[i].url = ''
+                        c.awards[i].urlLabel = ''
+                      })
+                    }
+                  />
+                ) : (
+                  <a className="rm-named-link rm-tag-link rm-verify-link" href={safeHref(a.url)}>
+                    {(a.urlLabel || '').trim()}
+                  </a>
+                )}
+              </span>
+            ) : null}
+            {has(a.summary) || edit ? (
+              <Ed
+                edit={edit}
+                value={a.summary ?? ''}
+                apply={(c, val) => {
+                  c.awards[i].summary = val
+                }}
+                rich
+                multiline
+                // The read-only page draws a description as its own block, so
+                // the canvas has to as well: left inline it ran on to the end
+                // of the awarder line ("Vertex LabsTop 2% of ...").
+                as="div"
+                placeholder="Summary"
+              />
+            ) : null}
+            <ItemMove edit={edit} sectionKey="awards" id={a.id} label={ADD_LABEL.awards} />
+            <ItemDelete edit={edit} sectionKey="awards" id={a.id} label={ADD_LABEL.awards} />
           </div>
-          {edit || a.awarder ? <Ed edit={edit} value={a.awarder} apply={(c, v) => { c.awards[i].awarder = v }} className="rm-mini-sub" placeholder="Awarder" /> : null}
-          {has(a.summary) ? <RichText html={a.summary} /> : null}
-        </div>
         )
       })}
     </>
   )
 }
 
-function Publications({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
+function Publications({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
   return (
     <>
       {doc.content.publications.map((p, i) => {
         if (!edit && !anyText(p.name, p.publisher, p.summary)) return null
         return (
-        <div className="rm-mini" key={p.id}>
-          <div className="rm-item-head">
-            <span className="rm-mini-title">{edit ? <Ed edit={edit} value={p.name} apply={(c, v) => { c.publications[i].name = v }} placeholder="Title" /> : safeHref(p.url) ? <a href={safeHref(p.url)}>{p.name}</a> : p.name}</span>
-            {edit || p.releaseDate ? <span className="rm-item-date">{singleDate(edit, true, p.releaseDate, (c, v) => { c.publications[i].releaseDate = v })}</span> : null}
+          <div className="rm-mini" key={p.id} data-item-id={p.id}>
+            <div className="rm-item-head">
+              <span className="rm-mini-title">
+                {edit ? (
+                  <Ed
+                    edit={edit}
+                    value={p.name}
+                    apply={(c, v) => {
+                      c.publications[i].name = v
+                    }}
+                    placeholder="Title"
+                  />
+                ) : safeHref(p.url) ? (
+                  <a className="rm-title-link" href={safeHref(p.url)}>
+                    {p.name}
+                  </a>
+                ) : (
+                  p.name
+                )}
+              </span>
+              {!dateInSub(opts) && (edit || p.releaseDate) ? (
+                <span className="rm-item-date">
+                  {singleDate(
+                    edit,
+                    true,
+                    p.releaseDate,
+                    (c, v) => {
+                      c.publications[i].releaseDate = v
+                    },
+                    opts?.dates
+                  )}
+                </span>
+              ) : null}
+            </div>
+            {/* The date closing the publisher line, when the section asks for
+                it there: "Amazon Web Services · Sep 2024". */}
+            {dateInSub(opts) ? (
+              edit || p.publisher || p.releaseDate ? (
+                <span className="rm-mini-sub">
+                  {edit || p.publisher ? (
+                    <Ed
+                      edit={edit}
+                      value={p.publisher}
+                      apply={(c, v) => {
+                        c.publications[i].publisher = v
+                      }}
+                      placeholder="Publisher"
+                    />
+                  ) : null}
+                  {!(edit || p.releaseDate) ? null : edit || p.publisher ? (
+                    <SubDate>
+                      {singleDate(
+                        edit,
+                        true,
+                        p.releaseDate,
+                        (c, v) => {
+                          c.publications[i].releaseDate = v
+                        },
+                        opts?.dates
+                      )}
+                    </SubDate>
+                  ) : (
+                    <span className="rm-sub-date">
+                      {singleDate(
+                        edit,
+                        true,
+                        p.releaseDate,
+                        (c, v) => {
+                          c.publications[i].releaseDate = v
+                        },
+                        opts?.dates
+                      )}
+                    </span>
+                  )}
+                </span>
+              ) : null
+            ) : edit || p.publisher ? (
+              <Ed
+                edit={edit}
+                value={p.publisher}
+                apply={(c, v) => {
+                  c.publications[i].publisher = v
+                }}
+                className="rm-mini-sub"
+                placeholder="Publisher"
+              />
+            ) : null}
+            {has(p.summary) || edit ? (
+              <Ed
+                edit={edit}
+                value={p.summary ?? ''}
+                apply={(c, val) => {
+                  c.publications[i].summary = val
+                }}
+                rich
+                multiline
+                // Same as an award: its own block, or it joins the publisher.
+                as="div"
+                placeholder="Summary"
+              />
+            ) : null}
+            <ItemMove edit={edit} sectionKey="publications" id={p.id} label={ADD_LABEL.publications} />
+            <ItemDelete edit={edit} sectionKey="publications" id={p.id} label={ADD_LABEL.publications} />
           </div>
-          {edit || p.publisher ? <Ed edit={edit} value={p.publisher} apply={(c, v) => { c.publications[i].publisher = v }} className="rm-mini-sub" placeholder="Publisher" /> : null}
-          {has(p.summary) ? <RichText html={p.summary} /> : null}
-        </div>
         )
       })}
     </>
@@ -678,38 +2969,155 @@ function Publications({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
 }
 
 function Volunteer({ doc, edit, opts }: { doc: ResumeDocument; edit?: EditFn; opts?: SecOpts }) {
+  // One reading of "now" for every entry in this section, so a render can
+  // never word one entry against a different today than the next.
+  const today = currentYearMonth()
   return (
     <>
       {doc.content.volunteer.map((v, i) => {
         if (!edit && !anyText(v.position, v.organization, v.summary, v.highlights)) return null
-        return (
-        <article className={`rm-item rm-keep${markClass(v.logo, opts?.showBadges ? badgeLetter(v.organization || v.position) : undefined)}`} key={v.id}>
-          <ItemHead
-            badge={opts?.showBadges ? badgeLetter(v.organization || v.position) : undefined}
-            logo={v.logo}
+        const orgFirst = leadsWithOrg(opts)
+        const role = (className?: string) => (
+          <Ed
             edit={edit}
-            setLogo={(c, val) => { c.volunteer[i].logo = val }}
-            title={<Ed edit={edit} value={v.position} apply={(c, val) => { c.volunteer[i].position = val }} placeholder="Role" />}
-            date={rangeDate(edit, show(opts?.showDates), v.startDate, v.endDate, (c, val) => { c.volunteer[i].startDate = val }, (c, val) => { c.volunteer[i].endDate = val })}
+            value={v.position}
+            apply={(c, val) => {
+              c.volunteer[i].position = val
+            }}
+            className={className}
+            placeholder="Role"
           />
-          {edit || v.organization ? (
-            <div className="rm-item-sub">
-              <Ed edit={edit} value={v.organization} apply={(c, val) => { c.volunteer[i].organization = val }} className="rm-item-org" placeholder="Organization" />
-            </div>
-          ) : null}
-          {has(v.summary) ? <RichText html={v.summary} /> : null}
-          {show(opts?.showBullets) ? (
-            <Bullets
-              items={v.highlights}
+        )
+        const org = (className?: string) => (
+          <Ed
+            edit={edit}
+            value={v.organization}
+            apply={(c, val) => {
+              c.volunteer[i].organization = val
+            }}
+            className={className}
+            placeholder="Organization"
+          />
+        )
+        // Resolved once: the head row draws it, unless the section puts
+        // dates at the end of the sub-line (dateAlign inline).
+        const when = rangeDate(
+          edit,
+          show(opts?.showDates),
+          v.startDate,
+          v.endDate,
+          (c, val) => {
+            c.volunteer[i].startDate = val
+          },
+          (c, val) => {
+            c.volunteer[i].endDate = val
+          },
+          spanOpts(opts),
+          {
+            on: metaColumnOf(opts) === 'gutter',
+            sectionKey: 'volunteer',
+            value: v.rail,
+            apply: (c, r) => {
+              c.volunteer[i].rail = r
+            },
+          }
+        )
+        return (
+          <article
+            className={`rm-item rm-keep${markClass(v.logo, entryBadgeOn(v, opts) ? badgeLetter(v.organization || v.position) : undefined)}`}
+            key={v.id}
+            data-item-id={v.id}
+          >
+            <ItemHead
+              opts={opts}
+              badge={entryBadgeOn(v, opts) ? badgeLetter(v.organization || v.position) : undefined}
+              href={safeHref(v.url)}
+              setHref={(c, val) => {
+                c.volunteer[i].url = val
+              }}
+              linkLabel={v.organization || v.position}
+              rail={railLabel('volunteer', v, today)}
+              logo={v.logo}
               edit={edit}
-              setItem={(c, bi, val) => { c.volunteer[i].highlights[bi] = val }}
-              onAdd={edit ? () => edit((c) => { c.volunteer[i].highlights.push('') }) : undefined}
-              onRemove={edit ? (bi) => edit((c) => { c.volunteer[i].highlights.splice(bi, 1) }) : undefined}
-              onInsertAfter={edit ? (bi) => edit((c) => { c.volunteer[i].highlights.splice(bi + 1, 0, '') }) : undefined}
-              onPruneEmpty={edit ? () => edit((c) => { c.volunteer[i].highlights = c.volunteer[i].highlights.filter((h) => htmlToText(h).trim().length > 0) }) : undefined}
+              setLogo={(c, val) => {
+                c.volunteer[i].logo = val
+              }}
+              title={orgFirst ? org() : role()}
+              date={dateInSub(opts) ? undefined : when}
             />
-          ) : null}
-        </article>
+            {edit || (orgFirst ? v.position : v.organization) || (dateInSub(opts) && when) ? (
+              <div className="rm-item-sub">
+                {orgFirst ? role('rm-item-org') : org('rm-item-org')}
+                {dateInSub(opts) && when ? <SubDate>{when}</SubDate> : null}
+              </div>
+            ) : null}
+            {has(v.summary) || edit ? (
+              <Ed
+                edit={edit}
+                value={v.summary ?? ''}
+                apply={(c, val) => {
+                  c.volunteer[i].summary = val
+                }}
+                rich
+                multiline
+                placeholder="Summary"
+              />
+            ) : null}
+            {show(opts?.showBullets) ? (
+              <Bullets
+                items={v.highlights}
+                edit={edit}
+                setItem={(c, bi, val) => {
+                  c.volunteer[i].highlights[bi] = val
+                }}
+                onAdd={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          c.volunteer[i].highlights.push('')
+                        })
+                    : undefined
+                }
+                onRemove={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.volunteer[i].highlights.splice(bi, 1)
+                        })
+                    : undefined
+                }
+                onInsertAfter={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.volunteer[i].highlights.splice(bi + 1, 0, '')
+                        })
+                    : undefined
+                }
+                onInsertLines={
+                  edit
+                    ? (bi, lines, replace) =>
+                        edit((c) => {
+                          const safe = lines.map(htmlEscape)
+                          c.volunteer[i].highlights.splice(replace ? bi : bi + 1, replace ? 1 : 0, ...safe)
+                        })
+                    : undefined
+                }
+                onPruneEmpty={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          c.volunteer[i].highlights = c.volunteer[i].highlights.filter(
+                            (h) => htmlToText(h).trim().length > 0
+                          )
+                        })
+                    : undefined
+                }
+              />
+            ) : null}
+            <ItemMove edit={edit} sectionKey="volunteer" id={v.id} label={ADD_LABEL.volunteer} />
+            <ItemDelete edit={edit} sectionKey="volunteer" id={v.id} label={ADD_LABEL.volunteer} />
+          </article>
         )
       })}
     </>
@@ -722,21 +3130,51 @@ function Interests({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
       {doc.content.interests.map((it, i) => {
         if (!edit && !anyText(it.name, it.keywords)) return null
         return (
-        <div className="rm-mini" key={it.id}>
-          <Ed edit={edit} value={it.name} apply={(c, v) => { c.interests[i].name = v }} className="rm-mini-title" placeholder="Interest" />
-          {edit ? (
-            <EditableChips
-              items={it.keywords ?? []}
+          <div className="rm-mini" key={it.id} data-item-id={it.id}>
+            <Ed
               edit={edit}
-              setItem={(c, ki, v) => { (c.interests[i].keywords ??= [])[ki] = v }}
-              onAdd={() => edit((c) => { (c.interests[i].keywords ??= []).push('') })}
-              onRemove={(ki) => edit((c) => { c.interests[i].keywords?.splice(ki, 1) })}
-              onPruneEmpty={() => edit((c) => { c.interests[i].keywords = (c.interests[i].keywords ?? []).filter((k) => (k || '').trim().length > 0) })}
-              addLabel="+ keyword"
-              placeholder="Keyword"
+              value={it.name}
+              apply={(c, v) => {
+                c.interests[i].name = v
+              }}
+              className="rm-mini-title"
+              placeholder="Interest"
             />
-          ) : it.keywords?.length ? <span className="rm-skill-inline"> — {it.keywords.join(', ')}</span> : null}
-        </div>
+            {edit ? (
+              <EditableChips
+                  sep={keywordSep(doc)}
+                items={it.keywords ?? []}
+                edit={edit}
+                setItem={(c, ki, v) => {
+                  ;(c.interests[i].keywords ??= [])[ki] = v
+                }}
+                onAdd={() =>
+                  edit((c) => {
+                    ;(c.interests[i].keywords ??= []).push('')
+                  })
+                }
+                onRemove={(ki) =>
+                  edit((c) => {
+                    c.interests[i].keywords?.splice(ki, 1)
+                  })
+                }
+                onPruneEmpty={() =>
+                  edit((c) => {
+                    c.interests[i].keywords = (c.interests[i].keywords ?? []).filter((k) => (k || '').trim().length > 0)
+                  })
+                }
+                addLabel="+ keyword"
+                placeholder="Keyword"
+              />
+            ) : it.keywords?.length ? (
+              <span className="rm-skill-inline">
+                {' '}
+                — <KeywordList items={it.keywords} sep=", " />
+              </span>
+            ) : null}
+            <ItemMove edit={edit} sectionKey="interests" id={it.id} label={ADD_LABEL.interests} />
+            <ItemDelete edit={edit} sectionKey="interests" id={it.id} label={ADD_LABEL.interests} />
+          </div>
         )
       })}
     </>
@@ -749,9 +3187,31 @@ function References({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
       {doc.content.references.map((r, i) => {
         if (!edit && !anyText(r.name, r.reference)) return null // blank rows never print
         return (
-          <div className="rm-mini" key={r.id}>
-            <Ed edit={edit} as="div" value={r.name} apply={(c, v) => { c.references[i].name = v }} className="rm-mini-title" placeholder="Name" />
-            {edit || r.reference ? <Ed edit={edit} as="div" value={r.reference} apply={(c, v) => { c.references[i].reference = v }} className="rm-mini-sub" placeholder="“Available on request”" /> : null}
+          <div className="rm-mini" key={r.id} data-item-id={r.id}>
+            <Ed
+              edit={edit}
+              as="div"
+              value={r.name}
+              apply={(c, v) => {
+                c.references[i].name = v
+              }}
+              className="rm-mini-title"
+              placeholder="Name"
+            />
+            {edit || r.reference ? (
+              <Ed
+                edit={edit}
+                as="div"
+                value={r.reference}
+                apply={(c, v) => {
+                  c.references[i].reference = v
+                }}
+                className="rm-mini-sub"
+                placeholder="“Available on request”"
+              />
+            ) : null}
+            <ItemMove edit={edit} sectionKey="references" id={r.id} label={ADD_LABEL.references} />
+            <ItemDelete edit={edit} sectionKey="references" id={r.id} label={ADD_LABEL.references} />
           </div>
         )
       })}
@@ -759,43 +3219,180 @@ function References({ doc, edit }: { doc: ResumeDocument; edit?: EditFn }) {
   )
 }
 
-function Custom({ doc, sectionKey, edit, opts }: { doc: ResumeDocument; sectionKey: string; edit?: EditFn; opts?: SecOpts }) {
+function Custom({
+  doc,
+  sectionKey,
+  edit,
+  opts,
+}: {
+  doc: ResumeDocument
+  sectionKey: string
+  edit?: EditFn
+  opts?: SecOpts
+}) {
   const id = sectionKey.slice('custom-'.length)
   const secIndex = doc.content.custom.findIndex((c) => c.id === id)
   const sec = doc.content.custom[secIndex]
   if (!sec) return null
+  // One reading of "now" for every entry in this section, so a render can
+  // never word one entry against a different today than the next.
+  const today = currentYearMonth()
   return (
     <>
       {sec.items.map((it, i) => {
         if (!edit && !anyText(it.name, it.subtitle, it.summary, it.highlights)) return null
-        return (
-        <article className="rm-item rm-keep" key={it.id}>
-          <ItemHead
-            badge={opts?.showBadges ? badgeLetter(it.name || it.subtitle) : undefined}
-            title={<Ed edit={edit} value={it.name} apply={(c, v) => { c.custom[secIndex].items[i].name = v }} placeholder="Title" />}
-            date={singleDate(edit, show(opts?.showDates), it.date ?? '', (c, v) => { c.custom[secIndex].items[i].date = v })}
-          />
-          {edit || it.subtitle || it.location ? (
-            <div className="rm-item-sub">
-              <Ed edit={edit} value={it.subtitle ?? ''} apply={(c, v) => { c.custom[secIndex].items[i].subtitle = v }} className="rm-item-org" placeholder="Subtitle" />
-              {show(opts?.showLocation) && (edit || it.location) ? <Ed edit={edit} value={it.location ?? ''} apply={(c, v) => { c.custom[secIndex].items[i].location = v }} className="rm-item-loc" placeholder="Location" /> : null}
-            </div>
-          ) : null}
-          {has(it.summary) ? (
-            <Ed edit={edit} value={it.summary ?? ''} rich multiline as="div" apply={(c, v) => { c.custom[secIndex].items[i].summary = v }} placeholder="Description" />
-          ) : null}
-          {show(opts?.showBullets) ? (
-            <Bullets
-              items={it.highlights ?? []}
+        // A custom entry's subtitle stands in for the organisation.
+        const orgFirst = leadsWithOrg(opts)
+        const withDate = locBesideDate(opts)
+        const place =
+          show(opts?.showLocation) && (edit || it.location) ? (
+            <Ed
               edit={edit}
-              setItem={(c, bi, v) => { c.custom[secIndex].items[i].highlights[bi] = v }}
-              onAdd={edit ? () => edit((c) => { (c.custom[secIndex].items[i].highlights ??= []).push('') }) : undefined}
-              onRemove={edit ? (bi) => edit((c) => { c.custom[secIndex].items[i].highlights?.splice(bi, 1) }) : undefined}
-              onInsertAfter={edit ? (bi) => edit((c) => { (c.custom[secIndex].items[i].highlights ??= []).splice(bi + 1, 0, '') }) : undefined}
-              onPruneEmpty={edit ? () => edit((c) => { const a = c.custom[secIndex].items[i].highlights; if (a) c.custom[secIndex].items[i].highlights = a.filter((h) => htmlToText(h).trim().length > 0) }) : undefined}
+              value={it.location ?? ''}
+              apply={(c, v) => {
+                c.custom[secIndex].items[i].location = v
+              }}
+              className="rm-item-loc"
+              placeholder="Location"
             />
-          ) : null}
-        </article>
+          ) : null
+        const name = (className?: string) => (
+          <Ed
+            edit={edit}
+            value={it.name}
+            apply={(c, v) => {
+              c.custom[secIndex].items[i].name = v
+            }}
+            className={className}
+            placeholder="Title"
+          />
+        )
+        const subtitle = (className?: string) => (
+          <Ed
+            edit={edit}
+            value={it.subtitle ?? ''}
+            apply={(c, v) => {
+              c.custom[secIndex].items[i].subtitle = v
+            }}
+            className={className}
+            placeholder="Subtitle"
+          />
+        )
+        // Resolved once: the head row draws it, unless the section puts
+        // dates at the end of the sub-line (dateAlign inline).
+        const when = singleDate(
+          edit,
+          show(opts?.showDates),
+          it.date ?? '',
+          (c, v) => {
+            c.custom[secIndex].items[i].date = v
+          },
+          opts?.dates,
+          {
+            on: metaColumnOf(opts) === 'gutter',
+            sectionKey: 'custom',
+            value: it.rail,
+            apply: (c, r) => {
+              c.custom[secIndex].items[i].rail = r
+            },
+          }
+        )
+        return (
+          <article className="rm-item rm-keep" key={it.id} data-item-id={it.id}>
+            <ItemHead
+              opts={opts}
+              badge={opts?.showBadges ? badgeLetter(it.name || it.subtitle) : undefined}
+              // A custom item carries a url like every other entry, so it gets
+              // the same link treatment rather than a field nothing could set.
+              href={safeHref(it.url)}
+              setHref={(c, val) => {
+                c.custom[secIndex].items[i].url = val
+              }}
+              linkLabel={it.name || it.subtitle}
+              rail={railLabel('custom', it, today)}
+              edit={edit}
+              title={orgFirst ? subtitle() : name()}
+              loc={withDate ? place : undefined}
+              date={dateInSub(opts) ? undefined : when}
+            />
+            {edit || (orgFirst ? it.name : it.subtitle) || (!withDate && it.location) || (dateInSub(opts) && when) ? (
+              <div className="rm-item-sub">
+                {orgFirst ? name('rm-item-org') : subtitle('rm-item-org')}
+                {withDate ? null : place}
+                {dateInSub(opts) && when ? <SubDate>{when}</SubDate> : null}
+              </div>
+            ) : null}
+            {has(it.summary) ? (
+              <Ed
+                edit={edit}
+                value={it.summary ?? ''}
+                rich
+                multiline
+                as="div"
+                apply={(c, v) => {
+                  c.custom[secIndex].items[i].summary = v
+                }}
+                placeholder="Description"
+              />
+            ) : null}
+            {show(opts?.showBullets) ? (
+              <Bullets
+                items={it.highlights ?? []}
+                edit={edit}
+                setItem={(c, bi, v) => {
+                  c.custom[secIndex].items[i].highlights[bi] = v
+                }}
+                onAdd={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          ;(c.custom[secIndex].items[i].highlights ??= []).push('')
+                        })
+                    : undefined
+                }
+                onRemove={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          c.custom[secIndex].items[i].highlights?.splice(bi, 1)
+                        })
+                    : undefined
+                }
+                onInsertAfter={
+                  edit
+                    ? (bi) =>
+                        edit((c) => {
+                          ;(c.custom[secIndex].items[i].highlights ??= []).splice(bi + 1, 0, '')
+                        })
+                    : undefined
+                }
+                onInsertLines={
+                  edit
+                    ? (bi, lines, replace) =>
+                        edit((c) => {
+                          const safe = lines.map(htmlEscape)
+                          ;(c.custom[secIndex].items[i].highlights ??= []).splice(
+                            replace ? bi : bi + 1,
+                            replace ? 1 : 0,
+                            ...safe
+                          )
+                        })
+                    : undefined
+                }
+                onPruneEmpty={
+                  edit
+                    ? () =>
+                        edit((c) => {
+                          const a = c.custom[secIndex].items[i].highlights
+                          if (a)
+                            c.custom[secIndex].items[i].highlights = a.filter((h) => htmlToText(h).trim().length > 0)
+                        })
+                    : undefined
+                }
+              />
+            ) : null}
+            <ItemDelete edit={edit} sectionKey={sectionKey} id={it.id} label={ADD_LABEL[sectionKey] ?? 'entry'} />
+          </article>
         )
       })}
     </>
@@ -821,10 +3418,29 @@ function AddEntry({ sectionKey, edit }: { sectionKey: string; edit: EditFn }) {
   )
 }
 
-function sectionRenderer(sectionKey: string, doc: ResumeDocument, config: TemplateConfig, edit?: EditFn, opts?: SecOpts): ReactNode {
+/** Discoverability hint under a section that hasn't got real content yet — the
+ *  ghost placeholder text (Title, Publisher, …) looks like a normal entry, so
+ *  this makes clear it's not what will show up in the exported PDF. Canvas-only,
+ *  one muted line, never affects layout in print/thumbnail (no `edit` there). */
+function EmptyHint() {
+  return (
+    <p className="rm-empty-hint no-print" contentEditable={false}>
+      Empty sections are not exported
+    </p>
+  )
+}
+
+function sectionRenderer(
+  sectionKey: string,
+  doc: ResumeDocument,
+  config: TemplateConfig,
+  edit?: EditFn,
+  opts?: SecOpts,
+  compact?: boolean
+): ReactNode {
   switch (sectionKey) {
     case 'summary':
-      return <Summary doc={doc} edit={edit} />
+      return <Summary doc={doc} edit={edit} opts={opts} />
     case 'work':
       return <Work doc={doc} edit={edit} opts={opts} />
     case 'education':
@@ -832,15 +3448,15 @@ function sectionRenderer(sectionKey: string, doc: ResumeDocument, config: Templa
     case 'projects':
       return <Projects doc={doc} edit={edit} opts={opts} />
     case 'skills':
-      return <Skills doc={doc} config={config} edit={edit} opts={opts} />
+      return <Skills doc={doc} config={config} edit={edit} opts={opts} compact={compact} />
     case 'languages':
-      return <Languages doc={doc} config={config} edit={edit} opts={opts} />
+      return <Languages doc={doc} config={config} edit={edit} opts={opts} compact={compact} />
     case 'certificates':
-      return <Certificates doc={doc} edit={edit} />
+      return <Certificates doc={doc} edit={edit} opts={opts} />
     case 'awards':
-      return <Awards doc={doc} edit={edit} />
+      return <Awards doc={doc} edit={edit} opts={opts} />
     case 'publications':
-      return <Publications doc={doc} edit={edit} />
+      return <Publications doc={doc} edit={edit} opts={opts} />
     case 'volunteer':
       return <Volunteer doc={doc} edit={edit} opts={opts} />
     case 'interests':
@@ -853,10 +3469,54 @@ function sectionRenderer(sectionKey: string, doc: ResumeDocument, config: Templa
   }
 }
 
-/** Render the body of any section by key. */
-export function SectionBody({ sectionKey, doc, config, edit }: { sectionKey: string; doc: ResumeDocument; config: TemplateConfig; edit?: EditFn }) {
-  const opts: SecOpts = doc.metadata.layout.sectionSettings?.[sectionKey] ?? {}
-  const body = sectionRenderer(sectionKey, doc, config, edit, opts)
+/** Render the body of any section by key. `compact` is the footer strip's
+ *  row form: skills and languages print one line per group; every other
+ *  section renders as it does anywhere, inside the strip. */
+export function SectionBody({
+  sectionKey,
+  doc,
+  config,
+  edit,
+  editMeta,
+  compact,
+  noMeta,
+}: {
+  sectionKey: string
+  doc: ResumeDocument
+  config: TemplateConfig
+  edit?: EditFn
+  editMeta?: MetaEditFn
+  compact?: boolean
+  /** This section is not in the body's single flow (the sidebar, a gallery
+   *  card), so no meta column is opened beside it. */
+  noMeta?: boolean
+}) {
+  const saved = doc.metadata.layout.sectionSettings?.[sectionKey]
+  // An empty value clears the override so the template's own choice returns -
+  // storing '' instead would pin the section to a size no template asked for.
+  const setBadge = editMeta
+    ? (key: 'badgeSize' | 'badgeShape', v: string) =>
+        editMeta((m) => {
+          const ss = ((m.layout.sectionSettings ??= {})[sectionKey] ??= {}) as Record<string, unknown>
+          if (v) ss[key] = v
+          else delete ss[key]
+        })
+    : undefined
+  const opts: SecOpts = {
+    ...(saved ?? {}),
+    // The section's own date side, else the document's.
+    dateAlign: dateAlignOf(saved, doc.metadata.layout.dateAlign),
+    setBadge,
+    linksClickable: doc.metadata.links?.clickable !== false,
+    dates: doc.metadata.dates,
+    // The meta column is the body's alone: a footer row is one compact line
+    // and a sidebar is a column already, so neither has room for one beside
+    // it. The cell is never BUILT there rather than built and hidden - in
+    // the margin the cell holds the entry's only date, and hiding that would
+    // lose it.
+    metaColumn: compact || noMeta ? 'none' : metaColumnOn(doc.metadata, doc.content),
+  }
+  const body = sectionRenderer(sectionKey, doc, config, edit, opts, compact)
   // Summary is a single field (always editable); every other section is a list,
   // so offer an inline "+ Add" affordance on the canvas (edit mode only).
   const canAdd = !!edit && sectionKey !== 'summary'
@@ -864,6 +3524,7 @@ export function SectionBody({ sectionKey, doc, config, edit }: { sectionKey: str
   return (
     <>
       {body}
+      {!sectionHasContent(sectionKey, doc.content) ? <EmptyHint /> : null}
       <AddEntry sectionKey={sectionKey} edit={edit} />
     </>
   )

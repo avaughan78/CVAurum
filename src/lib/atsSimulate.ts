@@ -18,6 +18,7 @@
  */
 import type { ResumeDocument } from '@/types/document'
 import { resolveOrder, sectionLabel, DEFAULT_LABELS } from '@/lib/sections'
+import { visibleDocument } from '@/lib/atsScope'
 import { htmlToText } from '@/lib/utils'
 import { cleanEmail } from '@/templates/_shared/atoms'
 
@@ -78,14 +79,22 @@ interface Signals {
 
 const STANDARD = new Set(['work', 'education', 'skills', 'projects', 'summary', 'languages', 'certificates', 'awards', 'publications', 'volunteer', 'interests', 'references', 'profiles'])
 
-function collectSignals(doc: ResumeDocument): Signals {
+function collectSignals(input: ResumeDocument): Signals {
+  // The structural signals below already read `resolveOrder`, so they always
+  // described the visible page. The CONTENT signals did not: a hidden skills
+  // group still raised `skillKeywordCount`, so the "what this parser extracts"
+  // readout credited the applicant with skills no parser would ever see
+  // (measured: 15 skill keywords reported from a section the page had
+  // dropped). Narrowing the document once here makes both halves agree.
+  const doc = visibleDocument(input)
   const c = doc.content
   const layout = doc.metadata.layout
-  const { main, aside } = resolveOrder(doc)
+  const { main, aside, footer } = resolveOrder(doc)
   const twoColumn = layout.columns === 2 && aside.length > 0
   const sidebarLabels = aside.map((k) => sectionLabel(k, doc)).join(', ')
 
-  const allKeys = [...main, ...aside]
+  // The footer strip is read last, but it is read: its headings count too.
+  const allKeys = [...main, ...aside, ...footer]
   const customHeadingKeys = allKeys.filter((k) => k.startsWith('custom-'))
   // Standard sections the user renamed to a non-standard label (a field-mapping
   // parser keys off the heading text, so a rename can hide the section).
@@ -110,7 +119,7 @@ function collectSignals(doc: ResumeDocument): Signals {
 
   const bulletStyles = Object.values(layout.sectionSettings ?? {}).map((s) => s?.bulletStyle)
   const globalBullet = doc.metadata.typography.bulletStyle
-  const fancy = ['arrow', 'diamond', 'check'].includes(globalBullet) || bulletStyles.some((b) => b && ['arrow', 'diamond', 'check'].includes(b))
+  const fancy = ['arrow', 'diamond', 'check', 'chevron'].includes(globalBullet) || bulletStyles.some((b) => b && ['arrow', 'diamond', 'check', 'chevron'].includes(b))
 
   return {
     twoColumn,
@@ -172,14 +181,23 @@ function baseFindings(sig: Signals, w: { twoCol: number; photo: number; heading:
   }
 
   // two-column reading order
+  //
+  // What the export actually does matters here, and it is not what this
+  // finding used to claim. Our PDF emits the main column ahead of the sidebar
+  // on every page, so anything reading in content order gets the name and
+  // experience first (asserted by the two-column ATS gate). Two real risks
+  // remain, and they are different from each other: a parser that rebuilds
+  // the page from glyph POSITIONS reads left to right and so hits a left
+  // sidebar first, and a resume longer than one page interleaves for
+  // everyone, because each page carries its own main-then-sidebar pair.
   if (sig.twoColumn && w.twoCol > 0) {
-    const sidebar = sig.sidebarLabels
+    const sidebar = sig.sidebarLabels || 'the side column'
     findings.push({
       severity: w.twoCol >= 12 ? 'risk' : 'minor',
       title: 'Two-column layout',
       detail: w.twoCol >= 12
-        ? `This parser reads the sidebar (${sidebar || 'side column'}) before the main column, which can scramble the order. A single-column template is the safest choice for it.`
-        : `Handled reasonably, but the sidebar is read before the main column. Verify the order in "What an ATS sees".`,
+        ? `Your PDF puts the main column ahead of the sidebar (${sidebar}), so a parser reading in order gets your name and experience first. This one rebuilds the page from where text sits instead, so a side column can still land out of order — and on a resume over one page, each page is read main-column-then-sidebar, so a sidebar section continuing overleaf arrives in two pieces. A single-column template avoids both.`
+        : `Handled reasonably: your PDF emits the main column before the sidebar (${sidebar}), so the name and experience are read first. On a resume over one page, each page is read main-column-then-sidebar, so a sidebar section that continues overleaf arrives in two pieces. Check the order in "What an ATS sees".`,
     })
     penalty += w.twoCol
   }

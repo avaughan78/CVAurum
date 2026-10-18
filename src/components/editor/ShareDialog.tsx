@@ -67,7 +67,7 @@ export function ShareDialog({ doc }: { doc: ResumeDocument }) {
 
   return createPortal(
     <div className="fixed inset-0 z-[80] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setOpen(false)} />
+      <div className="absolute inset-0 bg-black/60" onClick={() => setOpen(false)} />
       <div className="relative z-10 w-full max-w-md overflow-hidden rounded-2xl border border-border bg-surface shadow-float">
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <div className="flex items-center gap-2 text-base font-semibold"><Lock className="h-4 w-4 text-primary" /> Share an encrypted link</div>
@@ -76,7 +76,8 @@ export function ShareDialog({ doc }: { doc: ResumeDocument }) {
 
         <div className="max-h-[74vh] overflow-y-auto p-5">
           <p className="mb-4 flex items-start gap-1.5 rounded-lg bg-emerald-500/10 p-2.5 text-xs leading-relaxed text-emerald-700 dark:text-emerald-300">
-            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" /> Your résumé is AES-256 encrypted <em>inside</em> the link and never uploaded. The passphrase is never in the link — so even if the link is cached or logged anywhere, it can’t be opened without it.
+            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>Your résumé is AES-256 encrypted <em>inside</em> the link and never uploaded. The passphrase is never in the link — so even if the link is cached or logged anywhere, it can’t be opened without it.</span>
           </p>
 
           {/* passphrase */}
@@ -121,7 +122,7 @@ export function ShareDialog({ doc }: { doc: ResumeDocument }) {
               </div>
               <p className="mt-3 flex items-start gap-1.5 rounded-lg bg-primary/5 p-2.5 text-xs leading-relaxed text-foreground">
                 <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                Send the passphrase through a <strong>different</strong> channel than the link (say it in person, or use another app). Never put both in the same message.
+                <span>Send the passphrase through a <strong>different</strong> channel than the link (say it in person, or use another app). Never put both in the same message.</span>
               </p>
             </>
           )}

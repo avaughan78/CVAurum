@@ -1,17 +1,80 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Settings2, EyeOff, ArrowLeftRight, Copy, ClipboardPaste, Paintbrush, X } from 'lucide-react'
+import { Eye,
+  Settings2,
+  EyeOff,
+  ArrowLeftRight,
+  ArrowDownToLine,
+  ArrowUp,
+  ArrowDown,
+  GripVertical,
+  Copy,
+  ClipboardPaste,
+  Paintbrush,
+  PanelBottom,
+  X,
+} from 'lucide-react'
 import { useEditorStore } from '@/store/useEditorStore'
 import { usePopoverA11y } from './popoverA11y'
 import type { ResumeDocument } from '@/types/document'
 import type { Metadata } from '@/types/metadata'
-import { sectionLabel } from '@/lib/sections'
+import { sectionLabel, moveSection, moveSectionTo } from '@/lib/sections'
+import { hasPagePin, togglePagePin } from '@/lib/pageBreakPins'
+import { HAS_DATES, HAS_ENTRY_ORG, HAS_KEYWORDS, HAS_LINK, HAS_LOCATION, STYLE_FIELDS, headingAlignLocked, keepEntriesOn, paintStyle, sectionBase } from './sectionClasses'
+import { SECTION_NUMBER_STYLES } from './sectionNumeral'
+import { ICON_KINDS, sectionIconKind, suggestedIcons } from './sectionIconChoice'
+import { iconForKind } from '@/components/icons/sectionIcons'
 import type { MetaEditFn } from './Editable'
 
-type ToggleField = 'showBullets' | 'showDates' | 'showLocation' | 'showSummary' | 'showKeywords' | 'showBadges'
+type ToggleField =
+  | 'showBullets'
+  | 'showDates'
+  | 'showDuration'
+  | 'showLocation'
+  | 'showSummary'
+  | 'showKeywords'
+  | 'showBadges'
+/** Toggles that stay OFF until asked for; every other show* row is on until hidden. */
+const OPT_IN = new Set<ToggleField>(['showBadges', 'showDuration'])
 
-/** The visual-style fields the painter copies (NOT the show* content toggles). */
-const STYLE_FIELDS = ['headingStyle', 'skillsStyle', 'entryLayout', 'scoreStyle', 'bulletStyle', 'meterStyle', 'badgeSize', 'badgeShape'] as const
+/** An entry's two head fields. The section says which leads and which is
+ *  bold; unset is the title on both rows, the page as it always was. */
+const ENTRY_FIELDS: { label: string; value: 'title' | 'org'; title: string }[] = [
+  { label: 'Title', value: 'title', title: 'The position or degree' },
+  { label: 'Organization', value: 'org', title: 'The company, school or organization (a custom entry: its subtitle)' },
+]
+
+/** Where an entry's location prints ('' = the sub-line, the classic look). */
+const LOCATION_PLACEMENTS: { label: string; value: string; title: string }[] = [
+  { label: 'Sub-line', value: '', title: 'Under the title, with the rest of the entry detail' },
+  { label: 'With date', value: 'with-date', title: 'Beside the date, on the title row' },
+]
+
+/** Which edge of the title row the date sits on ('' = the right, as always). */
+const DATE_ALIGNS: { label: string; value: string; title: string }[] = [
+  { label: 'Right', value: 'right', title: 'At the right edge of the title row' },
+  { label: 'Left', value: 'left', title: 'Ahead of the title, in a column of its own' },
+  { label: 'After title', value: 'title', title: 'Straight after the title, on the same row' },
+  { label: 'Company line', value: 'inline', title: 'At the end of the line under the title' },
+]
+
+/** What the line under the title is called in each section, so the in-line
+ *  choice names the line it moves the date to. */
+const SUB_LINE: Record<string, string> = {
+  certificates: 'Issuer line',
+  awards: 'Awarder line',
+  publications: 'Publisher line',
+  education: 'School line',
+  volunteer: 'Organisation line',
+}
+
+/** Whether a page break may fall inside one of this section's entries.
+ *  undefined = Auto, the document's own switch (page.keepEntriesWhole). */
+const KEEP_ENTRIES: { label: string; value?: boolean; title: string }[] = [
+  { label: 'Auto', value: undefined, title: 'Follow the document (Design panel)' },
+  { label: 'On', value: true, title: 'Move a whole entry to the next page rather than break it' },
+  { label: 'Off', value: false, title: 'Let a page break fall inside an entry' },
+]
 
 /** Per-section heading treatments ('' = the template's own default). */
 const HEADING_STYLES: { label: string; value: string }[] = [
@@ -26,11 +89,25 @@ const HEADING_STYLES: { label: string; value: string }[] = [
   { label: 'Plain', value: 'plain' },
 ]
 
+/** Per-section heading alignment ('' = the template's own). */
+const HEADING_ALIGNS: { label: string; value: string; title: string }[] = [
+  { label: 'Auto', value: '', title: "The template's own alignment" },
+  { label: 'Left', value: 'left', title: 'Flush left' },
+  { label: 'Center', value: 'center', title: 'Centred over the section' },
+]
+
 /** Education score placements ('' = inline, the classic look). */
 const SCORE_STYLES: { label: string; value: string }[] = [
   { label: 'Inline', value: '' },
   { label: 'Right', value: 'right' },
   { label: 'Pill', value: 'pill' },
+]
+
+/** How much room a skill pill takes around its text. */
+const CHIP_SIZES: { label: string; value: string }[] = [
+  { label: 'Auto', value: '' },
+  { label: 'Compact', value: 's' },
+  { label: 'Roomy', value: 'l' },
 ]
 
 /** Skills display styles ('' = the template's own default). */
@@ -39,7 +116,35 @@ const SKILL_STYLES: { label: string; value: string }[] = [
   { label: 'Pills', value: 'chips' },
   { label: 'Tags', value: 'tags' },
   { label: 'Inline', value: 'inline' },
+  { label: 'Stacked', value: 'stacked' },
   { label: 'Grid', value: 'grid' },
+  { label: 'Rings', value: 'rings' },
+]
+
+/** How an entry's own keyword tags look ('' = the template's own chip).
+ *  They share their names, and their looks, with the skills styles above, so
+ *  a project's tag row can be made to read exactly like a skills row - the
+ *  reduced vocabulary was the complaint. Rings alone is left out: a ring
+ *  draws a proficiency level, and a project keyword has none to draw. */
+const TAG_STYLES: { label: string; value: string }[] = [
+  { label: 'Auto', value: '' },
+  { label: 'Pills', value: 'chips' },
+  { label: 'Tags', value: 'tags' },
+  { label: 'Inline', value: 'inline' },
+  { label: 'Stacked', value: 'stacked' },
+  { label: 'Grid', value: 'grid' },
+]
+
+/** How a section's visible URL line is drawn ('' = Auto, the document's own
+ *  link style). The document setting governs NAMED links and the header
+ *  contacts; the address printed under a project title answered nothing at
+ *  all until this row. Shown by default, and it stays that way: an address a
+ *  portfolio resume prints is a real signal to lose silently. */
+const LINK_STYLES: { label: string; value: string; title: string }[] = [
+  { label: 'Auto', value: '', title: "Follow the document's link style (Design panel)" },
+  { label: 'Tag', value: 'tag', title: 'The same small paper tag a named link wears' },
+  { label: 'Plain', value: 'plain', title: 'The address as ordinary text' },
+  { label: 'Hidden', value: 'none', title: 'Do not print the address (the title keeps its link)' },
 ]
 
 /** Entry-flow layouts ('' = the template's own default). */
@@ -49,6 +154,25 @@ const ENTRY_LAYOUTS: { label: string; value: string }[] = [
   { label: 'Cards', value: 'cards' },
   { label: 'Grid', value: 'grid' },
   { label: 'Divided', value: 'divided' },
+]
+
+/** Section badge treatments - one choice for the whole document, so the row
+ *  that offers them says so. Folio first: it is the default. */
+const ICON_STYLES: { label: string; value: Metadata['layout']['sectionIconStyle'] }[] = [
+  { label: 'Folio', value: 'folio' },
+  { label: 'Chip', value: 'chip' },
+  { label: 'Plain', value: 'plain' },
+  { label: 'Filled', value: 'filled' },
+  { label: 'Circle', value: 'circle' },
+  { label: 'Outline', value: 'outline' },
+  { label: 'None', value: 'none' },
+]
+
+/** Section badge sizes, document-wide as well. */
+const ICON_SIZES: { label: string; value: Metadata['layout']['sectionIconSize']; title: string }[] = [
+  { label: 'S', value: 's', title: 'Small badges' },
+  { label: 'M', value: 'm', title: 'Medium badges' },
+  { label: 'L', value: 'l', title: 'Large badges' },
 ]
 
 /* Tiny visual mock of each style so users SEE what they're picking. */
@@ -119,11 +243,24 @@ function Mini({ kind }: { kind: string }) {
           <span className="h-[8px] w-3 rounded-full border border-primary/60 bg-primary/15" />
         </span>
       )
+    case 's:rings':
+      return (
+        <span className="flex w-8 items-center justify-center gap-[4px]">
+          <span className="h-[11px] w-[11px] rounded-full border-[2px] border-primary/75 border-r-foreground/20" />
+          <span className="h-[11px] w-[11px] rounded-full border-[2px] border-primary/75 border-b-foreground/20 border-r-foreground/20" />
+        </span>
+      )
     case 's:tags':
       return (
         <span className="flex w-8 gap-[4px]">
-          <span className="flex flex-col gap-[2px]"><span className={`h-[3px] w-3 ${t}`} /><span className="h-px w-full bg-foreground/50" /></span>
-          <span className="flex flex-col gap-[2px]"><span className={`h-[3px] w-2.5 ${t}`} /><span className="h-px w-full bg-foreground/50" /></span>
+          <span className="flex flex-col gap-[2px]">
+            <span className={`h-[3px] w-3 ${t}`} />
+            <span className="h-px w-full bg-foreground/50" />
+          </span>
+          <span className="flex flex-col gap-[2px]">
+            <span className={`h-[3px] w-2.5 ${t}`} />
+            <span className="h-px w-full bg-foreground/50" />
+          </span>
         </span>
       )
     case 's:inline':
@@ -143,6 +280,36 @@ function Mini({ kind }: { kind: string }) {
               <span className={`h-[2.5px] flex-1 ${t}`} />
             </span>
           ))}
+        </span>
+      )
+    case 's:stacked':
+      return (
+        <span className="flex w-8 flex-col gap-[3px]">
+          <span className={`h-[3px] w-3.5 ${t}`} />
+          <span className="flex items-center gap-[3px]">
+            <span className={`h-[2.5px] w-2 ${t}`} />
+            <span className="h-[2.5px] w-[2.5px] rounded-full bg-foreground/45" />
+            <span className={`h-[2.5px] w-2 ${t}`} />
+          </span>
+        </span>
+      )
+    // link line (a project's visible URL)
+    case 'k:':
+      return <span className="h-[10px] w-6 rounded-[3px] border border-dashed border-muted-foreground/60" />
+    case 'k:tag':
+      return (
+        <span className="relative flex h-[11px] w-7 items-center justify-center rounded-[2px] border border-primary/40 bg-primary/10">
+          <span className={`absolute bottom-[2px] left-[2px] top-[2px] w-[2px] rounded-[1px] ${a}`} />
+          <span className={`ml-[3px] h-[3px] w-3.5 ${t}`} />
+        </span>
+      )
+    case 'k:plain':
+      return <span className={`h-[3px] w-6 ${t}`} />
+    case 'k:none':
+      return (
+        <span className="relative flex w-8 items-center justify-center">
+          <span className="h-[3px] w-5 rounded-[1px] bg-foreground/25" />
+          <span className="absolute left-1 right-1 top-1/2 h-px -rotate-12 bg-foreground/50" />
         </span>
       )
     // score placements
@@ -188,8 +355,12 @@ function Mini({ kind }: { kind: string }) {
     case 'e:cards':
       return (
         <span className="flex w-8 flex-col gap-[3px]">
-          <span className="flex h-[8px] items-center rounded-[2px] border border-foreground/30 px-[3px]"><span className={`h-[2.5px] w-3 ${t}`} /></span>
-          <span className="flex h-[8px] items-center rounded-[2px] border border-foreground/30 px-[3px]"><span className={`h-[2.5px] w-2.5 ${t}`} /></span>
+          <span className="flex h-[8px] items-center rounded-[2px] border border-foreground/30 px-[3px]">
+            <span className={`h-[2.5px] w-3 ${t}`} />
+          </span>
+          <span className="flex h-[8px] items-center rounded-[2px] border border-foreground/30 px-[3px]">
+            <span className={`h-[2.5px] w-2.5 ${t}`} />
+          </span>
         </span>
       )
     case 'e:grid':
@@ -208,6 +379,62 @@ function Mini({ kind }: { kind: string }) {
           <span className={`h-[3px] w-4/5 ${t}`} />
         </span>
       )
+    // section badge styles (document-wide): a badge beside a heading bar
+    case 'i:folio':
+      return (
+        <span className="flex w-8 items-center gap-[4px]">
+          <span className="relative h-[11px] w-[11px] shrink-0 overflow-hidden rounded-[2px] border border-primary/40 bg-primary/10">
+            <span className={`absolute left-[3px] top-[3px] h-[5px] w-[5px] rounded-[1px] ${a}`} />
+            <span className="absolute -right-[3px] -top-[3px] h-[6px] w-[6px] rotate-45 bg-primary/50" />
+          </span>
+          <span className={`h-[3px] w-4 ${t}`} />
+        </span>
+      )
+    case 'i:chip':
+      return (
+        <span className="flex w-8 items-center gap-[4px]">
+          <span className="flex h-[11px] w-[11px] shrink-0 items-center justify-center rounded-[3px] bg-primary/15">
+            <span className={`h-[5px] w-[5px] rounded-[1px] ${a}`} />
+          </span>
+          <span className={`h-[3px] w-4 ${t}`} />
+        </span>
+      )
+    case 'i:plain':
+      return (
+        <span className="flex w-8 items-center gap-[4px]">
+          <span className={`h-[7px] w-[7px] shrink-0 rounded-[1px] ${a}`} />
+          <span className={`h-[3px] w-4 ${t}`} />
+        </span>
+      )
+    case 'i:filled':
+      return (
+        <span className="flex w-8 items-center gap-[4px]">
+          <span className={`flex h-[11px] w-[11px] shrink-0 items-center justify-center rounded-[3px] ${a}`}>
+            <span className="h-[5px] w-[5px] rounded-[1px] bg-white/90" />
+          </span>
+          <span className={`h-[3px] w-4 ${t}`} />
+        </span>
+      )
+    case 'i:circle':
+      return (
+        <span className="flex w-8 items-center gap-[4px]">
+          <span className="flex h-[11px] w-[11px] shrink-0 items-center justify-center rounded-full bg-primary/15">
+            <span className={`h-[5px] w-[5px] rounded-full ${a}`} />
+          </span>
+          <span className={`h-[3px] w-4 ${t}`} />
+        </span>
+      )
+    case 'i:outline':
+      return (
+        <span className="flex w-8 items-center gap-[4px]">
+          <span className="flex h-[11px] w-[11px] shrink-0 items-center justify-center rounded-[3px] border border-primary/60">
+            <span className={`h-[5px] w-[5px] rounded-[1px] ${a}`} />
+          </span>
+          <span className={`h-[3px] w-4 ${t}`} />
+        </span>
+      )
+    case 'i:none':
+      return <span className={`h-[3px] w-5 ${t}`} />
     default:
       return null
   }
@@ -219,9 +446,14 @@ const NO_ENTRY_LAYOUT = new Set(['summary', 'skills', 'languages'])
 const NO_BADGES = new Set(['certificates', 'awards', 'publications', 'interests', 'references'])
 
 const HAS_BULLETS = new Set(['work', 'projects', 'volunteer', 'custom'])
-const HAS_DATES = new Set(['work', 'education', 'projects', 'volunteer', 'certificates', 'awards', 'publications', 'custom'])
-const HAS_LOCATION = new Set(['work', 'education', 'custom'])
+/** Sections whose dates are ranges, so a time span can be counted. */
+const HAS_DURATION = new Set(['work', 'education', 'projects', 'volunteer'])
 const HAS_SUMMARY = new Set(['work'])
+/* Which entry fields a section prints - the date, the location, the
+ * organisation line - live beside the style painter, which keys on the same
+ * three sets, so a painted value never lands on a section whose gear could
+ * not clear it again. */
+const HAS_ORG = HAS_ENTRY_ORG
 
 /** Per-section bullet markers (glyph chips — the marker itself is the preview). */
 const BULLET_CHOICES: { v: string; label: string; title: string }[] = [
@@ -233,6 +465,7 @@ const BULLET_CHOICES: { v: string; label: string; title: string }[] = [
   { v: 'arrow', label: '›', title: 'Arrow' },
   { v: 'check', label: '✓', title: 'Check' },
   { v: 'diamond', label: '◆', title: 'Diamond' },
+  { v: 'chevron', label: '>', title: 'Chevron' },
   { v: 'none', label: 'None', title: 'No bullet markers' },
 ]
 
@@ -246,7 +479,6 @@ const METER_CHOICES: { v: string; label: string; title: string }[] = [
   { v: 'none', label: 'None', title: 'Hide proficiency' },
 ]
 const HAS_METER = new Set(['skills', 'languages'])
-const HAS_KEYWORDS = new Set(['projects'])
 
 const POP_W = 308 // popover width (px) — must match w-[308px] below
 
@@ -257,7 +489,23 @@ const POP_W = 308 // popover width (px) — must match w-[308px] below
  * Desktop: a floating panel clamped fully on-screen with its own scroll area.
  * Phones: a bottom sheet (floating panels are unusable at that size).
  */
-export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string; doc: ResumeDocument; editMeta: MetaEditFn }) {
+export function SectionGear({
+  sectionKey,
+  doc,
+  editMeta,
+  variant = 'canvas',
+}: {
+  sectionKey: string
+  doc: ResumeDocument
+  editMeta: MetaEditFn
+  /** The side panel borrows only the Style button. The default return is the
+   *  whole canvas control cluster - grip, hide, move, pin - whose absolutely
+   *  positioned members escaped a panel card and covered the header's own
+   *  controls, so a tap on the panel's show/hide eye landed on an invisible
+   *  canvas control instead (reported from a phone, 2026-08-30). The panel
+   *  has its own grip, eye and menu; it borrows none of ours. */
+  variant?: 'canvas' | 'panel'
+}) {
   const [open, setOpen] = useState(false)
   // sheet=true → phone bottom-sheet; otherwise a clamped floating panel.
   const [pos, setPos] = useState({ top: 0, left: 0, maxH: 600, sheet: false })
@@ -266,10 +514,57 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
   usePopoverA11y(open, () => setOpen(false), panelRef)
 
   const layout = doc.metadata.layout
-  const base = sectionKey.startsWith('custom-') ? 'custom' : sectionKey
+  const base = sectionBase(sectionKey)
   const opts = layout.sectionSettings?.[sectionKey] ?? {}
   const twoCol = layout.columns === 2
   const inAside = layout.aside.includes(sectionKey)
+  // In the footer strip only the compact row form renders: no chips, no
+  // meters, so the rows that choose them are replaced by a line saying so.
+  const inFooter = layout.footer.includes(sectionKey)
+  // With the titles beside their content the heading takes a column of its
+  // own, set against that content by definition, so no alignment chip in the
+  // group has anything to do.
+  const headsSide = layout.headingPlacement === 'side' && !inFooter && !inAside
+  // Meter style only ever does anything for a skill group that has a rating
+  // (sections.tsx Skills() now meters ANY rated group, keywords or not) — flag
+  // it here so the popover can say so instead of silently doing nothing when
+  // no group has a level set yet.
+  const skillsHaveRatedGroup = base !== 'skills' || doc.content.skills.some((s) => typeof s.rating === 'number')
+
+  // The section badge is ONE choice for the whole page - its style and its
+  // size - so these write layout-wide fields through the same editMeta path
+  // the per-section fields use, and their rows say "all sections".
+  const iconStyle = layout.sectionIconStyle ?? 'folio'
+  const iconSize = layout.sectionIconSize ?? 'm'
+  const setIconStyle = (v: Metadata['layout']['sectionIconStyle']) =>
+    editMeta((m) => {
+      m.layout.sectionIconStyle = v
+    })
+  const setIconSize = (v: Metadata['layout']['sectionIconSize']) =>
+    editMeta((m) => {
+      m.layout.sectionIconSize = v
+    })
+
+  // The running numerals are one choice for the whole page too - on or off,
+  // and in what figures - so the row says "all sections" like the two above
+  // it. It is offered HERE because this sheet is where a person went looking
+  // for the way to drop the numbering from a numbered design: the switch
+  // lived only in the Design panel's Layout group, and "Style" is the button
+  // on the heading that carries the numeral.
+  const numbersOn = layout.sectionNumbers
+  const numberStyle = layout.sectionNumberStyle
+  // Off writes the switch alone: the chosen figures stay on the document, so
+  // turning the numbering back on restores the style that was showing rather
+  // than snapping every author back to the two-digit folio.
+  const setNumbering = (v: Metadata['layout']['sectionNumberStyle'] | 'off') =>
+    editMeta((m) => {
+      if (v === 'off') {
+        m.layout.sectionNumbers = false
+        return
+      }
+      m.layout.sectionNumbers = true
+      m.layout.sectionNumberStyle = v
+    })
 
   // Keep the panel usable if the window changes underneath it.
   useEffect(() => {
@@ -283,37 +578,109 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
     editMeta((m) => {
       if (!m.layout.sectionSettings) m.layout.sectionSettings = {}
       const cur = m.layout.sectionSettings[sectionKey] ?? {}
-      // showBadges is opt-IN (off by default); the rest are opt-OUT (shown by default).
-      const shown = field === 'showBadges' ? cur.showBadges === true : cur[field] !== false
+      const shown = OPT_IN.has(field) ? cur[field] === true : cur[field] !== false
       m.layout.sectionSettings[sectionKey] = { ...cur, [field]: shown ? false : true }
     })
 
   // Per-section style overrides — applied live on the canvas as you click.
-  const setStyle = (field: 'headingStyle' | 'skillsStyle' | 'entryLayout' | 'scoreStyle' | 'bulletStyle' | 'meterStyle' | 'badgeSize' | 'badgeShape', value?: string) =>
+  const setStyle = (
+    field:
+      | 'headingStyle'
+      | 'headingAlign'
+      | 'skillsStyle'
+      | 'tagStyle'
+      | 'linkStyle'
+      | 'chipSize'
+      | 'entryLayout'
+      | 'entryOrder'
+      | 'entryEmphasis'
+      | 'locationPlacement'
+      | 'dateAlign'
+      | 'scoreStyle'
+      | 'bulletStyle'
+      | 'meterStyle'
+      | 'badgeSize'
+      | 'badgeShape'
+      | 'keepTogether'
+      | 'icon',
+    value?: string | boolean
+  ) =>
     editMeta((m) => {
       if (!m.layout.sectionSettings) m.layout.sectionSettings = {}
       const cur = { ...(m.layout.sectionSettings[sectionKey] ?? {}) }
-      if (value) (cur as Record<string, unknown>)[field] = value
-      else delete (cur as Record<string, unknown>)[field]
+      // Auto is the ABSENCE of the field, so the section follows whatever
+      // decides for it - the template, or the document. An unset value (and
+      // the empty string the chip rows carry for Auto) removes the key; a
+      // false is a choice of its own and is written like any other.
+      if (value === undefined || value === '') delete (cur as Record<string, unknown>)[field]
+      else (cur as Record<string, unknown>)[field] = value
       m.layout.sectionSettings[sectionKey] = cur
     })
 
+  const isHidden = doc.metadata.layout.hidden.includes(sectionKey)
   const hide = () =>
     editMeta((m) => {
-      if (!m.layout.hidden.includes(sectionKey)) m.layout.hidden.push(sectionKey)
+      // A toggle, not a one-way door: the style sheet is where a phone user
+      // went looking for the way back after hiding a section, and its only
+      // offer was Hide again.
+      if (m.layout.hidden.includes(sectionKey)) m.layout.hidden = m.layout.hidden.filter((k) => k !== sectionKey)
+      else m.layout.hidden.push(sectionKey)
     })
+
+  // "Start on new page" pin (2026-08-17 spec section 1): a section-level
+  // forced page break, resolved identically by the export and the preview
+  // (metadata.page.breaks). Auto-fit ON means "one page, let the engine
+  // decide", so pinning is only offered with it off. One entry's own pin
+  // lives on its hover cluster and its panel card (pageBreakPins.ts).
+  const autoFitOn = doc.metadata.page.autoFit
+  const pinned = hasPagePin(doc.metadata.page.breaks, sectionKey)
+  const togglePin = () => editMeta((m) => togglePagePin(m.page.breaks, sectionKey))
+
+  // Whether a page break may fall inside one of this section's entries. The
+  // document's own switch (Design panel) decides until this row does, and it
+  // decides in both directions - a section can hold its entries whole on a
+  // page that breaks freely, or break freely on one that holds. Three states,
+  // not two: a plain toggle always wrote a concrete answer, so the first
+  // click pinned the section for good and it could never follow the document
+  // again. Auto is the key's absence, written through the same setStyle path
+  // every other Auto uses; what it resolves to comes from the same helper the
+  // renderer and the Word export read, so the row cannot drift from the page.
+  const autoKeepsEntries = keepEntriesOn(doc.metadata.page, undefined)
 
   const move = () =>
     editMeta((m) => {
-      const from: 'main' | 'aside' = m.layout.main.includes(sectionKey) ? 'main' : 'aside'
-      const to: 'main' | 'aside' = from === 'main' ? 'aside' : 'main'
-      m.layout[from] = m.layout[from].filter((k) => k !== sectionKey)
-      m.layout[to] = [...m.layout[to], sectionKey]
+      const to: 'main' | 'aside' = m.layout.main.includes(sectionKey) ? 'aside' : 'main'
+      moveSectionTo(m.layout, sectionKey, to, m.layout[to].length)
+    })
+  // Into the footer strip, or out of it to the end of the main flow. One
+  // move, through the same helper, so the key leaves every other place.
+  const moveFooter = () =>
+    editMeta((m) => {
+      const to: 'main' | 'footer' = m.layout.footer.includes(sectionKey) ? 'main' : 'footer'
+      moveSectionTo(m.layout, sectionKey, to, m.layout[to].length)
     })
 
+  // Inline reordering (2026-08-17 inline-reorder spec): arrows move one step
+  // within this section's column via the same shared helper every control
+  // surface uses. Position for the disabled state comes straight from the
+  // layout arrays; a content-appended key missing from both sits at the
+  // visual end of main, so only its up-arrow is live.
+  const colArr = layout.main.includes(sectionKey)
+    ? layout.main
+    : layout.aside.includes(sectionKey)
+      ? layout.aside
+      : layout.footer.includes(sectionKey)
+        ? layout.footer
+        : null
+  const colIdx = colArr ? colArr.indexOf(sectionKey) : -1
+  const atTop = colArr ? colIdx === 0 : false
+  const atBottom = colArr ? colIdx === colArr.length - 1 : true
+  const moveStep = (dir: -1 | 1) => editMeta((m) => moveSection(m.layout, sectionKey, dir))
+
   // Style painter: copy this section's visual style, then paint it onto another
-  // section (or all of them) — like Figma's paint-format. Only the visual-style
-  // fields travel; each section keeps its own content-visibility toggles.
+  // section (or all of them). Only the visual-style fields travel; each
+  // section keeps its own content-visibility toggles, and the entry order
+  // stays on sections that have an organisation line (paintStyle).
   const copiedStyle = useEditorStore((s) => s.copiedStyle)
   const setCopiedStyle = useEditorStore((s) => s.setCopiedStyle)
   const copyStyle = () => {
@@ -324,17 +691,11 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
     }
     setCopiedStyle(picked)
   }
-  const applyStyleTo = (m: Metadata, key: string) => {
-    if (!m.layout.sectionSettings) m.layout.sectionSettings = {}
-    const cur = { ...(m.layout.sectionSettings[key] ?? {}) } as Record<string, unknown>
-    for (const f of STYLE_FIELDS) delete cur[f] // clear then apply, so Auto (unset) paints too
-    Object.assign(cur, copiedStyle ?? {})
-    m.layout.sectionSettings[key] = cur
-  }
+  const applyStyleTo = (m: Metadata, key: string) => paintStyle(m, key, copiedStyle ?? {})
   const pasteStyle = () => editMeta((m) => applyStyleTo(m, sectionKey))
   const paintAll = () =>
     editMeta((m) => {
-      for (const key of [...m.layout.main, ...m.layout.aside]) applyStyleTo(m, key)
+      for (const key of [...m.layout.main, ...m.layout.aside, ...m.layout.footer]) applyStyleTo(m, key)
     })
 
   const openPopover = (e: React.MouseEvent) => {
@@ -348,11 +709,48 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
       setOpen(true)
       return
     }
-    const maxH = Math.min(620, vh - 16)
-    // Sit in the page's right margin, level with the gear — the section stays
-    // visible while its styles change live. Clamped fully on-screen.
-    const left = Math.max(8, Math.min(r.right + 12, vw - POP_W - 8))
-    const top = Math.max(8, Math.min(r.top - 4, vh - maxH - 8))
+    // Sit beside the gear — the section stays visible while its styles change
+    // live. Right of it by preference; on the far side when the right margin
+    // cannot hold the whole panel, rather than sliding back OVER the control
+    // that opened it (the old clamp did exactly that on a gear near the right
+    // edge).
+    const left =
+      r.right + 12 + POP_W <= vw - 8
+        ? r.right + 12
+        : r.left - 12 - POP_W >= 8
+          ? r.left - 12 - POP_W
+          : Math.max(8, Math.min(r.right + 12, vw - POP_W - 8))
+    // ANCHORED to the gear by one of its own edges, never floated to a fixed
+    // line. The old rule asked for a 620px panel and then clamped its top to
+    // `vh - maxH - 8`, so every gear below that line - two thirds of the
+    // sections on a full page - opened a sheet whose header sat hundreds of
+    // pixels ABOVE the control, level with some other section: measured at
+    // -490px for Education and -600px for Certifications on a 1000px viewport,
+    // with the sheet's box covering a section it does not edit in 12 of the 19
+    // sections measured. Nothing was mis-routed (the sheet always edited the clicked key),
+    // but a sheet that opens level with the section above the one it names is
+    // read as belonging to that section, which is the shape of the report that
+    // the control "targets the next section".
+    //
+    // So: top-aligned with the gear while the space below it can hold a usable
+    // panel, otherwise BOTTOM-aligned to the gear the way any dropdown opens
+    // upward. Either way one of the panel's edges is level with the control,
+    // and the header that names the section is within a panel's height of it.
+    const room = 8
+    const minH = Math.min(320, vh - room * 2)
+    const topAligned = Math.max(room, r.top - 4)
+    // A gear scrolled part-way off the bottom would otherwise anchor the panel
+    // off-screen; the anchor never leaves the viewport.
+    const anchorBottom = Math.min(r.bottom, vh - room)
+    let top: number
+    let maxH: number
+    if (vh - room - topAligned >= minH) {
+      top = topAligned
+      maxH = Math.min(620, vh - room - top)
+    } else {
+      maxH = Math.min(620, Math.max(minH, anchorBottom - room))
+      top = Math.max(room, anchorBottom - maxH)
+    }
     setPos({ top, left, maxH, sheet: false })
     setOpen(true)
   }
@@ -360,24 +758,120 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
   const rows: { label: string; field: ToggleField }[] = []
   if (HAS_BULLETS.has(base)) rows.push({ label: 'Bullet points', field: 'showBullets' })
   if (HAS_DATES.has(base)) rows.push({ label: 'Dates', field: 'showDates' })
+  // A span rides on the dates, so the row goes with them.
+  if (HAS_DURATION.has(base) && opts.showDates !== false) rows.push({ label: 'Time spans', field: 'showDuration' })
   if (HAS_LOCATION.has(base)) rows.push({ label: 'Location', field: 'showLocation' })
   if (HAS_SUMMARY.has(base)) rows.push({ label: 'Role summary', field: 'showSummary' })
   if (HAS_KEYWORDS.has(base)) rows.push({ label: 'Tech tags', field: 'showKeywords' })
-  if (!NO_ENTRY_LAYOUT.has(base) && !NO_BADGES.has(base)) rows.push({ label: 'Entry badges (initial)', field: 'showBadges' })
+  if (!NO_ENTRY_LAYOUT.has(base) && !NO_BADGES.has(base))
+    rows.push({ label: 'Entry badges (initial)', field: 'showBadges' })
 
   return (
     <>
-      <button
-        type="button"
-        className="rm-section-gear no-print"
-        contentEditable={false}
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={openPopover}
-        title="Style & settings for this section"
-        aria-label="Section style and settings"
-      >
-        <Settings2 /> Style
-      </button>
+      <div className={variant === 'panel' ? 'contents' : 'rm-section-controls no-print'}>
+        {/* Canvas drag grip — the session logic lives in CanvasReorder.tsx
+            (document-level listeners find it via data-canvas-drag). */}
+        {variant === 'canvas' && (
+        <button
+          type="button"
+          className="rm-section-hide rm-section-move rm-section-grip"
+          contentEditable={false}
+          data-canvas-drag="section"
+          style={{ touchAction: 'none' }}
+          title="Drag to reorder section (or use the arrows)"
+          aria-label="Drag to reorder section"
+        >
+          <GripVertical />
+        </button>
+        )}
+        <button
+          type="button"
+          className="rm-section-gear"
+          contentEditable={false}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={openPopover}
+          // NAMED for the section it edits, not "this section". Every design
+          // puts this pill in the page's own margin - in a side column it
+          // floats in the gap ABOVE its own heading, two pixels clear of it
+          // and twenty below the section before it - so which section a given
+          // pill belongs to is decided by a couple of pixels. The tooltip and
+          // the accessible name now say it outright, and the sheet's header
+          // repeats it. (It also ends a real accessibility defect: a
+          // twelve-section page carried twelve buttons whose accessible name
+          // was the identical "Section style and settings".)
+          title={`Style & settings — ${sectionLabel(sectionKey, doc)}`}
+          aria-label={`${sectionLabel(sectionKey, doc)} style and settings`}
+        >
+          <Settings2 /> Style
+        </button>
+        {variant === 'canvas' && (
+        <button
+          type="button"
+          className="rm-section-hide rm-section-move"
+          contentEditable={false}
+          disabled={atTop}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => moveStep(-1)}
+          title="Move section up"
+          aria-label="Move section up"
+        >
+          <ArrowUp />
+        </button>
+        )}
+        {variant === 'canvas' && (
+        <button
+          type="button"
+          className="rm-section-hide rm-section-move"
+          contentEditable={false}
+          disabled={atBottom}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => moveStep(1)}
+          title="Move section down"
+          aria-label="Move section down"
+        >
+          <ArrowDown />
+        </button>
+        )}
+        {twoCol && !inFooter && (
+          <button
+            type="button"
+            className="rm-section-hide rm-section-move"
+            contentEditable={false}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={move}
+            title={inAside ? 'Move to the main column' : 'Move to the side column'}
+            aria-label={inAside ? 'Move section to the main column' : 'Move section to the side column'}
+          >
+            <ArrowLeftRight />
+          </button>
+        )}
+        {variant === 'canvas' && (
+        <button
+          type="button"
+          className="rm-section-hide"
+          contentEditable={false}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={hide}
+          title="Hide section (restore from Sections panel)"
+          aria-label="Hide section"
+        >
+          <EyeOff />
+        </button>
+        )}
+        {pinned && !autoFitOn && (
+          <button
+            type="button"
+            className="rm-section-gear"
+            contentEditable={false}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={togglePin}
+            title="Starts on a new page — click to unpin"
+            aria-label="Unpin page break"
+          >
+            <ArrowDownToLine /> New page
+          </button>
+        )}
+      </div>
       {open &&
         createPortal(
           <>
@@ -399,7 +893,9 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
               <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
                 <div className="min-w-0">
                   <div className="truncate text-sm font-semibold leading-tight">{sectionLabel(sectionKey, doc)}</div>
-                  <div className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Style &amp; settings</div>
+                  <div className="text-[10.5px] uppercase tracking-wide text-muted-foreground">
+                    Style &amp; settings
+                  </div>
                 </div>
                 <button className="btn-icon h-7 w-7 shrink-0" onClick={() => setOpen(false)} aria-label="Close">
                   <X className="h-4 w-4" />
@@ -414,32 +910,157 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                       <ToggleRow
                         key={r.field}
                         label={r.label}
-                        on={r.field === 'showBadges' ? opts.showBadges === true : opts[r.field] !== false}
+                        on={OPT_IN.has(r.field) ? opts[r.field] === true : opts[r.field] !== false}
                         onClick={() => toggle(r.field)}
                       />
                     ))}
                   </Group>
                 )}
 
+                {/* The section's own lines come first: what a project prints
+                    (its address, its tags) is what an author opens this popover
+                    for, and buried seventeen groups down nobody found it. */}
+                {/* The section's own URL line - a project's address under its
+                    title. The document's link style governs NAMED links and
+                    the header contacts, so this line answered nothing at all
+                    until this row. It stays SHOWN by default: an address a
+                    portfolio resume prints is a real signal to drop quietly.
+                    Gated the way the tag rows below are, on the sections that
+                    actually print such a line. */}
+                {HAS_LINK.has(base) && (
+                  <Group label="Link line">
+                    <div className="grid grid-cols-4 gap-1">
+                      {LINK_STYLES.map((s) => (
+                        <StyleChip
+                          key={s.value || 'auto'}
+                          label={s.label}
+                          kind={`k:${s.value}`}
+                          title={s.title}
+                          on={(opts.linkStyle === 'auto' ? '' : (opts.linkStyle ?? '')) === s.value}
+                          onClick={() => setStyle('linkStyle', s.value || undefined)}
+                        />
+                      ))}
+                    </div>
+                    <p className="mt-1 text-[10px] leading-tight text-muted-foreground">
+                      Auto follows the document (Design panel). Hidden drops the address from the page, the Word file
+                      and the plain-text copy; the title keeps its link.
+                    </p>
+                  </Group>
+                )}
+
+                {/* Entry tags - the sections whose entries carry keywords of
+                    their own (projects). The skills pickers were gated to the
+                    skills section, so these tags could only be shown or
+                    hidden; the skills looks, and the same size chips, now
+                    reach them. Offered only while the tags are shown, as the
+                    bullet row is. */}
+                {HAS_KEYWORDS.has(base) && opts.showKeywords !== false && (
+                  <>
+                    <Group label="Tags as">
+                      <div className="grid grid-cols-3 gap-1">
+                        {TAG_STYLES.map((s) => (
+                          <StyleChip
+                            key={s.value || 'auto'}
+                            label={s.label}
+                            kind={`s:${s.value}`}
+                            on={(opts.tagStyle ?? '') === s.value}
+                            onClick={() => setStyle('tagStyle', s.value || undefined)}
+                          />
+                        ))}
+                      </div>
+                    </Group>
+                    <Group label="Tag size">
+                      <div className="grid grid-cols-3 gap-1">
+                        {CHIP_SIZES.map((z) => (
+                          <ChipBtn
+                            key={z.value || 'auto'}
+                            label={z.label}
+                            on={(opts.chipSize ?? '') === z.value}
+                            onClick={() => setStyle('chipSize', z.value || undefined)}
+                          />
+                        ))}
+                      </div>
+                    </Group>
+                  </>
+                )}
+
+                {/* Page pin — force this section to start a new page (spec 1).
+                    With auto-fit on, pagination isn't user-controlled, so the
+                    row explains instead of offering a dead toggle. */}
+                <Group label="Page">
+                  {autoFitOn ? (
+                    <p className="px-2 py-1 text-[11px] leading-snug text-muted-foreground">
+                      Turn off “Magic fit” (Design panel) to pin page breaks.
+                    </p>
+                  ) : (
+                    <ToggleRow label="Start on new page" on={pinned} onClick={togglePin} />
+                  )}
+                  {/* Entry-scoped, so it is offered where there are entries.
+                      A summary is one block of prose: the row wrote a setting
+                      nothing about it reads. */}
+                  {base !== 'summary' && (
+                    <>
+                      <div className="px-1 pt-1">
+                        <div className="mb-1 px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          Keep entries together
+                        </div>
+                        <div className="grid grid-cols-3 gap-1">
+                          {KEEP_ENTRIES.map((k) => (
+                            <ChipBtn
+                              key={k.label}
+                              label={k.label}
+                              title={k.title}
+                              on={opts.keepTogether === k.value}
+                              onClick={() => setStyle('keepTogether', k.value)}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                      <p className="px-2 py-1 text-[11px] leading-snug text-muted-foreground">
+                        Moves a whole entry to the next page instead of breaking one across it. Auto follows the
+                        document, which is {autoKeepsEntries ? 'on' : 'off'} right now.
+                      </p>
+                    </>
+                  )}
+                </Group>
+
                 {/* Bullet marker — per-section override of the global bullet style */}
                 {HAS_BULLETS.has(base) && opts.showBullets !== false && (
                   <Group label="Bullet style">
                     <div className="grid grid-cols-5 gap-1">
                       {BULLET_CHOICES.map((b) => (
-                        <ChipBtn key={b.v || 'auto'} label={b.label} title={b.title} on={(opts.bulletStyle ?? '') === b.v} onClick={() => setStyle('bulletStyle', b.v)} />
+                        <ChipBtn
+                          key={b.v || 'auto'}
+                          label={b.label}
+                          title={b.title}
+                          on={(opts.bulletStyle ?? '') === b.v}
+                          onClick={() => setStyle('bulletStyle', b.v)}
+                        />
                       ))}
                     </div>
                   </Group>
                 )}
 
-                {/* Proficiency meter — skills & languages only */}
-                {HAS_METER.has(base) && (
+                {/* Proficiency meter - skills and languages only, and never in
+                    the footer strip, which draws no meter */}
+                {HAS_METER.has(base) && !inFooter && (
                   <Group label="Meter style">
                     <div className="grid grid-cols-3 gap-1">
                       {METER_CHOICES.map((b) => (
-                        <ChipBtn key={b.v || 'auto'} label={b.label} title={b.title} on={(opts.meterStyle ?? '') === b.v} onClick={() => setStyle('meterStyle', b.v)} />
+                        <ChipBtn
+                          key={b.v || 'auto'}
+                          label={b.label}
+                          title={b.title}
+                          on={(opts.meterStyle ?? '') === b.v}
+                          onClick={() => setStyle('meterStyle', b.v)}
+                        />
                       ))}
                     </div>
+                    {!skillsHaveRatedGroup && (
+                      <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+                        Set a level on a skill group (side panel) to show meters
+                      </p>
+                    )}
                   </Group>
                 )}
 
@@ -456,11 +1077,18 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                           { v: 'm', label: 'M' },
                           { v: 'l', label: 'L' },
                         ].map((b) => (
-                          <ChipBtn key={b.v || 'auto'} label={b.label} on={(opts.badgeSize ?? '') === b.v} onClick={() => setStyle('badgeSize', b.v)} />
+                          <ChipBtn
+                            key={b.v || 'auto'}
+                            label={b.label}
+                            on={(opts.badgeSize ?? '') === b.v}
+                            onClick={() => setStyle('badgeSize', b.v)}
+                          />
                         ))}
                       </div>
                       <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
-                        To add a company / school mark: hover an entry on the page and click the <span className="font-medium text-primary">+ Logo</span> chip beside its title (or use the entry&apos;s form in the Content panel).
+                        To add a company / school mark: hover an entry on the page and click the{' '}
+                        <span className="font-medium text-primary">+ Logo</span> chip beside its title (or use the
+                        entry&apos;s form in the Content panel).
                       </p>
                     </Group>
                     <Group label="Logo & badge shape">
@@ -471,7 +1099,13 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                           { v: 'circle', label: '◯', title: 'Circle' },
                           { v: 'square', label: '□', title: 'Square' },
                         ].map((b) => (
-                          <ChipBtn key={b.v || 'auto'} label={b.label} title={b.title} on={(opts.badgeShape ?? '') === b.v} onClick={() => setStyle('badgeShape', b.v)} />
+                          <ChipBtn
+                            key={b.v || 'auto'}
+                            label={b.label}
+                            title={b.title}
+                            on={(opts.badgeShape ?? '') === b.v}
+                            onClick={() => setStyle('badgeShape', b.v)}
+                          />
                         ))}
                       </div>
                     </Group>
@@ -493,6 +1127,108 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                   </div>
                 </Group>
 
+                {/* Heading alignment - where THIS section's heading sits */}
+                <Group label="Heading align">
+                  <div className="grid grid-cols-3 gap-1">
+                    {HEADING_ALIGNS.map((a) => {
+                      // Beside the content the title has a narrow column of
+                      // its own, set against the text it belongs to; neither
+                      // edge is a look the page can draw in there, so both
+                      // chips say why instead of doing nothing when tapped.
+                      const locked = headingAlignLocked(a.value, headsSide)
+                      return (
+                        <ChipBtn
+                          key={a.value || 'auto'}
+                          label={a.label}
+                          title={a.title}
+                          on={(opts.headingAlign ?? '') === a.value}
+                          onClick={() => setStyle('headingAlign', a.value || undefined)}
+                          disabled={locked}
+                          reason={locked ? 'Beside the content, titles keep to the right edge' : undefined}
+                        />
+                      )
+                    })}
+                  </div>
+                  {headsSide && (
+                    <p className="mt-1 text-[10px] leading-tight text-muted-foreground">
+                      Headings sit beside the content, so titles keep to the right edge of their own column.
+                    </p>
+                  )}
+                </Group>
+
+                {/* The running numeral that opens a heading - off, or in one
+                    of the four figures the formatter draws. Document-wide,
+                    like the two badge rows under it, and labelled the way
+                    they are. The figures come from sectionNumeral.ts, which
+                    is what the page actually draws with, so this row and the
+                    Design panel's cannot come to offer different ones. */}
+                <Group label="Numbering (all sections)">
+                  <div className="grid grid-cols-5 gap-1">
+                    <ChipBtn
+                      label="Off"
+                      title="No numeral before the section titles"
+                      on={!numbersOn}
+                      onClick={() => setNumbering('off')}
+                    />
+                    {SECTION_NUMBER_STYLES.map((s) => (
+                      <ChipBtn
+                        key={s.value}
+                        label={s.label}
+                        title={s.title}
+                        on={numbersOn && numberStyle === s.value}
+                        onClick={() => setNumbering(s.value)}
+                      />
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[10px] leading-tight text-muted-foreground">
+                    Counts every section in the main column — decoration only, never in the text a parser reads.
+                  </p>
+                </Group>
+
+                {/* This section's own glyph: suggested first (from a custom
+                    section's title, or the section's usual glyph), then the
+                    whole set, then Auto and none. The badge style below
+                    decides how the glyph is drawn. */}
+                {iconStyle !== 'none' ? (
+                  <Group label="This section's icon">
+                    <IconChoice
+                      sectionKey={sectionKey}
+                      title={sectionLabel(sectionKey, doc)}
+                      value={opts.icon}
+                      onPick={(v) => setStyle('icon', v)}
+                    />
+                  </Group>
+                ) : null}
+
+                {/* Section badge - style and size are document-wide, unlike
+                    every row above, and the labels say so. */}
+                <Group label="Section icons (all sections)">
+                  <div className="grid grid-cols-4 gap-1">
+                    {ICON_STYLES.map((s) => (
+                      <StyleChip
+                        key={s.value}
+                        label={s.label}
+                        kind={`i:${s.value}`}
+                        on={iconStyle === s.value}
+                        onClick={() => setIconStyle(s.value)}
+                      />
+                    ))}
+                  </div>
+                </Group>
+                <Group label="Icon size (all sections)">
+                  <div className="grid grid-cols-3 gap-1">
+                    {ICON_SIZES.map((z) => (
+                      <ChipBtn
+                        key={z.value}
+                        label={z.label}
+                        title={z.title}
+                        on={iconSize === z.value}
+                        onClick={() => setIconSize(z.value)}
+                      />
+                    ))}
+                  </div>
+                </Group>
+
                 {/* Entry layout — how this section's entries flow on the page */}
                 {!NO_ENTRY_LAYOUT.has(base) && (
                   <Group label="Entries layout">
@@ -504,6 +1240,80 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                           kind={`e:${s.value}`}
                           on={(opts.entryLayout ?? '') === s.value}
                           onClick={() => setStyle('entryLayout', s.value || undefined)}
+                        />
+                      ))}
+                    </div>
+                  </Group>
+                )}
+
+                {/* Entry order and emphasis - which field leads each entry
+                    and which is bold. Two independent choices; the default
+                    (title on both) is unset, so a painted Auto lands on it. */}
+                {HAS_ORG.has(base) && (
+                  <>
+                    <Group label="Lead with">
+                      <div className="grid grid-cols-2 gap-1">
+                        {ENTRY_FIELDS.map((f) => (
+                          <ChipBtn
+                            key={f.value}
+                            label={f.value === 'org' && base === 'custom' ? 'Subtitle' : f.label}
+                            title={f.title}
+                            on={(opts.entryOrder === 'org-first' ? 'org' : 'title') === f.value}
+                            onClick={() => setStyle('entryOrder', f.value === 'org' ? 'org-first' : undefined)}
+                          />
+                        ))}
+                      </div>
+                    </Group>
+                    <Group label="Bold">
+                      <div className="grid grid-cols-2 gap-1">
+                        {ENTRY_FIELDS.map((f) => (
+                          <ChipBtn
+                            key={f.value}
+                            label={f.value === 'org' && base === 'custom' ? 'Subtitle' : f.label}
+                            title={f.title}
+                            on={(opts.entryEmphasis ?? 'title') === f.value}
+                            onClick={() => setStyle('entryEmphasis', f.value === 'org' ? 'org' : undefined)}
+                          />
+                        ))}
+                      </div>
+                    </Group>
+                  </>
+                )}
+
+                {/* Where the location prints, and which edge the date sits
+                    on. Both are per-entry placement, so they sit together
+                    under the order rows; each is only offered while the
+                    section actually shows the field. */}
+                {HAS_LOCATION.has(base) && opts.showLocation !== false && (
+                  <Group label="Location">
+                    <div className="grid grid-cols-2 gap-1">
+                      {LOCATION_PLACEMENTS.map((p) => (
+                        <ChipBtn
+                          key={p.value || 'subline'}
+                          label={p.label}
+                          title={p.title}
+                          on={(opts.locationPlacement === 'with-date' ? 'with-date' : '') === p.value}
+                          onClick={() => setStyle('locationPlacement', p.value || undefined)}
+                        />
+                      ))}
+                    </div>
+                  </Group>
+                )}
+                {HAS_DATES.has(base) && opts.showDates !== false && (
+                  <Group label="Date side">
+                    <div className="grid grid-cols-2 gap-1">
+                      {DATE_ALIGNS.map((d) => (
+                        <ChipBtn
+                          key={d.value}
+                          label={d.value === 'inline' ? (SUB_LINE[base] ?? d.label) : d.label}
+                          title={d.title}
+                          // What is in effect: the section's own choice, else the
+                          // document's (Design, Dates). Picking the one the
+                          // document already gives clears the section's own.
+                          on={(opts.dateAlign ?? layout.dateAlign ?? 'right') === d.value}
+                          onClick={() =>
+                            setStyle('dateAlign', d.value === (layout.dateAlign ?? 'right') ? undefined : d.value)
+                          }
                         />
                       ))}
                     </div>
@@ -527,26 +1337,70 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                   </Group>
                 )}
 
-                {/* Skills display — only for the skills section */}
-                {sectionKey === 'skills' && (
+                {/* In the footer strip only the row form renders, so the
+                    rows that choose a style say so rather than doing nothing. */}
+                {HAS_METER.has(base) && inFooter && (
+                  <p className="px-2 pb-2 pt-1 text-[11px] leading-snug text-muted-foreground">
+                    In the footer strip this section prints as one line per group. Move it to the main flow to choose a
+                    style or a meter.
+                  </p>
+                )}
+
+
+                {/* Skills display - only for the skills section, outside the strip */}
+                {sectionKey === 'skills' && !inFooter && (
                   <Group label="Skills as">
                     <div className="grid grid-cols-3 gap-1">
-                      {SKILL_STYLES.map((s) => (
-                        <StyleChip
-                          key={s.value || 'auto'}
-                          label={s.label}
-                          kind={`s:${s.value}`}
-                          on={(opts.skillsStyle ?? '') === s.value}
-                          onClick={() => setStyle('skillsStyle', s.value || undefined)}
-                        />
-                      ))}
+                      {SKILL_STYLES.map((s) => {
+                        // A ring measures a level. With no skill rated there
+                        // is nothing for one to draw, so the chip says why
+                        // instead of doing nothing when tapped.
+                        const noLevel = s.value === 'rings' && !doc.content.skills.some((g) => typeof g.rating === 'number')
+                        return (
+                          <StyleChip
+                            key={s.value || 'auto'}
+                            label={s.label}
+                            kind={`s:${s.value}`}
+                            on={(opts.skillsStyle ?? '') === s.value}
+                            onClick={() => setStyle('skillsStyle', s.value || undefined)}
+                            disabled={noLevel}
+                            reason={noLevel ? 'Rings need a skill with a level' : undefined}
+                          />
+                        )
+                      })}
                     </div>
+                    {!doc.content.skills.some((g) => typeof g.rating === 'number') && (
+                      <p className="mt-1 text-[10px] leading-tight text-muted-foreground">
+                        Rings need a level on at least one skill.
+                      </p>
+                    )}
+                    {/* Only the pill-shaped styles have a pill to size. */}
+                    {['chips', 'tags', ''].includes(opts.skillsStyle ?? '') && (
+                      <div className="mt-1.5">
+                        <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          Pill size
+                        </div>
+                        <div className="grid grid-cols-3 gap-1">
+                          {CHIP_SIZES.map((z) => (
+                            <StyleChip
+                              key={z.value || 'auto'}
+                              label={z.label}
+                              kind={`z:${z.value}`}
+                              on={(opts.chipSize ?? '') === z.value}
+                              onClick={() => setStyle('chipSize', z.value || undefined)}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </Group>
                 )}
 
                 <div className="my-1.5 h-px bg-border" />
                 <div className="px-2 pb-1 pt-0.5">
-                  <div className="mb-0.5 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Style painter</div>
+                  <div className="mb-0.5 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Style painter
+                  </div>
                   <p className="text-[11px] leading-snug text-muted-foreground">
                     {copiedStyle
                       ? 'Style copied — Paste it here, or paint it onto All sections at once.'
@@ -572,7 +1426,10 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                       </button>
                       <button
                         className="flex items-center justify-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2 py-1.5 text-xs font-medium text-primary hover:bg-primary/15"
-                        onClick={() => { paintAll(); setOpen(false) }}
+                        onClick={() => {
+                          paintAll()
+                          setOpen(false)
+                        }}
                         title="Paint the copied style onto every section"
                       >
                         <Paintbrush className="h-3.5 w-3.5" /> All
@@ -581,30 +1438,119 @@ export function SectionGear({ sectionKey, doc, editMeta }: { sectionKey: string;
                   )}
                 </div>
                 <div className="my-1.5 h-px bg-border" />
-                {twoCol && (
+                {twoCol && !inFooter && (
                   <button
                     className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted"
-                    onClick={() => { move(); setOpen(false) }}
+                    onClick={() => {
+                      move()
+                      setOpen(false)
+                    }}
                   >
                     <ArrowLeftRight className="h-4 w-4" /> Move to {inAside ? 'main column' : 'sidebar'}
                   </button>
                 )}
+                {/* The footer strip: in from anywhere, out to the end of the
+                    main flow. The panel's twin of this sheet shows the same
+                    row, so a phone reaches it too. */}
                 <button
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-danger hover:bg-danger/10"
-                  onClick={() => { hide(); setOpen(false) }}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted"
+                  onClick={() => {
+                    moveFooter()
+                    setOpen(false)
+                  }}
                 >
-                  <EyeOff className="h-4 w-4" /> Hide section
+                  <PanelBottom className="h-4 w-4" /> {inFooter ? 'Move to main' : 'Move to footer'}
+                </button>
+                <button
+                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm ${isHidden ? 'text-foreground hover:bg-muted' : 'text-danger hover:bg-danger/10'}`}
+                  onClick={() => {
+                    hide()
+                    setOpen(false)
+                  }}
+                >
+                  {isHidden ? (
+                    <>
+                      <Eye className="h-4 w-4" /> Show section
+                    </>
+                  ) : (
+                    <>
+                      <EyeOff className="h-4 w-4" /> Hide section
+                    </>
+                  )}
                 </button>
               </div>
             </div>
           </>,
-          document.body,
+          document.body
         )}
     </>
   )
 }
 
 /** A labeled cluster of controls — consistent rhythm instead of one long list. */
+/**
+ * A section's glyph, chosen the way the canvas shows it: the few the title
+ * suggests as large labelled buttons, every glyph as a compact grid, and the
+ * two answers that are not a glyph - Auto (the suggestion) and No icon.
+ */
+function IconChoice({
+  sectionKey,
+  title,
+  value,
+  onPick,
+}: {
+  sectionKey: string
+  title: string
+  value?: string
+  onPick: (v: string | undefined) => void
+}) {
+  const current = sectionIconKind(sectionKey, title, value)
+  const suggested = suggestedIcons(title, sectionKey)
+  const labelOf = (k: string) => ICON_KINDS.find((x) => x.kind === k)?.label ?? k
+  const cell = (k: string, big: boolean) => {
+    const Icon = iconForKind(k)
+    const on = value !== undefined && current === k
+    return (
+      <button
+        key={k}
+        type="button"
+        aria-pressed={on}
+        title={labelOf(k)}
+        aria-label={`${labelOf(k)} icon`}
+        onClick={() => onPick(k)}
+        className={`flex flex-col items-center justify-center gap-1 rounded-md border transition ${
+          big ? 'h-14 px-1' : 'h-9'
+        } ${on ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:border-primary/50'}`}
+      >
+        <Icon className={big ? 'h-4 w-4' : 'h-3.5 w-3.5'} aria-hidden />
+        {big ? <span className="text-[10px] leading-none">{labelOf(k)}</span> : null}
+      </button>
+    )
+  }
+  return (
+    <div className="space-y-1.5">
+      {suggested.length ? (
+        <>
+          <p className="px-1 text-[10px] leading-tight text-muted-foreground">
+            {sectionKey.startsWith('custom-') ? `Suggested for “${title}”` : 'Suggested'}
+          </p>
+          <div className="grid grid-cols-4 gap-1">{suggested.map((k) => cell(k, true))}</div>
+        </>
+      ) : null}
+      <div className="grid grid-cols-6 gap-1">{ICON_KINDS.map((k) => cell(k.kind, false))}</div>
+      <div className="grid grid-cols-2 gap-1">
+        <ChipBtn
+          label="Auto"
+          title={`The glyph this section's title suggests (${labelOf(sectionIconKind(sectionKey, title))})`}
+          on={value === undefined}
+          onClick={() => onPick(undefined)}
+        />
+        <ChipBtn label="No icon" title="No badge on this section's heading" on={value === 'none'} onClick={() => onPick('none')} />
+      </div>
+    </div>
+  )
+}
+
 function Group({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="px-1 pb-2 pt-1">
@@ -615,16 +1561,35 @@ function Group({ label, children }: { label: string; children: React.ReactNode }
 }
 
 /** A compact text/glyph option chip (bullet marker, meter, size, shape). */
-function ChipBtn({ label, title, on, onClick }: { label: string; title?: string; on: boolean; onClick: () => void }) {
+function ChipBtn({
+  label,
+  title,
+  on,
+  onClick,
+  disabled,
+  reason,
+}: {
+  label: string
+  title?: string
+  on: boolean
+  onClick: () => void
+  /** An option this section cannot take right now; `reason` says why in a
+   *  line, the way a style chip does. */
+  disabled?: boolean
+  reason?: string
+}) {
   return (
     <button
       type="button"
-      title={title || label}
+      title={disabled && reason ? reason : title || label}
       aria-pressed={on}
+      disabled={disabled}
       onClick={onClick}
       className={`min-w-0 truncate rounded-md border px-1 py-1.5 text-xs font-medium transition ${
-        on ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:border-primary/50 hover:text-foreground'
-      }`}
+        on
+          ? 'border-primary bg-primary/10 text-primary'
+          : 'border-border text-muted-foreground hover:border-primary/50 hover:text-foreground'
+      }${disabled ? ' cursor-not-allowed opacity-45 hover:border-border hover:text-muted-foreground' : ''}`}
     >
       {label}
     </button>
@@ -632,31 +1597,65 @@ function ChipBtn({ label, title, on, onClick }: { label: string; title?: string;
 }
 
 /** A style option: a small visual mock of the style + its name underneath. */
-function StyleChip({ label, kind, on, onClick }: { label: string; kind: string; on: boolean; onClick: () => void }) {
+function StyleChip({
+  label,
+  kind,
+  on,
+  onClick,
+  disabled,
+  reason,
+  title,
+}: {
+  label: string
+  kind: string
+  on: boolean
+  onClick: () => void
+  /** A style the section cannot take right now; `reason` says why in a line. */
+  disabled?: boolean
+  reason?: string
+  /** A fuller sentence for the hover, where the chip's own word is short.
+   *  Falls back to that word, which is what every other chip shows. */
+  title?: string
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
-      title={label}
+      title={disabled && reason ? reason : title || label}
       aria-pressed={on}
+      disabled={disabled}
       className={`flex min-w-0 flex-col items-center gap-1 rounded-lg border p-1.5 transition ${
         on ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border bg-surface hover:border-primary/50'
-      }`}
+      }${disabled ? ' cursor-not-allowed opacity-45 hover:border-border' : ''}`}
     >
       <span className="flex h-5 w-full items-center justify-center">
         <Mini kind={kind} />
       </span>
-      <span className={`w-full truncate text-center text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}>{label}</span>
+      <span
+        className={`w-full truncate text-center text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}
+      >
+        {label}
+      </span>
     </button>
   )
 }
 
 function ToggleRow({ label, on, onClick }: { label: string; on: boolean; onClick: () => void }) {
   return (
-    <button type="button" role="switch" aria-checked={on} onClick={onClick} className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      onClick={onClick}
+      className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-sm hover:bg-muted"
+    >
       <span className="truncate">{label}</span>
-      <span className={`relative h-4 w-7 shrink-0 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-muted-foreground/30'}`}>
-        <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-all ${on ? 'left-[14px]' : 'left-0.5'}`} />
+      <span
+        className={`relative h-4 w-7 shrink-0 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-muted-foreground/30'}`}
+      >
+        <span
+          className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-all ${on ? 'left-[14px]' : 'left-0.5'}`}
+        />
       </span>
     </button>
   )

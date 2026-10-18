@@ -57,7 +57,7 @@ export function SectionGallery({
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
       <div className="relative z-10 flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-float">
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <div>
@@ -74,7 +74,7 @@ export function SectionGallery({
           {available.map((key) => (
             <button
               key={key}
-              className="group flex flex-col overflow-hidden rounded-xl border border-border bg-white text-left transition hover:-translate-y-0.5 hover:border-primary hover:shadow-soft"
+              className="group flex flex-col overflow-hidden rounded-xl border border-border bg-surface text-left transition hover:-translate-y-0.5 hover:border-primary hover:shadow-soft"
               onClick={() => onAdd(key)}
             >
               <div className="relative h-[152px] overflow-hidden border-b border-border px-3.5 pt-3.5" style={{ background: pageBg }}>
@@ -90,14 +90,14 @@ export function SectionGallery({
             </button>
           ))}
 
-          <div className="group flex flex-col overflow-hidden rounded-xl border border-dashed border-border bg-white text-left">
+          <div className="group flex flex-col overflow-hidden rounded-xl border border-dashed border-border bg-surface text-left">
             <div className="flex h-[152px] flex-col justify-center gap-2 border-b border-border bg-muted/30 px-3.5">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Popular ideas — one click</span>
               <div className="flex flex-wrap gap-1.5">
                 {CUSTOM_STARTERS.map((n) => (
                   <button
                     key={n}
-                    className="rounded-full border border-border bg-white px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-primary hover:bg-primary hover:text-white"
+                    className="rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-foreground transition hover:border-primary hover:bg-primary hover:text-white"
                     onClick={() => onAddCustom(n)}
                   >
                     {n}

@@ -1,10 +1,12 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ResumeContent } from '@/types/document'
-import { formatDate, formatDateRange } from '@/lib/utils'
+import { currentYearMonth, formatDate, formatDateRange, isSingleDate, monthNames } from '@/lib/utils'
+import type { DateRangeOptions } from '@/lib/utils'
+import { railLabel } from '@/lib/rail'
+import { pickMonthYear } from '@/lib/monthYear'
 import type { EditFn } from './Editable'
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const NOW_YEAR = new Date().getFullYear()
 const YEARS = Array.from({ length: 75 }, (_, i) => NOW_YEAR + 2 - i)
 
@@ -22,24 +24,74 @@ function ymValue(v: string): number | null {
   return parseInt(y, 10) * 12 + (m ? parseInt(m, 10) - 1 : 0)
 }
 
-/** Two dropdowns (month + year) that read/write a "YYYY-MM" / "YYYY" string. */
-function MonthYear({ value, onChange, present }: { value: string; onChange: (v: string) => void; present?: boolean }) {
+/**
+ * A fresh, distinct END value to land in when leaving Present mode (the user
+ * unticks "Present"). Must never equal `start` — end === start is the
+ * definition of single-date mode (isSingleDate, in lib/utils), and reusing
+ * `start` as-is would silently re-collapse the range and hide the END fields
+ * the user just asked to edit, trapping them right back where they started.
+ *
+ * Granularity follows `start`: a "YYYY-MM" start produces a "YYYY-MM" end
+ * (start advanced by one month, or the current year-month, whichever is
+ * later); a year-only "YYYY" start produces a year-only end (start + 1 year,
+ * or the current year, whichever is later — start + 1 year is always > start,
+ * so that half of the comparison only matters for picking a "nicer" number
+ * when start is far in the past). An empty start has no granularity to
+ * match, so it falls back to the current year-month.
+ */
+export function nextRangeEnd(start: string, now: Date = new Date()): string {
+  const nowY = now.getFullYear()
+  const nowM = now.getMonth() + 1
+  const nowYM = `${nowY}-${String(nowM).padStart(2, '0')}`
+
+  const { y, m } = parseYM(start)
+  if (!y) return nowYM
+
+  if (m) {
+    const startVal = parseInt(y, 10) * 12 + (parseInt(m, 10) - 1)
+    const nowVal = nowY * 12 + (nowM - 1)
+    const chosen = Math.max(startVal + 1, nowVal)
+    const cy = Math.floor(chosen / 12)
+    const cm = (chosen % 12) + 1
+    return `${cy}-${String(cm).padStart(2, '0')}`
+  }
+
+  return String(Math.max(parseInt(y, 10) + 1, nowY))
+}
+
+/** Two dropdowns (month + year) that read/write a "YYYY-MM" / "YYYY" string.
+ *  `months` is the shared month list in the document's language. */
+function MonthYear({
+  value,
+  onChange,
+  present,
+  months,
+}: {
+  value: string
+  onChange: (v: string) => void
+  present?: boolean
+  months: string[]
+}) {
   const { y, m } = parseYM(value)
-  const set = (year: string, month: string) => {
-    if (!year) return onChange('')
-    onChange(month ? `${year}-${month.padStart(2, '0')}` : year)
+  // A month picked before its year is held until the year arrives
+  // (lib/monthYear.ts); it used to be thrown away.
+  const [pendingMonth, setPendingMonth] = useState('')
+  const pick = (change: { month?: string; year?: string }) => {
+    const r = pickMonthYear(value, pendingMonth, change)
+    setPendingMonth(r.pendingMonth)
+    if (r.value !== value) onChange(r.value)
   }
   return (
     <div className="flex gap-1.5">
-      <select className="h-8 flex-1 rounded-md border border-input bg-surface px-1.5 text-sm disabled:opacity-50" value={present ? '' : m} disabled={present} onChange={(e) => set(y, e.target.value)}>
+      <select className="h-8 flex-1 rounded-md border border-input bg-surface px-1.5 text-sm disabled:opacity-50" value={present ? '' : m || pendingMonth} disabled={present} onChange={(e) => pick({ month: e.target.value })}>
         <option value="">Month</option>
-        {MONTHS.map((name, i) => (
+        {months.map((name, i) => (
           <option key={name} value={String(i + 1)}>
             {name}
           </option>
         ))}
       </select>
-      <select className="h-8 flex-1 rounded-md border border-input bg-surface px-1.5 text-sm disabled:opacity-50" value={present ? '' : y} disabled={present} onChange={(e) => set(e.target.value, m)}>
+      <select className={`h-8 flex-1 rounded-md border border-input bg-surface px-1.5 text-sm disabled:opacity-50${pendingMonth && !y ? ' ring-2 ring-primary' : ''}`} value={present ? '' : y} disabled={present} onChange={(e) => pick({ year: e.target.value })}>
         <option value="">Year</option>
         {YEARS.map((yy) => (
           <option key={yy} value={String(yy)}>
@@ -50,6 +102,10 @@ function MonthYear({ value, onChange, present }: { value: string; onChange: (v: 
     </div>
   )
 }
+
+/** What the rail draws beside this entry, as the author stored it. Both
+ *  halves optional: a missing one means the automatic label. */
+export type RailValue = { year?: string; word?: string }
 
 /**
  * Click-to-edit date on the resume canvas. Shows the formatted date (or a hint)
@@ -63,6 +119,12 @@ export function CanvasDate({
   end,
   applyStart,
   applyEnd,
+  dateOpts,
+  railOn,
+  rail,
+  applyRail,
+  sectionKey,
+  status,
 }: {
   edit: EditFn
   range?: boolean
@@ -70,12 +132,34 @@ export function CanvasDate({
   end?: string
   applyStart: (c: ResumeContent, v: string) => void
   applyEnd?: (c: ResumeContent, v: string) => void
+  /** How the date reads here - the document's month style, separator,
+   *  present word and language, plus the section's time span when it asked
+   *  for one - so the label while editing is the text the print render sets. */
+  dateOpts?: DateRangeOptions
+  /** The document's date column is the rail, so this entry HAS a cell there
+   *  to control. False on every template that draws no rail, where the two
+   *  fields would set something invisible. */
+  railOn?: boolean
+  /** The author's own numerals and word for this entry, when they set them. */
+  rail?: RailValue
+  /** Writes them back. Absent for a section the rail draws nothing for. */
+  applyRail?: (c: ResumeContent, rail: RailValue) => void
+  /** Which section this entry is in, and how far along it is - the two
+   *  things the automatic label is decided from, so the fields can show it
+   *  as their placeholder. */
+  sectionKey?: string
+  status?: string
 }) {
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState({ top: 0, left: 0 })
+  // The picker names months the way the page prints them.
+  const months = monthNames(dateOpts?.language)
   const present = !!range && !(end || '').trim()
+  // A single date (one year / one month) is stored as end === start, so it
+  // renders once everywhere and stays valid JSON Resume.
+  const single = !!range && isSingleDate(start, end)
   const endBeforeStart = (() => {
-    if (!range || present) return false
+    if (!range || present || single) return false
     const a = ymValue(start)
     const b = ymValue(end || '')
     return a != null && b != null && b < a
@@ -84,13 +168,31 @@ export function CanvasDate({
   // A range with NO dates at all must invite ("Add dates"), not claim "Present"
   // (formatDateRange treats an empty end as Present, which is wrong when the
   // start is empty too — that's a brand-new, untouched entry).
-  const label = range ? (start.trim() || (end || '').trim() ? formatDateRange(start, end) : 'Add dates') : formatDate(start) || 'Add date'
+  const label = range ? (start.trim() || (end || '').trim() ? formatDateRange(start, end, dateOpts) : 'Add dates') : formatDate(start, dateOpts) || 'Add date'
+
+  // What the rail would draw here on its own - shown as the placeholder, so
+  // the author sees the automatic label before deciding to replace it.
+  const railDefault =
+    railOn && applyRail && sectionKey
+      ? railLabel(sectionKey, { startDate: start, endDate: end, status }, currentYearMonth())
+      : null
 
   const openAt = (e: React.MouseEvent) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
     setPos({ top: r.bottom + 6, left: Math.max(8, Math.min(r.left, window.innerWidth - 248)) })
     setOpen(true)
   }
+  // The popover opens under its button, and an entry low on the screen put
+  // its foot - the Rail row and Done - below the window's edge with nothing
+  // to scroll (2026-09-08). Once it has a height, it moves up as far as it
+  // must to fit, and when even that is not enough it scrolls inside.
+  const panelRef = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    if (!open || !panelRef.current) return
+    const h = panelRef.current.offsetHeight
+    const maxTop = window.innerHeight - h - 8
+    if (pos.top > maxTop) setPos((p) => ({ ...p, top: Math.max(8, maxTop) }))
+  }, [open, pos.top])
 
   return (
     <>
@@ -101,22 +203,75 @@ export function CanvasDate({
         createPortal(
           <>
             <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
-            <div className="fixed z-[61] w-60 rounded-xl border border-border bg-surface p-3 text-foreground shadow-float" style={{ top: pos.top, left: pos.left }}>
-              <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{range ? 'Start' : 'Date'}</div>
-              <MonthYear value={start} onChange={(v) => edit((c) => applyStart(c, v))} />
+            <div
+              ref={panelRef}
+              className="fixed z-[61] max-h-[calc(100vh-16px)] w-60 overflow-y-auto overscroll-contain rounded-xl border border-border bg-surface p-3 text-foreground shadow-float"
+              style={{ top: pos.top, left: pos.left }}
+            >
+              <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                {range ? (single ? 'Date' : 'Start') : 'Date'}
+              </div>
+              <MonthYear
+                value={start}
+                months={months}
+                onChange={(v) =>
+                  edit((c) => {
+                    applyStart(c, v)
+                    // keep a single-date entry collapsed as the start moves
+                    if (single && applyEnd) applyEnd(c, v)
+                  })
+                }
+              />
               {range && applyEnd && (
                 <>
-                  <div className="mb-1 mt-3 flex items-center justify-between">
-                    <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">End</span>
-                    <label className="flex cursor-pointer items-center gap-1 text-xs text-muted-foreground">
-                      <input type="checkbox" className="h-3.5 w-3.5 accent-primary" checked={present} onChange={(e) => edit((c) => applyEnd(c, e.target.checked ? '' : start || `${NOW_YEAR}`))} />
-                      Present
-                    </label>
-                  </div>
-                  <MonthYear value={end || ''} present={present} onChange={(v) => edit((c) => applyEnd(c, v))} />
-                  {endBeforeStart && (
-                    <p className="mt-1.5 text-[11px] font-medium text-danger">End date is before the start date.</p>
+                  {/* One-off entries (a single year) — issue #7. Stored as
+                      end === start so every renderer shows just one date. */}
+                  <label className="mt-2.5 flex w-fit cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 accent-primary"
+                      checked={single}
+                      onChange={(e) => edit((c) => applyEnd(c, e.target.checked ? start || `${NOW_YEAR}` : ''))}
+                    />
+                    Single date (no range)
+                  </label>
+                  {!single && (
+                    <>
+                      <div className="mb-1 mt-3 flex items-center justify-between">
+                        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">End</span>
+                        <label className="flex cursor-pointer items-center gap-1 text-xs text-muted-foreground">
+                          <input type="checkbox" className="h-3.5 w-3.5 accent-primary" checked={present} onChange={(e) => edit((c) => applyEnd(c, e.target.checked ? '' : nextRangeEnd(start)))} />
+                          Present
+                        </label>
+                      </div>
+                      <MonthYear value={end || ''} months={months} present={present} onChange={(v) => edit((c) => applyEnd(c, v))} />
+                      {endBeforeStart && (
+                        <p className="mt-1.5 text-[11px] font-medium text-danger">End date is before the start date.</p>
+                      )}
+                    </>
                   )}
+                </>
+              )}
+              {railOn && applyRail && (
+                <>
+                  <div className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Rail</div>
+                  <div className="flex gap-1">
+                    <input
+                      className="input h-7 w-16 px-1.5 text-xs"
+                      aria-label="Rail year"
+                      placeholder={railDefault?.year ?? 'year'}
+                      value={rail?.year ?? ''}
+                      onChange={(e) => edit((c) => applyRail(c, { ...rail, year: e.target.value }))}
+                    />
+                    <input
+                      className="input h-7 min-w-0 flex-1 px-1.5 text-xs"
+                      aria-label="Rail word"
+                      placeholder={railDefault?.word || 'word'}
+                      value={rail?.word ?? ''}
+                      onChange={(e) => edit((c) => applyRail(c, { ...rail, word: e.target.value }))}
+                    />
+                  </div>
+                  <p className="mt-1 text-[10px] text-muted-foreground">The big year and the word under it. Leave blank for the automatic one.</p>
                 </>
               )}
               <div className="mt-3 flex justify-end">

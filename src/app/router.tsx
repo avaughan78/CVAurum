@@ -2,6 +2,8 @@ import { Component, lazy, Suspense, useEffect, type ComponentType, type ReactNod
 import { createBrowserRouter, useRouteError } from 'react-router-dom'
 import { RootLayout } from './RootLayout'
 import { Landing } from '@/routes/Landing'
+import { NotFound } from '@/routes/NotFound'
+import { GUIDES } from '@/data/guides'
 
 const RELOAD_KEY = 'cvaurum:chunk-reload'
 
@@ -45,6 +47,12 @@ function lazyRoute<T extends { default: ComponentType<unknown> }>(factory: () =>
 
 // Heavy routes are code-split so the homepage loads instantly.
 const Dashboard = lazyRoute(() => import('@/routes/Dashboard').then((m) => ({ default: m.Dashboard })))
+const TemplatesPage = lazyRoute(() => import('@/routes/Templates').then((m) => ({ default: m.Templates })))
+const TemplatePage = lazyRoute(() => import('@/routes/TemplatePage').then((m) => ({ default: m.TemplatePage })))
+const ExamplesPage = lazyRoute(() => import('@/routes/Examples').then((m) => ({ default: m.Examples })))
+const ExamplePage = lazyRoute(() => import('@/routes/ExamplePage').then((m) => ({ default: m.ExamplePage })))
+const PromptsPage = lazyRoute(() => import('@/routes/Prompts').then((m) => ({ default: m.Prompts })))
+const GuidePage = lazyRoute(() => import('@/routes/Guide').then((m) => ({ default: m.Guide })))
 const EditorRoute = lazyRoute(() => import('@/routes/EditorRoute').then((m) => ({ default: m.EditorRoute })))
 const Tracker = lazyRoute(() => import('@/routes/Tracker').then((m) => ({ default: m.Tracker })))
 const PrintPage = lazyRoute(() => import('@/routes/PrintPage').then((m) => ({ default: m.PrintPage })))
@@ -63,6 +71,12 @@ function FailedToLoad() {
     sessionStorage.removeItem(RELOAD_KEY)
     window.location.reload()
   }
+  // The root layout removes the boot splash when it mounts, and an error at
+  // the root replaces the layout, so this card sat underneath the splash
+  // and the visitor saw "Loading CVAurum..." for ever.
+  useEffect(() => {
+    document.getElementById('boot-splash')?.remove()
+  }, [])
   return (
     <div className="flex h-screen flex-col items-center justify-center gap-4 bg-background px-6 text-center text-foreground">
       <h1 className="text-lg font-semibold">This part didn’t load</h1>
@@ -120,10 +134,31 @@ export const router = createBrowserRouter([
     errorElement: <RouteError />,
     children: [
       { path: '/', element: <Landing /> },
+      { path: '/templates', element: s(<TemplatesPage />) },
+      // One indexable page per design — the phrase people search is the
+      // template's name, which the gallery alone can never rank for.
+      { path: '/templates/:id', element: s(<TemplatePage />) },
+      { path: '/examples', element: s(<ExamplesPage />) },
+      // One indexable page per sample - "data analyst resume example" is the
+      // phrase people type, and the library alone can never rank for it.
+      { path: '/examples/:slug', element: s(<ExamplePage />) },
+      // Prompts to hand to an assistant, whose answers this app imports —
+      // public, indexable, and the way in for someone whose history is in a
+      // chat window rather than in a file.
+      { path: '/prompts', element: s(<PromptsPage />) },
+      // One page per search question - "free resume builder", "ATS resume
+      // checker", "resume builder no sign up" - answered in full
+      // (src/data/guides.ts). Listed by slug, not matched by a pattern, so a
+      // mistyped address is still a 404.
+      ...GUIDES.map((g) => ({ path: `/${g.slug}`, element: s(<GuidePage />) })),
       { path: '/app', element: s(<Dashboard />) },
       { path: '/resume/:id', element: s(<EditorRoute />) },
       { path: '/tracker', element: s(<Tracker />) },
       { path: '/r', element: s(<ShareReceive />) },
+      // A wrong address is not an error: it gets its own page, inside the
+      // layout (so the boot splash goes and the toaster works), not the
+      // "this part didn't load" card meant for a chunk that failed to fetch.
+      { path: '*', element: <NotFound /> },
     ],
   },
   // Standalone, chrome-free page used for native "Save as PDF".

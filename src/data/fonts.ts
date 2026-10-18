@@ -22,6 +22,14 @@ export interface FontDef {
   italic?: boolean
   /** CSS fallback stack */
   fallback?: string
+  /** Bundled families that draw what this one lacks, tried BEFORE the
+   *  category's script chain: a small display face falls back to the text
+   *  face it was drawn to sit beside, not to whatever the category offers. */
+  chain?: string[]
+  /** The face does not draw all of Basic Latin (an @ or a $ is missing), so
+   *  the PDF painter checks every run set in it rather than only the runs
+   *  outside Latin (src/lib/pdf/textFallback.ts, mayNeedFallback). */
+  partialLatin?: true
 }
 
 export const FONTS: FontDef[] = [
@@ -46,6 +54,7 @@ export const FONTS: FontDef[] = [
   { name: 'Exo 2', category: 'sans' },
   { name: 'IBM Plex Sans', category: 'sans' },
   { name: 'DM Sans', category: 'sans' },
+  { name: 'Space Grotesk', category: 'sans', weights: [400, 500, 600, 700] },
 
   // — Serif —
   { name: 'Merriweather', category: 'serif', weights: [400, 700, 900] },
@@ -62,6 +71,29 @@ export const FONTS: FontDef[] = [
   { name: 'Cormorant Garamond', category: 'serif', weights: [400, 500, 600, 700] },
   { name: 'Libre Baskerville', category: 'serif', weights: [400, 700] },
   { name: 'Spectral', category: 'serif' },
+  // The one family here that is BUILT rather than fetched: its publisher ships
+  // OpenType files, not a stylesheet, so scripts/make-built-fonts.py downloads
+  // and converts it (CFF -> quadratic glyf) instead of scripts/fetch-fonts.cjs
+  // querying for it. Licence and change log: public/fonts/LICENCE.
+  //
+  // Two weights only, like PT Serif and Tinos: the family has a regular and a
+  // bold and nothing between. resolveFontKey snaps a design asking for 600 to
+  // the nearest, so 700 is what it gets.
+  //
+  // LOCA HEADROOM, measured on the built files, not estimated: short loca can
+  // address 131,070 bytes of glyf, and these land at 112,150 (400) and 106,116
+  // (700) — 18,920 B / 14.4% and 24,954 B / 19.0% under the ceiling, keeping
+  // latin, greek, cyrillic and vietnamese. That is the narrowest margin of any
+  // family here, so a tighter cu2qu tolerance or a wider kept script set could
+  // tip the regular over into long loca, which fontkit subsets into BLANK
+  // GLYPHS (see src/lib/pdf/fontsLoca.test.ts). The web woff2 is deliberately
+  // untrimmed — a browser reads long loca fine, and the trim costs the italics
+  // ễ and ắ.
+  //
+  // No SCRIPT_FALLBACKS entry: it is a Latin face (no Cyrillic at all, 24 of
+  // 57 Greek letters), so the serif chain below carries what it lacks, exactly
+  // as it does for Lato, Volkhov and the two Garamonds.
+  { name: 'Latin Modern Roman', category: 'serif', weights: [400, 700], italic: true },
 
   // — Mono —
   { name: 'JetBrains Mono', category: 'mono' },
@@ -73,6 +105,17 @@ export const FONTS: FontDef[] = [
   { name: 'Bebas Neue', category: 'display', weights: [400] },
   { name: 'Abril Fatface', category: 'display', weights: [400] },
   { name: 'Archivo', category: 'display' },
+  // The two constructed faces (scripts/make-display-faces.py): one regular
+  // cut, unicase - a lowercase letter is drawn as its capital in a glyph of
+  // its own, so the text layer keeps the author's case. They cover Latin
+  // names; anything else in a heading comes from the face each was drawn to
+  // sit beside, then the display chain.
+  { name: 'Flare Display', category: 'display', weights: [400], chain: ['Archivo'], partialLatin: true },
+  { name: 'Dossier Stencil', category: 'display', weights: [400], chain: ['IBM Plex Mono'], partialLatin: true },
+  { name: 'Schematic Outline', category: 'display', weights: [400], chain: ['Archivo'], partialLatin: true },
+  { name: 'Keystone Condensed', category: 'display', weights: [400], chain: ['Archivo'], partialLatin: true },
+  { name: 'Meridian Geometric', category: 'display', weights: [400], chain: ['Archivo'], partialLatin: true },
+  { name: 'Volta Display', category: 'display', weights: [400], chain: ['Archivo'], partialLatin: true },
 
   // — Handwriting / signature (decorative name fonts) —
   { name: 'Dancing Script', category: 'handwriting', weights: [400, 500, 600, 700] },
@@ -91,11 +134,56 @@ const FALLBACKS: Record<FontCategory, string> = {
 
 export const FONT_MAP: Record<string, FontDef> = Object.fromEntries(FONTS.map((f) => [f.name, f]))
 
+/**
+ * Bundled families that draw the scripts a Latin-only family cannot, one
+ * chain per category: the category's own face first (a serif résumé keeps a
+ * serif Cyrillic), then Inter, which covers Cyrillic, Greek and Vietnamese
+ * in full. These sit in the CSS stack right after the chosen family, so the
+ * browser draws a Cyrillic letter with them instead of with whatever system
+ * font it finds; the PDF painter walks the same chain (src/lib/pdf/
+ * textFallback.ts), so the page and the export agree glyph for glyph.
+ */
+export const SCRIPT_FALLBACKS: Record<FontCategory, string[]> = {
+  sans: ['Inter'],
+  serif: ['Source Serif 4', 'Inter'],
+  mono: ['Source Code Pro', 'Inter'],
+  display: ['Oswald', 'Inter'],
+  handwriting: ['Inter'],
+}
+
+/**
+ * The bundled MARKS family — four bullet glyphs (◦ U+25E6, ▪ U+25AA, ✓ U+2713,
+ * ◆ U+25C6) that NO bundled family carries: measured across all 158 PDF faces
+ * and all 257 web-font subset files, 0 of each. Generated outright by
+ * scripts/make-marks-font.py, so its licence is this repository's own.
+ *
+ * It is deliberately NOT in `FONTS` — nobody should be able to set a résumé in
+ * it — and NOT in `SCRIPT_FALLBACKS`, which is about scripts and whose members
+ * must draw Cyrillic, Greek and Vietnamese. It is appended to every chain
+ * below instead, so it is the LAST thing tried: the bullet, en dash and angle
+ * quote every family already has keep coming from the résumé's own face, and
+ * only the four marks nothing has fall through to this.
+ *
+ * Both sides read the chain: the browser through `fontStack` (the CSS the
+ * canvas draws with) and the painter through `PdfFontCache.coverage`. Before
+ * it existed, a ✓ or ◆ bullet was drawn on the canvas from whatever system
+ * font the reader happened to have, and dropped from the PDF entirely.
+ */
+export const MARKS_FAMILY = 'CVAurum Marks'
+
+/** The fallback families for `name`, in order, never naming `name` itself. */
+export function scriptFallbacks(name?: string): string[] {
+  const def = name ? FONT_MAP[name] : undefined
+  const chain = [...(def?.chain ?? []), ...SCRIPT_FALLBACKS[def?.category ?? 'sans'], MARKS_FAMILY]
+  return [...new Set(chain)].filter((f) => f !== name)
+}
+
 export function fontStack(name?: string): string {
   if (!name) return FALLBACKS.sans
   const def = FONT_MAP[name]
   const fb = def ? def.fallback ?? FALLBACKS[def.category] : FALLBACKS.sans
-  return `"${name}", ${fb}`
+  const chain = scriptFallbacks(name).map((f) => `"${f}"`)
+  return [`"${name}"`, ...chain, fb].join(', ')
 }
 
 /**

@@ -3,24 +3,173 @@
  * where you see it (mirrors the per-section gear). Pinned to the viewport's
  * right edge so the header stays visible while it changes live.
  */
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Settings2 } from 'lucide-react'
 import type { ResumeDocument } from '@/types/document'
+import { isPhoneLayout } from '@/lib/layoutMode'
 import type { Metadata } from '@/types/metadata'
 import type { MetaEditFn } from './Editable'
-import { HEADER_STYLES, HeaderMini } from './headerStyles'
+import { ArtBandRow, HEADER_STYLES, HeaderMini } from './headerStyles'
+import { StatTilesEditor } from './StatTilesEditor'
+import { KickerFields } from './PageWordsFields'
 import { FONTS } from '@/data/fonts'
 import { usePopoverA11y } from './popoverA11y'
+import { usePhotoPicker } from '@/components/editor/usePhotoPicker'
 
 /** Curated accent palette — enough range for any industry, all print-safe. */
-const ACCENTS = ['#2563eb', '#0f766e', '#7c3aed', '#b91c1c', '#d4982f', '#a16207', '#db2777', '#15803d', '#475569', '#0f172a']
+const ACCENTS = [
+  '#2563eb',
+  '#0f766e',
+  '#7c3aed',
+  '#b91c1c',
+  '#d4982f',
+  '#a16207',
+  '#db2777',
+  '#15803d',
+  '#475569',
+  '#0f172a',
+]
+
+/**
+ * The contact line: how the details are arranged, what sits between them, and
+ * whether they carry icons.
+ *
+ * Templates used to decide all three, so an author who wanted their details
+ * stacked in a narrow sidebar, or dots between them, had to change TEMPLATE to
+ * get it. These are presentation choices, not template identity.
+ */
+function ContactLinePicker({ doc, editMeta }: { doc: ResumeDocument; editMeta: MetaEditFn }) {
+  const { contactStyle, contactSeparator, icons, contactPlacement, contactLinks, columns } = doc.metadata.layout
+  const fullLinks = doc.metadata.links?.display === 'full'
+  const strip = contactStyle === 'strip'
+  const lined = contactStyle !== 'stacked' && contactStyle !== 'strip' && contactStyle !== 'pills'
+  const row = <T extends string>(
+    name: string,
+    value: T,
+    options: { v: T; label: string; title?: string }[],
+    set: (v: T) => void
+  ) => (
+    <div className="mb-1 flex items-center gap-1.5">
+      <span className="w-14 shrink-0 text-[10px] text-muted-foreground">{name}</span>
+      <div className="flex flex-1 gap-1" role="radiogroup" aria-label={name}>
+        {options.map((o) => (
+          <button
+            key={o.v}
+            type="button"
+            role="radio"
+            aria-checked={value === o.v}
+            title={o.title || o.label}
+            onClick={() => set(o.v)}
+            // min-w-fit, not min-w-0 + truncate: the row shares its width
+            // equally, and at the popover's width "Space" (41px) got 37px
+            // and read "Sp…" - a label a reader cannot use. Every option is
+            // now at least its own word wide, the rest of the row is shared.
+            className={`min-w-fit flex-1 whitespace-nowrap rounded-md border px-1 py-1 text-[11px] font-medium transition ${
+              value === o.v
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border text-muted-foreground hover:border-primary/50'
+            }`}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+  return (
+    <div className="px-2 pb-1.5">
+      {row<'inline' | 'stacked' | 'strip' | 'pills'>(
+        'Arrange',
+        contactStyle ?? 'inline',
+        [
+          { v: 'inline', label: 'Inline', title: 'All on one wrapping line' },
+          { v: 'stacked', label: 'Stacked', title: 'One detail per row - reads better in a narrow sidebar' },
+          { v: 'strip', label: 'Strip', title: 'A ruled strip of labelled cells: EMAIL, PHONE, LINKEDIN over each detail' },
+          { v: 'pills', label: 'Pills', title: 'Each detail in its own soft pill, with its icon' },
+        ],
+        (v) =>
+          editMeta((m) => {
+            m.layout.contactStyle = v
+          })
+      )}
+      {row<'below' | 'beside' | 'above' | 'sidebar'>(
+        'Position',
+        contactPlacement === 'sidebar' && columns !== 2 ? 'below' : (contactPlacement ?? 'below'),
+        [
+          { v: 'below', label: 'Below', title: 'Under the name and headline' },
+          { v: 'beside', label: 'Beside', title: 'A column to the right of the name' },
+          { v: 'above', label: 'Above', title: 'A line over the name, like a letterhead' },
+          ...(columns === 2
+            ? [{ v: 'sidebar' as const, label: 'Sidebar', title: 'At the top of the sidebar, one detail per row' }]
+            : []),
+        ],
+        (v) =>
+          editMeta((m) => {
+            m.layout.contactPlacement = v
+          })
+      )}
+      {lined
+        ? row<'none' | 'dot' | 'pipe' | 'slash' | 'dash' | 'node' | 'chevron'>(
+            'Between',
+            contactSeparator ?? 'none',
+            [
+              { v: 'none', label: 'Space', title: 'Spacing only' },
+              { v: 'node', label: '●', title: 'A small dot in the accent colour' },
+              { v: 'dot', label: '·', title: 'Middle dot' },
+              { v: 'pipe', label: '|', title: 'Vertical bar' },
+              { v: 'slash', label: '/', title: 'Slash' },
+              { v: 'dash', label: '–', title: 'En dash' },
+              { v: 'chevron', label: '>', title: 'Chevron' },
+            ],
+            (v) =>
+              editMeta((m) => {
+                m.layout.contactSeparator = v
+              })
+          )
+        : null}
+      {strip && fullLinks
+        ? row<'ledger' | 'columns' | 'wrap'>(
+            'Links',
+            contactLinks ?? 'ledger',
+            [
+              { v: 'ledger', label: 'Ledger', title: 'Short details in the strip, whole links listed under it' },
+              { v: 'columns', label: '2 cols', title: 'The strip in two wider columns, so a whole link fits' },
+              { v: 'wrap', label: 'Wrap', title: 'Three columns; a long link breaks at its slashes - a parser then reads it as two pieces' },
+            ],
+            (v) =>
+              editMeta((m) => {
+                m.layout.contactLinks = v
+              })
+          )
+        : null}
+      {row<'on' | 'off'>(
+        'Icons',
+        icons === false ? 'off' : 'on',
+        [
+          { v: 'on', label: 'Show' },
+          { v: 'off', label: 'Hide' },
+        ],
+        (v) =>
+          editMeta((m) => {
+            m.layout.icons = v === 'on'
+          })
+      )}
+      {!lined ? (
+        <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">
+          {strip ? 'The strip’s rules do the separating.' : contactStyle === 'pills' ? 'Each pill is its own separator.' : 'Stacked rows never take a separator.'}
+        </p>
+      ) : null}
+    </div>
+  )
+}
 
 /** Identity mark: exactly ONE of none / monogram / photo — never a placeholder. */
 function IdentityMarkPicker({ doc, editMeta }: { doc: ResumeDocument; editMeta: MetaEditFn }) {
   const { monogram, showPhoto } = doc.metadata.layout
   const hasImage = !!doc.content.basics.image
-  const current: 'none' | 'monogram' | 'photo' = showPhoto && hasImage ? 'photo' : monogram ? 'monogram' : showPhoto ? 'photo' : 'none'
+  const current: 'none' | 'monogram' | 'photo' =
+    showPhoto && hasImage ? 'photo' : monogram ? 'monogram' : showPhoto ? 'photo' : 'none'
   const pick = (v: 'none' | 'monogram' | 'photo') =>
     editMeta((m) => {
       m.layout.monogram = v === 'monogram'
@@ -49,24 +198,115 @@ function IdentityMarkPicker({ doc, editMeta }: { doc: ResumeDocument; editMeta: 
       </div>
       {current === 'photo' && !hasImage && (
         <p className="mt-1 text-[10px] leading-snug text-amber-600 dark:text-amber-400">
-          No photo uploaded yet — add one under Content → Personal details. Nothing prints until you do (no placeholder, ever).
+          No photo yet — use <strong>Add photo…</strong> just below. Nothing prints until you do (no placeholder, ever).
         </p>
       )}
     </div>
   )
 }
 
-export function HeaderGear({ doc, editMeta }: { doc: ResumeDocument; editMeta: MetaEditFn }) {
+/**
+ * The picture itself, where the author came looking for it.
+ *
+ * "Style" is where someone goes to change how the header looks, and the
+ * identity mark row above can say PHOTO without there being any way, from
+ * here, to say WHICH photo. This row is that way — the same file → crop →
+ * save flow as the panel and the canvas, plus the one destructive option,
+ * which clears the picture and stops the layout asking for one (a cleared
+ * image with `showPhoto` still on leaves the header silently empty).
+ */
+function PhotoRow({ doc }: { doc: ResumeDocument }) {
+  const picker = usePhotoPicker()
+  const hasImage = !!doc.content.basics.image
+  return (
+    <div className="px-2 pb-1.5">
+      <div className="flex gap-1">
+        <button
+          type="button"
+          onClick={picker.open}
+          className="flex-1 rounded-md border border-border px-1.5 py-1 text-[11px] font-medium text-muted-foreground transition hover:border-primary/50 hover:text-foreground"
+        >
+          {hasImage ? 'Change photo…' : 'Add photo…'}
+        </button>
+        {hasImage ? (
+          <button
+            type="button"
+            onClick={picker.remove}
+            className="flex-1 rounded-md border border-border px-1.5 py-1 text-[11px] font-medium text-danger transition hover:border-danger/60 hover:bg-danger/10"
+          >
+            Remove photo
+          </button>
+        ) : null}
+      </div>
+      {picker.ui}
+    </div>
+  )
+}
+
+/**
+ * Which shape this popover takes. A floating card can only be reached with a
+ * pointer that can hover a scrollbar and a window that can be resized; on a
+ * touch screen whatever hangs below the edge is simply gone. Phones took the
+ * sheet already; a tablet (touch, but wider than 640) was left with the card
+ * and lost its bottom strip. Desktop - any width, because a fine pointer is
+ * what decides - keeps the card exactly as before.
+ */
+export function wantsSheet() {
+  if (isPhoneLayout()) return true
+  const w = document.documentElement.clientWidth
+  const coarse = typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches
+  return coarse && w < 1024
+}
+
+export function HeaderGear({ doc, editMeta, variant }: { doc: ResumeDocument; editMeta: MetaEditFn; variant?: string }) {
   const [open, setOpen] = useState(false)
   const [top, setTop] = useState(0)
+  // The room left under `top`. The panel used to cap its height at the whole
+  // window (100vh-16px) no matter how far down it started, so top + height
+  // fell below the window edge and the last controls - the body font among
+  // them - could not be scrolled back into view.
+  const [maxH, setMaxH] = useState(0)
+  const [sheet, setSheet] = useState(false)
   const current = doc.metadata.layout.headerStyle ?? ''
   const panelRef = useRef<HTMLDivElement>(null)
   // Escape closes; focus moves in on open and back to the gear on close.
   usePopoverA11y(open, () => setOpen(false), panelRef)
 
+  // The numbers band on the canvas is decoration - aria-hidden outlines, not
+  // editable text - so a click on a tile cannot edit it in place. It asks the
+  // header's popover to open at the Numbers group instead.
+  useEffect(() => {
+    const onOpen = () => {
+      setSheet(wantsSheet())
+      const t = Math.max(8, Math.min(120, window.innerHeight - 420))
+      setTop(t)
+      setMaxH(window.innerHeight - t - 8)
+      setOpen(true)
+      requestAnimationFrame(() => panelRef.current?.querySelector('#hg-numbers')?.scrollIntoView({ block: 'start' }))
+    }
+    window.addEventListener('cvaurum:open-header-numbers', onOpen)
+    return () => window.removeEventListener('cvaurum:open-header-numbers', onOpen)
+  }, [])
+
   const openPopover = (e: React.MouseEvent) => {
+    // Phones get a bottom sheet, exactly like the section style sheet. As a
+    // floating panel this opened level with the header - mid-screen on a
+    // phone - so most of its height hung below the viewport and the reader
+    // saw a cut-off card that would not scroll (reported from a phone,
+    // 2026-08-30; the panel itself scrolled, but only within the sliver
+    // that was actually on screen).
+    if (wantsSheet()) {
+      setSheet(true)
+      setOpen(true)
+      return
+    }
+    setSheet(false)
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-    setTop(Math.max(8, Math.min(r.top - 4, window.innerHeight - 420)))
+    // Level with the pill, but never starting so low that the panel's own
+    // height would run off the bottom: what is left under `top` IS the cap.
+    const t = Math.max(8, Math.min(r.top - 4, window.innerHeight - 420))
+    setTop(t)
+    setMaxH(window.innerHeight - t - 8)
     setOpen(true)
   }
   const pick = (value: string) =>
@@ -90,15 +330,23 @@ export function HeaderGear({ doc, editMeta }: { doc: ResumeDocument; editMeta: M
       {open &&
         createPortal(
           <>
-            <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
+            <div className={`fixed inset-0 z-[60] ${sheet ? 'bg-black/35' : ''}`} onClick={() => setOpen(false)} />
             <div
               ref={panelRef}
               role="dialog"
               aria-modal="true"
               tabIndex={-1}
               aria-label="Header style and layout"
-              className="fixed z-[61] max-h-[calc(100vh-16px)] w-[19rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-xl border border-border bg-surface p-1.5 text-foreground shadow-float"
-              style={{ top, left: Math.max(8, document.documentElement.clientWidth - 304 - 12) }}
+              className={
+                sheet
+                  ? 'fixed inset-x-0 bottom-0 z-[61] overflow-y-auto overflow-x-hidden overscroll-contain rounded-t-2xl border-t border-border bg-surface p-1.5 pb-4 text-foreground shadow-float'
+                  : 'fixed z-[61] w-[19rem] overflow-y-auto overflow-x-hidden overscroll-contain rounded-xl border border-border bg-surface p-1.5 text-foreground shadow-float'
+              }
+              style={
+                sheet
+                  ? { maxHeight: Math.round(window.innerHeight * 0.8) }
+                  : { top, maxHeight: maxH, left: Math.max(8, document.documentElement.clientWidth - 304 - 12) }
+              }
             >
               <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                 Header <span className="font-normal normal-case">— layout</span>
@@ -117,16 +365,62 @@ export function HeaderGear({ doc, editMeta }: { doc: ResumeDocument; editMeta: M
                       <span className="flex h-8 w-full items-center justify-center overflow-hidden rounded-[3px] border border-border/70 bg-white p-1">
                         <HeaderMini kind={h.value} />
                       </span>
-                      <span className={`text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}>{h.label}</span>
+                      <span
+                        className={`text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}
+                      >
+                        {h.label}
+                      </span>
                     </button>
                   )
                 })}
+              </div>
+              {/* The line above the name, where the composition draws one:
+                  its words are the author's, never the design's. */}
+              {variant === 'kicker' ? (
+                <>
+                  <div className="mx-2 my-1 border-t border-border" />
+                  <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Above the name <span className="font-normal normal-case">— your own words</span>
+                  </div>
+                  <KickerFields doc={doc} editMeta={editMeta} compact />
+                </>
+              ) : null}
+              <div className="mx-2 my-1 border-t border-border" />
+              <div
+                id="hg-numbers"
+                className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
+              >
+                Numbers <span className="font-normal normal-case">— the band of figures</span>
+              </div>
+              <StatTilesEditor doc={doc} editMeta={editMeta} />
+              <div className="mx-2 my-1 border-t border-border" />
+              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Art <span className="font-normal normal-case">— behind the header</span>
+              </div>
+              <div className="px-2 pb-1.5">
+                <ArtBandRow
+                  value={doc.metadata.theme.artBand ?? 'none'}
+                  onPick={(band) =>
+                    editMeta((m) => {
+                      m.theme.artBand = band as Metadata['theme']['artBand']
+                    })
+                  }
+                />
               </div>
               <div className="mx-2 my-1 border-t border-border" />
               <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                 Identity mark
               </div>
               <IdentityMarkPicker doc={doc} editMeta={editMeta} />
+              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Photo <span className="font-normal normal-case">— the picture itself</span>
+              </div>
+              <PhotoRow doc={doc} />
+              <div className="mx-2 my-1 border-t border-border" />
+              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Contact line
+              </div>
+              <ContactLinePicker doc={doc} editMeta={editMeta} />
               <div className="mx-2 my-1 border-t border-border" />
               <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                 Accent color
@@ -176,7 +470,7 @@ export function HeaderGear({ doc, editMeta }: { doc: ResumeDocument; editMeta: M
               </p>
             </div>
           </>,
-          document.body,
+          document.body
         )}
     </>
   )

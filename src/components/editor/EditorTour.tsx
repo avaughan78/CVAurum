@@ -10,27 +10,51 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { X, ArrowRight, ArrowLeft, Sparkles } from 'lucide-react'
+import { isPhoneLayout } from '@/lib/layoutMode'
+import { TEMPLATE_COUNT } from '@/templates/registry'
 
-const TOUR_KEY = 'cvaurum:tour:v1'
+const TOUR_KEY = 'cvaurum:tour:v2'
 const CARD_W = 324
 
 interface Step {
   sel?: string
   title: string
   body: string
+  /** What this step says on a phone, where the canvas is hidden behind the
+   *  panel and hover does not exist. The desktop body told a phone user to
+   *  click text they could not see and hover things a finger cannot - the
+   *  guidance was WRONG there, not merely unanchored (reported live,
+   *  2026-08-29). Steps without one read the same everywhere. */
+  mobileBody?: string
+  /** A step about a desktop-only surface (the command palette) is skipped on
+   *  a phone rather than described apologetically. */
+  desktopOnly?: boolean
+  /** On a phone, SHOW the surface the step talks about - the tour used to
+   *  describe the template gallery while the Content form stayed on screen,
+   *  which read as the tour being broken. Runs when the step opens, phone
+   *  only; desktop anchors its ring to the real control instead. */
+  mobileShow?: { tab?: 'content' | 'design' | 'templates' | 'ats'; panelOpen?: boolean; event?: string }
+  /** Anchor to use on a phone when the desktop one is hidden there - the
+   *  restyle step rings the panel's own Style button instead of a canvas
+   *  that is not on screen, so the centered fallback card cannot end up
+   *  covering the very control the words describe. */
+  mobileSel?: string
 }
 
+/* Titles carry no numbers - the prefix is added at render, so skipping the
+   desktop-only steps on a phone keeps the numbering sequential. */
 const STEPS: Step[] = [
-  { title: 'Welcome — quick tour 👋', body: "A 30-second look at where everything is. Skip anytime, and reopen it from the “?” in the top bar." },
-  { sel: '[data-tour="nav"]', title: '1 · Choose a section', body: 'Switch between Content, Design, Templates, and the ATS check here.' },
-  { sel: '[data-tour="panel"]', title: '2 · Fill in your details', body: 'Type your name, experience, and skills. Empty sections show an “Add” button — nothing is hidden.' },
-  { sel: '[data-tour="canvas"]', title: '3 · Edit on the page', body: 'Click any text on the resume to edit it right there. What you see is exactly what you export.' },
-  { sel: '[data-tour="canvas"]', title: '4 · Restyle any section', body: 'Hover a section and press its “Style” pill — pick heading, layout, and skill styles from live visual previews. The header has one too, with photo/monogram options.' },
-  { sel: '[data-tour="modes"]', title: '5 · Edit · Preview · ATS', body: 'Edit is the live canvas. Preview shows exactly what exports. ATS shows the plain text a recruiting system reads — plus a per-system parse simulation (Workday, Greenhouse, Lever, Taleo, iCIMS) and an on-device writing coach.' },
-  { sel: '[data-tour="templates"]', title: '6 · Switch templates', body: 'Try any of 52 designs — hover one for a full-size preview with your content, click to switch. Nothing is re-typed.' },
-  { sel: '[data-tour="share"]', title: '7 · Share privately', body: 'Send an encrypted link — your résumé is sealed with a passphrase inside the link and never touches a server, so even a cached link can’t be read without it.' },
-  { sel: '[data-tour="palette"]', title: '8 · Do anything with ⌘K', body: 'Press ⌘K / Ctrl+K for a command palette — switch templates, fonts, accents, add sections, change mode. Inside a summary, type “/” for quick inserts.' },
-  { sel: '[data-tour="export"]', title: '9 · Download, free', body: 'Export a crisp PDF or Word file — unlimited, no account, no watermark. Everything stays in your browser.' },
+  { title: 'Welcome — a quick tour 👋', body: 'Thirty seconds on where everything is. Skip it anytime and reopen it from the “?” in the top bar.' },
+  { sel: '[data-tour="panel"]', mobileShow: { tab: 'content', panelOpen: true }, title: 'Fill in your details', body: 'Type your name, experience and skills here. Empty sections show an “Add” button — nothing is hidden.' },
+  { sel: '[data-tour="canvas"]', mobileShow: { panelOpen: false }, title: 'Or edit on the page', body: 'Click any text on the résumé to edit it right there. What you see is exactly what you download.', mobileBody: 'This is the page itself — tap any text to edit it. The Content tab below reopens the full forms; everything you type lands here instantly.' },
+  { sel: '[data-tour="templates"]', mobileShow: { tab: 'templates', panelOpen: true }, title: `${TEMPLATE_COUNT} designs, one résumé`, body: 'Hover a design for a full-size preview with your own content; click to switch. Nothing is retyped, and every design can be restyled afterwards.', mobileBody: 'Tap any design to switch. Nothing is retyped, and every design can be restyled afterwards.' },
+  { sel: '[data-tour="design"]', mobileShow: { tab: 'design', panelOpen: true }, title: 'Make it yours', body: 'Design changes colours, fonts, the header, the contact line and where it sits, heading styles, where dates and language levels go, one or two columns, spacing and page size — on any template.' },
+  { sel: '[data-tour="canvas"]', mobileSel: '.rm-panel-gear .rm-section-gear', mobileShow: { tab: 'content', panelOpen: true, event: 'cvaurum:tour-show-style' }, title: 'Restyle one section', body: 'Hover a section and press its “Style” pill to change just that section: heading, icon, entry layout, date position. The eye beside it hides the section.', mobileBody: 'This “Style” button restyles one section — heading, icon, entry layout, date position. The ⋯ menu renames, hides or removes it.' },
+  { sel: '[data-tour="checks"]', mobileShow: { panelOpen: false }, title: 'Your size, your pages, readable', body: 'This chip says what the page prints: the size you set, with content flowing onto a new page when it needs one. If a few lines spill over, it offers to fit them back — never below 9pt. Beside it, the contrast check confirms every line meets WCAG AA.' },
+  { sel: '[data-tour="modes"]', title: 'Edit · Preview · ATS', body: 'Preview shows exactly what exports. ATS shows the plain text an applicant-tracking system reads, how five kinds of system would split it into fields, and a keyword match against the job.' },
+  { sel: '[data-tour="palette"]', title: 'Do anything with ⌘K', body: 'Press ⌘K / Ctrl+K for a command palette — switch designs, fonts and colours, add sections, change mode. In a summary, type “/” for quick inserts.', desktopOnly: true },
+  { sel: '[data-tour="share"]', title: 'Share privately', body: 'Send an encrypted link: the résumé is sealed with a passphrase inside the link and never touches a server.' },
+  { sel: '[data-tour="export"]', title: 'Download, free', body: 'PDF or Word, unlimited, no account, no watermark. The PDF is real selectable text, tagged for screen readers (PDF/UA-1) and archival (PDF/A-2B).' },
 ]
 
 export function EditorTour() {
@@ -62,12 +86,33 @@ export function EditorTour() {
     return () => window.removeEventListener('cvaurum:open-tour', onOpen)
   }, [])
 
-  const step = STEPS[i]
+  // The phone layout is where the panel covers the canvas, so it is also
+  // where the desktop wording stops being true.
+  const mobile = isPhoneLayout()
+  const steps = mobile ? STEPS.filter((st) => !st.desktopOnly) : STEPS
+  const step = steps[i]
+
+  // Bring the surface a step talks about onto the screen (phone only).
+  useEffect(() => {
+    if (!open || !mobile || !step?.mobileShow) return
+    import('@/store/useEditorStore').then(({ useEditorStore }) => {
+      const es = useEditorStore.getState()
+      if (step.mobileShow!.tab) es.setLeftTab(step.mobileShow!.tab)
+      if (step.mobileShow!.panelOpen !== undefined) es.setLeftOpen(step.mobileShow!.panelOpen)
+      // Some steps need a surface prepared beyond tab switching - the restyle
+      // step asks the organizer to expand its first card so the Style button
+      // the words point at is actually on screen.
+      if (step.mobileShow!.event) setTimeout(() => window.dispatchEvent(new Event(step.mobileShow!.event!)), 120)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, i, mobile])
 
   // Measure the current target (re-measure on step change, resize, scroll).
   const measure = useCallback(() => {
-    if (!open || !step?.sel) return setRect(null)
-    const el = document.querySelector(step.sel) as HTMLElement | null
+    const mobileNow = isPhoneLayout()
+    const sel = (mobileNow && step?.mobileSel) || step?.sel
+    if (!open || !sel) return setRect(null)
+    const el = document.querySelector(sel) as HTMLElement | null
     const r = el?.getBoundingClientRect() ?? null
     setRect(r && r.width > 4 && r.height > 4 ? r : null)
   }, [open, step])
@@ -96,7 +141,7 @@ export function EditorTour() {
 
   if (!open) return null
 
-  const last = i === STEPS.length - 1
+  const last = i === steps.length - 1
   const vw = window.innerWidth
   const vh = window.innerHeight
 
@@ -140,18 +185,19 @@ export function EditorTour() {
         <div className="mb-1 flex items-start justify-between gap-2">
           <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
             {i === 0 && <Sparkles className="h-4 w-4 text-primary" />}
+            {i > 0 ? `${i} · ` : ''}
             {step.title}
           </div>
           <button className="btn-icon h-6 w-6 shrink-0" onClick={finish} aria-label="Skip tour" title="Skip">
             <X className="h-4 w-4" />
           </button>
         </div>
-        <p className="text-sm leading-relaxed text-muted-foreground">{step.body}</p>
+        <p className="text-sm leading-relaxed text-muted-foreground">{(mobile && step.mobileBody) || step.body}</p>
 
         <div className="mt-4 flex items-center justify-between">
           {/* progress dots */}
           <div className="flex items-center gap-1.5">
-            {STEPS.map((_, n) => (
+            {steps.map((_, n) => (
               <span key={n} className={`h-1.5 rounded-full transition-all ${n === i ? 'w-4 bg-primary' : 'w-1.5 bg-muted-foreground/30'}`} />
             ))}
           </div>

@@ -1,0 +1,1071 @@
+/**
+ * The Word export honours the document's own page margin, base type size,
+ * line height and contact separator. It used to hard-code 0.75in margins, a
+ * fixed 10pt scale and a bullet between contacts, so a resume set 20mm wide at
+ * 11pt with pipes between its details came out of Word looking like a
+ * different document. The metrics are pure functions, asserted exactly; the
+ * packed XML is then opened to prove the numbers land in the section and run
+ * properties Word reads.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { Packer } from 'docx'
+import JSZip from 'jszip'
+import { buildDocx, docxMetrics, loadArtBandImage, setArtBandImage } from './docx'
+import { createDocument, defaultMetadata } from '@/data/defaults'
+import { SAMPLE_CONTENT } from '@/data/sample'
+import type { ResumeDocument } from '@/types/document'
+import type { Metadata } from '@/types/metadata'
+import type { MetadataOverrides } from '@/data/defaults'
+
+// The sanitizer wraps a DOM purifier that needs a window, and this suite runs
+// under vitest's plain 'node' environment (see vitest.config.ts). The bullet
+// text asserted below is plain, so handing it back unchanged is exactly what
+// the real sanitizer does with it.
+vi.mock('@/lib/sanitize', () => ({ sanitizeHtml: (html: string) => html }))
+
+const docWith = (overrides: MetadataOverrides = {}): ResumeDocument =>
+  ({
+    id: 'res-1',
+    title: 'T',
+    createdAt: 0,
+    updatedAt: 0,
+    jobDescription: '',
+    content: {
+      basics: {
+        name: 'Jordan Rivera',
+        label: 'Product Designer',
+        email: 'jordan@example.com',
+        phone: '+1 555 0100',
+        location: { city: 'Lisbon' },
+        profiles: [],
+      },
+      work: [{ id: 'w1', name: 'Acme', position: 'Designer', startDate: '2021-03', endDate: '' }],
+      volunteer: [],
+      education: [],
+      awards: [],
+      certificates: [],
+      publications: [],
+      skills: [],
+      languages: [],
+      interests: [],
+      references: [],
+      projects: [],
+      custom: [],
+    },
+    metadata: defaultMetadata({ ...overrides, layout: { main: ['work'], ...(overrides.layout ?? {}) } }),
+  }) as unknown as ResumeDocument
+
+/** The two parts of the package the assertions read. */
+async function unpack(doc: ResumeDocument, fitScale = 1) {
+  const buf = await Packer.toBuffer(buildDocx(doc, fitScale))
+  const zip = await JSZip.loadAsync(buf)
+  const body = await zip.file('word/document.xml')!.async('string')
+  const styles = await zip.file('word/styles.xml')!.async('string')
+  return { body, styles }
+}
+
+/** Every text run, in document order. */
+const texts = (xml: string) => [...xml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)].map((m) => m[1])
+
+/** The half-point size of the run that prints `text`. */
+function runSize(xml: string, text: string): number | undefined {
+  const runs = xml.split('<w:r>').slice(1)
+  const run = runs.find((r) => r.includes(`>${text}</w:t>`))
+  const m = run?.match(/<w:sz w:val="(\d+)"/)
+  return m ? Number(m[1]) : undefined
+}
+
+const pgMar = (xml: string) => {
+  const m = xml.match(/<w:pgMar\s([^>]*)\/>/)
+  const side = (k: string) => Number(m?.[1].match(new RegExp(`w:${k}="(\\d+)"`))?.[1])
+  return { top: side('top'), right: side('right'), bottom: side('bottom'), left: side('left') }
+}
+const docDefaultLine = (styles: string) => {
+  const d = styles.match(/<w:docDefaults>([\s\S]*?)<\/w:docDefaults>/)?.[1] ?? ''
+  return Number(d.match(/<w:spacing[^>]*w:line="(\d+)"/)?.[1])
+}
+
+describe('docxMetrics', () => {
+  it('turns the page margin from millimetres into twips', () => {
+    // 13mm is the schema default; 20mm is a common wide margin.
+    expect(docxMetrics(defaultMetadata()).margin).toBe(737)
+    expect(docxMetrics(defaultMetadata({ page: { margin: 20 } })).margin).toBe(1134)
+    expect(docxMetrics(defaultMetadata({ page: { margin: 0 } })).margin).toBe(0)
+  })
+
+  it('derives every run size from the base size with the canvas ratios', () => {
+    // The canvas sets the name at fs * (1.55 + headingScale * 0.62), the
+    // section title at fs * sectionTitleScale (1.06 stock), the headline at
+    // headlineScale (1.15), contacts at contactScale (0.95), entry titles at
+    // 1.05, sub-lines at 0.95 and dates at 0.92 (Artboard.tsx useVars,
+    // artboard.css). Half-points, so a 9.6pt body is 19 and the default name 48.
+    const a = docxMetrics(defaultMetadata()).sizes
+    expect(a).toEqual({ name: 48, headline: 22, section: 20, title: 20, body: 19, sub: 18, contact: 18, date: 18 })
+    const b = docxMetrics(defaultMetadata({ typography: { fontSize: 11, headingScale: 2 } })).sizes
+    expect(b).toEqual({ name: 61, headline: 25, section: 23, title: 23, body: 22, sub: 21, contact: 21, date: 20 })
+  })
+
+  it('sizes the section titles, the headline and the contacts by their own scales', () => {
+    // 9.6pt * 1.3 * 2 = 24.96, * 1.4 * 2 = 26.88, * 0.8 * 2 = 15.36. Sub-lines
+    // keep their own ratio: a smaller contact line is not a smaller org line.
+    const s = docxMetrics(defaultMetadata({ typography: { sectionTitleScale: 1.3, headlineScale: 1.4, contactScale: 0.8 } })).sizes
+    expect(s.section).toBe(25)
+    expect(s.headline).toBe(27)
+    expect(s.contact).toBe(15)
+    expect(s.sub).toBe(18)
+  })
+
+  it('applies the one-page fit scale to the sizes and to nothing else', () => {
+    const m = docxMetrics(defaultMetadata(), 0.8)
+    expect(m.sizes.body).toBe(15)
+    expect(m.sizes.name).toBe(38)
+    expect(m.margin).toBe(737)
+    expect(m.line).toBe(252)
+  })
+
+  it('clamps the fit scale to the floor and ceiling the on-screen fit uses', () => {
+    expect(docxMetrics(defaultMetadata(), 0.2).sizes.body).toBe(docxMetrics(defaultMetadata(), 0.66).sizes.body)
+    expect(docxMetrics(defaultMetadata(), 3).sizes.body).toBe(docxMetrics(defaultMetadata(), 1.15).sizes.body)
+    expect(docxMetrics(defaultMetadata(), 0).sizes.body).toBe(19)
+  })
+
+  it('maps the line height onto Word line spacing, keeping the default where it was', () => {
+    // Word's single spacing already spans the font's own line box (about
+    // 1.22em for the usual body faces) while the canvas line-height is a
+    // bare multiple of the type size, so the multiplier is divided out. The
+    // export's long-standing 252 is exactly 240 * 1.28 / 1.22.
+    expect(docxMetrics(defaultMetadata()).line).toBe(252)
+    expect(docxMetrics(defaultMetadata({ typography: { lineHeight: 1.6 } })).line).toBe(315)
+    expect(docxMetrics(defaultMetadata({ typography: { lineHeight: 1 } })).line).toBe(197)
+  })
+
+  it('prints the same glyph between contacts that the canvas draws', () => {
+    const sep = (v: 'none' | 'dot' | 'pipe' | 'slash' | 'dash') =>
+      docxMetrics(defaultMetadata({ layout: { contactSeparator: v } })).separator
+    expect(sep('dot')).toBe('   ·   ')
+    expect(sep('pipe')).toBe('   |   ')
+    expect(sep('slash')).toBe('   /   ')
+    expect(sep('dash')).toBe('   –   ')
+    // 'none' is spacing only, never a bullet.
+    expect(sep('none').trim()).toBe('')
+    expect(sep('none').length).toBeGreaterThan(0)
+  })
+})
+
+describe('buildDocx writes the metrics into the package', () => {
+  it('default document: 13mm margins, 9.6pt scale, 1.28 leading, spaced contacts', async () => {
+    const { body, styles } = await unpack(docWith())
+    expect(pgMar(body)).toEqual({ top: 737, right: 737, bottom: 737, left: 737 })
+    expect(docDefaultLine(styles)).toBe(252)
+    expect(runSize(body, 'Jordan Rivera')).toBe(48)
+    expect(runSize(body, 'Product Designer')).toBe(22)
+    expect(runSize(body, 'EXPERIENCE')).toBe(20)
+    expect(runSize(body, 'Designer')).toBe(20)
+    expect(runSize(body, 'jordan@example.com')).toBe(18)
+    const all = texts(body).join('')
+    expect(all).not.toContain('•')
+    expect(all).not.toContain('|')
+    expect(texts(body)).toContain('    ')
+  })
+
+  it('a wide, large, airy document with pipes: 20mm, 11pt, 1.6 leading', async () => {
+    const doc = docWith({
+      page: { margin: 20, format: 'Letter' },
+      typography: { fontSize: 11, lineHeight: 1.6, headingScale: 2 },
+      layout: { contactSeparator: 'pipe' },
+    })
+    const { body, styles } = await unpack(doc)
+    expect(pgMar(body)).toEqual({ top: 1134, right: 1134, bottom: 1134, left: 1134 })
+    expect(docDefaultLine(styles)).toBe(315)
+    expect(runSize(body, 'Jordan Rivera')).toBe(61)
+    expect(runSize(body, 'Product Designer')).toBe(25)
+    expect(runSize(body, 'EXPERIENCE')).toBe(23)
+    expect(runSize(body, 'Designer')).toBe(23)
+    expect(runSize(body, 'jordan@example.com')).toBe(21)
+    expect(texts(body).filter((t) => t === '   |   ')).toHaveLength(2)
+    expect(texts(body).join('')).not.toContain('•')
+  })
+
+  it('the fit scale shrinks the type without touching the margins', async () => {
+    const { body } = await unpack(docWith(), 0.8)
+    expect(pgMar(body).left).toBe(737)
+    expect(runSize(body, 'Jordan Rivera')).toBe(38)
+    expect(runSize(body, 'Designer')).toBe(16)
+  })
+
+  it('the right tab for dates sits at the text width the margin leaves', async () => {
+    // A4 is 11906 twips wide; two 20mm margins leave 9638.
+    const { body } = await unpack(docWith({ page: { margin: 20 } }))
+    expect(body).toMatch(/<w:tab w:val="right" w:pos="9638"\/>/)
+  })
+})
+
+/** A one-pixel image, standing in for a decoded art band. */
+const PIXEL = {
+  data: new Uint8Array([
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196,
+    137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68,
+    174, 66, 96, 130,
+  ]),
+  type: 'png' as const,
+}
+
+/** The paragraph that prints `text`, with its properties. */
+const paraOf = (xml: string, text: string) => xml.split('<w:p>').slice(1).find((p) => p.includes(`>${text}</w:t>`)) ?? ''
+const indAttr = (p: string, k: 'left' | 'hanging') => {
+  const m = p.match(/<w:ind\s([^>]*)\/>/)?.[1].match(new RegExp(`w:${k}="(\\d+)"`))
+  return m ? Number(m[1]) : undefined
+}
+const spacingAfter = (p: string) => {
+  const m = p.match(/<w:spacing[^>]*w:after="(\d+)"/)
+  return m ? Number(m[1]) : undefined
+}
+
+describe('bullet indent and bullet spacing', () => {
+  // The page sets a highlight list in by typography.bulletIndent (em of the
+  // base size) and spaces its bullets by typography.bulletGap (em). Word
+  // takes the same distances in twips at the same base size: 1.05em of
+  // 9.6pt is 10.08pt = 202 twips; 0.2em is 1.92pt = 38 twips.
+  //
+  // A bullet's text is read through a DOM element and there is none here,
+  // so a text-only element stands in (the stand-in pdf/export.test.ts uses).
+  const originalDocument = globalThis.document
+  beforeEach(() => {
+    globalThis.document = {
+      createElement: () => ({
+        childNodes: [] as { nodeType: number; textContent: string }[],
+        set innerHTML(html: string) {
+          this.childNodes = [{ nodeType: 3, textContent: html }]
+        },
+        get textContent() {
+          return this.childNodes.map((n) => n.textContent).join('')
+        },
+      }),
+    } as unknown as Document
+  })
+  afterEach(() => {
+    globalThis.document = originalDocument
+  })
+
+  it('docxMetrics turns the em values into twips at the base size', () => {
+    const a = docxMetrics(defaultMetadata())
+    expect(a.bulletIndent).toBe(202)
+    expect(a.bulletGap).toBe(38)
+    const b = docxMetrics(defaultMetadata({ typography: { fontSize: 11, bulletIndent: 1.5, bulletGap: 0.4 } }))
+    expect(b.bulletIndent).toBe(330)
+    expect(b.bulletGap).toBe(88)
+  })
+
+  it('the fit scale shrinks the indent with the type, as an em does on the page', () => {
+    expect(docxMetrics(defaultMetadata(), 0.8).bulletIndent).toBe(161)
+    expect(docxMetrics(defaultMetadata(), 0.8).bulletGap).toBe(31)
+  })
+
+  it('a bullet paragraph hangs its marker in the indent and takes the gap after', async () => {
+    const doc = docWith({ typography: { fontSize: 11, bulletIndent: 1.5, bulletGap: 0.4 } })
+    doc.content.work[0].highlights = ['Shipped the thing', 'Then shipped the next thing']
+    const { body } = await unpack(doc)
+    const p = paraOf(body, 'Shipped the thing')
+    expect(p).toContain('<w:numPr>')
+    expect(indAttr(p, 'left')).toBe(330)
+    expect(indAttr(p, 'hanging')).toBe(330)
+    expect(spacingAfter(p)).toBe(88)
+  })
+
+  it('with no marker the text still sits at the indent, nothing hangs', async () => {
+    const doc = docWith({ typography: { bulletStyle: 'none' } })
+    doc.content.work[0].highlights = ['Shipped the thing', 'Then shipped the next thing']
+    const { body } = await unpack(doc)
+    const p = paraOf(body, 'Shipped the thing')
+    expect(p).not.toContain('<w:numPr>')
+    expect(indAttr(p, 'left')).toBe(202)
+    expect(indAttr(p, 'hanging')).toBeUndefined()
+    expect(spacingAfter(p)).toBe(38)
+  })
+
+  // The gap is the air BETWEEN bullets - the canvas draws none after the last
+  // one - so giving it to every bullet padded the end of every list, and a
+  // roomy gap pushed the entry below it down by a distance the page never
+  // showed.
+  it('the gap falls between bullets; the last of a list takes the trailing value', async () => {
+    const doc = docWith({ typography: { fontSize: 11, bulletIndent: 1.5, bulletGap: 0.4 } })
+    doc.content.work[0].highlights = ['First thing', 'Second thing', 'Last thing']
+    const { body } = await unpack(doc)
+    expect(spacingAfter(paraOf(body, 'First thing'))).toBe(88)
+    expect(spacingAfter(paraOf(body, 'Second thing'))).toBe(88)
+    expect(spacingAfter(paraOf(body, 'Last thing'))).toBe(16)
+  })
+
+  it('a one-bullet list is all last bullet, and an empty one is skipped on the way', async () => {
+    const doc = docWith({ typography: { fontSize: 11, bulletIndent: 1.5, bulletGap: 0.4 } })
+    doc.content.work[0].highlights = ['Only thing']
+    expect(spacingAfter(paraOf((await unpack(doc)).body, 'Only thing'))).toBe(16)
+    // A blank highlight never prints, so it cannot be the one that gets the
+    // trailing value while a real bullet sits under it.
+    doc.content.work[0].highlights = ['Real thing', '']
+    expect(spacingAfter(paraOf((await unpack(doc)).body, 'Real thing'))).toBe(16)
+  })
+})
+
+describe('the Word export prints the time span the page shows', () => {
+  // The span rides on the same date string the page sets, so the right-tab
+  // date reads "Mar 2021 - Feb 2023 (2 yrs)" in Word exactly as on the canvas.
+  // The fixture's open-ended range is closed first so the words do not age.
+  it('appends it to the right-tab date when the section asks', async () => {
+    const doc = docWith({ layout: { sectionSettings: { work: { showDuration: true } } } })
+    doc.content.work[0].endDate = '2023-02'
+    const { body } = await unpack(doc)
+    expect(texts(body).join('')).toContain('Mar 2021 — Feb 2023 (2 yrs)')
+  })
+
+  it('prints the bare range when it does not', async () => {
+    const doc = docWith()
+    doc.content.work[0].endDate = '2023-02'
+    const all = texts((await unpack(doc)).body).join('')
+    expect(all).toContain('Mar 2021 — Feb 2023')
+    expect(all).not.toContain('(2 yrs)')
+  })
+})
+
+describe('the Word export prints dates the way the document formats them', () => {
+  // The month style, the separator, the present word and the language are
+  // the document's, read by the same formatter the page uses, so the
+  // right-tab date in Word is the date on the canvas character for character.
+  it('follows the month style, the separator and the present word', async () => {
+    const doc = docWith({ dates: { month: 'long', separator: 'to', present: 'Current' } })
+    const all = texts((await unpack(doc)).body).join('')
+    expect(all).toContain('March 2021 to Current')
+    expect(all).not.toContain('Present')
+  })
+
+  it('names the month in the document\'s language, on single dates too', async () => {
+    const doc = docWith({ dates: { month: 'long', language: 'de', separator: 'endash' } })
+    doc.content.work[0].endDate = '2023-02'
+    doc.content.certificates = [{ id: 'c1', name: 'Cloud Architect', issuer: 'Vendor', date: '2024-09' }] as never
+    doc.metadata.layout.main = ['work', 'certificates']
+    const all = texts((await unpack(doc)).body).join('')
+    expect(all).toContain('März 2021 – Februar 2023')
+    expect(all).toContain('September 2024')
+  })
+
+  it('reads as it always did when the document never chose', async () => {
+    const doc = docWith()
+    const all = texts((await unpack(doc)).body).join('')
+    expect(all).toContain('Mar 2021 — Present')
+  })
+})
+
+describe('the Word export colours each element the way the page does', () => {
+  // The run that prints `text`, with its properties; and the paragraph.
+  const runOf = (xml: string, text: string) => xml.split('<w:r>').slice(1).find((r) => r.includes(`>${text}</w:t>`)) ?? ''
+  const runColor = (xml: string, text: string) => runOf(xml, text).match(/<w:color w:val="([0-9A-F]{6})"/)?.[1]
+  const ruleColor = (xml: string, text: string) => paraOf(xml, text).match(/<w:bottom [^>]*w:color="([0-9A-F]{6})"/)?.[1]
+
+  const linked = (overrides: MetadataOverrides = {}) => {
+    const doc = docWith(overrides)
+    doc.content.basics.url = 'https://jordan.example'
+    return doc
+  }
+
+  it('the name, the headline, the section titles and their rule, the contacts and the links take their own colours', async () => {
+    const { body } = await unpack(
+      linked({ theme: { name: '#112233', headline: '#445566', headings: '#b45309', contacts: '#778899', links: '#0a0b0c' } })
+    )
+    expect(runColor(body, 'Jordan Rivera')).toBe('112233')
+    expect(runColor(body, 'Product Designer')).toBe('445566')
+    expect(runColor(body, 'EXPERIENCE')).toBe('B45309')
+    expect(ruleColor(body, 'EXPERIENCE')).toBe('B45309')
+    expect(runColor(body, 'Lisbon')).toBe('778899')
+    // A linked contact stays on the contact line's colour, as on the page.
+    expect(runColor(body, 'jordan.example')).toBe('778899')
+  })
+
+  it('a links colour alone never reaches a linked contact; the contacts keep theirs', async () => {
+    // The page prints the whole contact line in one colour whatever the link
+    // colour is (`.rm-contacts a { color: inherit }`), so a linked contact
+    // here stays in the colour this export always printed it in - the accent
+    // - and only a contact colour moves it.
+    const { body } = await unpack(linked({ theme: { links: '#0a0b0c' } }))
+    expect(runColor(body, 'jordan.example')).toBe('2563EB')
+    expect(runColor(body, 'Lisbon')).toBe('5B6472')
+  })
+
+  it('unset, each falls back to the colour this export always printed it in', async () => {
+    const { body } = await unpack(linked({ theme: { primary: '#0f766e' } }))
+    expect(runColor(body, 'Jordan Rivera')).toBe('0F766E')
+    expect(runColor(body, 'Product Designer')).toBe('0F766E')
+    expect(runColor(body, 'EXPERIENCE')).toBe('0F766E')
+    expect(ruleColor(body, 'EXPERIENCE')).toBe('0F766E')
+    expect(runColor(body, 'Lisbon')).toBe('5B6472')
+    expect(runColor(body, 'jordan.example')).toBe('0F766E')
+  })
+})
+
+describe('the Word export sets headings, the headline and the contacts the way the page does', () => {
+  // The run that prints `text`, with its properties.
+  const runOf = (xml: string, text: string) => xml.split('<w:r>').slice(1).find((r) => r.includes(`>${text}</w:t>`)) ?? ''
+
+  it('the section title size follows sectionTitleScale', async () => {
+    const { body } = await unpack(docWith({ typography: { sectionTitleScale: 1.3 } }))
+    expect(runSize(body, 'EXPERIENCE')).toBe(25)
+  })
+
+  it('the headline and the contacts follow their own scales', async () => {
+    const { body } = await unpack(docWith({ typography: { headlineScale: 1.4, contactScale: 0.8 } }))
+    expect(runSize(body, 'Product Designer')).toBe(27)
+    expect(runSize(body, 'Lisbon')).toBe(15)
+  })
+
+  it('small caps: the label keeps its case and the run is marked small caps', async () => {
+    // Decoration, never text: the words stay "Experience" for any reader of
+    // the file, and Word draws the small caps itself.
+    const { body } = await unpack(docWith({ typography: { headingCase: 'smallcaps', uppercaseHeadings: true } }))
+    expect(runOf(body, 'Experience')).toContain('<w:smallCaps/>')
+    expect(texts(body)).not.toContain('EXPERIENCE')
+  })
+
+  it('as typed: the label prints plain, whatever the legacy flag says', async () => {
+    const { body } = await unpack(docWith({ typography: { headingCase: 'none', uppercaseHeadings: true } }))
+    expect(runOf(body, 'Experience')).not.toContain('<w:smallCaps/>')
+    expect(texts(body)).not.toContain('EXPERIENCE')
+  })
+
+  it('upper: the legacy flag alone still uppercases, and so does the explicit choice', async () => {
+    const flag = await unpack(docWith({ typography: { uppercaseHeadings: true } }))
+    expect(texts(flag.body)).toContain('EXPERIENCE')
+    const chosen = await unpack(docWith({ typography: { headingCase: 'upper', uppercaseHeadings: false } }))
+    expect(texts(chosen.body)).toContain('EXPERIENCE')
+  })
+
+  it('a regular heading and a light name drop the bold; the defaults keep it', async () => {
+    const chosen = await unpack(docWith({ typography: { headingWeight: 'regular', nameWeight: 'light' } }))
+    expect(runOf(chosen.body, 'EXPERIENCE')).not.toContain('<w:b/>')
+    expect(runOf(chosen.body, 'Jordan Rivera')).not.toContain('<w:b/>')
+    const stock = await unpack(docWith())
+    expect(runOf(stock.body, 'EXPERIENCE')).toContain('<w:b/>')
+    expect(runOf(stock.body, 'Jordan Rivera')).toContain('<w:b/>')
+  })
+})
+
+describe('the Word export aligns and spaces headings the way the page does', () => {
+  // A centred heading is a centred paragraph; the air under a heading is the
+  // spacing after it, riding the same multiplier the page's margin rides; the
+  // rule under it is the paragraph border, at the width the author chose
+  // (Word measures borders in eighths of a point: a pixel is six of them).
+  const heading = (xml: string) => paraOf(xml, 'EXPERIENCE')
+  const spacingAfter = (p: string) => Number(p.match(/<w:spacing [^>]*w:after="(\d+)"/)?.[1])
+  const ruleSize = (p: string) => Number(p.match(/<w:bottom [^>]*w:sz="(\d+)"/)?.[1])
+
+  it('a centred section prints a centred heading; the default is not aligned', async () => {
+    const centred = await unpack(docWith({ layout: { sectionSettings: { work: { headingAlign: 'center' } } } }))
+    expect(heading(centred.body)).toContain('<w:jc w:val="center"/>')
+    const stock = await unpack(docWith())
+    expect(heading(stock.body)).not.toContain('<w:jc ')
+  })
+
+  it('the spacing after a heading follows headingGap, from the 80 twips it always was', async () => {
+    expect(spacingAfter(heading((await unpack(docWith())).body))).toBe(80)
+    expect(spacingAfter(heading((await unpack(docWith({ typography: { headingGap: 1.5 } }))).body))).toBe(120)
+  })
+
+  it('the rule takes the chosen width; unset keeps the width it always drew', async () => {
+    expect(ruleSize(heading((await unpack(docWith())).body))).toBe(6)
+    expect(ruleSize(heading((await unpack(docWith({ typography: { headingRuleWidth: 2 } }))).body))).toBe(12)
+    expect(ruleSize(heading((await unpack(docWith({ typography: { headingRuleWidth: 1 } }))).body))).toBe(6)
+  })
+})
+
+describe('the Word export leads and stresses each entry the way the section does', () => {
+  // The lead line is the paragraph with the right-tab date; the other field
+  // is the sub-line under it. Which of the two is bold follows the section's
+  // emphasis - a FIELD, not a slot - so the title stays bold under a leading
+  // company until the section stresses the company instead.
+  const runOf = (xml: string, text: string) => xml.split('<w:r>').slice(1).find((r) => r.includes(`>${text}</w:t>`)) ?? ''
+  // Only the lead line carries the right tab stop for its date.
+  const dated = (xml: string, text: string) => paraOf(xml, text).includes('<w:tabs>')
+  const withEntries = (sectionSettings: Metadata['layout']['sectionSettings'] = {}) => {
+    const doc = docWith({ layout: { main: ['work', 'education', 'volunteer', 'custom-x1'], sectionSettings } })
+    doc.content.work[0].endDate = '2023-02'
+    doc.content.education = [
+      { id: 'e1', institution: 'State University', studyType: 'BSc', area: 'Computer Science', startDate: '2015', endDate: '2019', courses: [] },
+    ] as never
+    doc.content.volunteer = [{ id: 'v1', organization: 'Food Bank', position: 'Driver', startDate: '2020', endDate: '2021', highlights: [] }] as never
+    doc.content.custom = [{ id: 'x1', name: 'Talks', items: [{ id: 'i1', name: 'Keynote', subtitle: 'DevConf', date: '2022', highlights: [] }] }] as never
+    return doc
+  }
+
+  it('by default the title leads, bold, and the organisation sits under it', async () => {
+    const { body } = await unpack(withEntries())
+    expect(dated(body, 'Designer')).toBe(true)
+    expect(runOf(body, 'Designer')).toContain('<w:b/>')
+    expect(runOf(body, 'Acme')).not.toContain('<w:b/>')
+    expect(dated(body, 'BSc, Computer Science')).toBe(true)
+    expect(runOf(body, 'BSc, Computer Science')).toContain('<w:b/>')
+    expect(runOf(body, 'State University')).not.toContain('<w:b/>')
+    expect(dated(body, 'Driver')).toBe(true)
+    expect(dated(body, 'Keynote')).toBe(true)
+  })
+
+  it('organisation first puts the company on the date line and the position under it', async () => {
+    const all = { entryOrder: 'org-first' } as const
+    const { body } = await unpack(withEntries({ work: all, education: all, volunteer: all, 'custom-x1': all }))
+    expect(dated(body, 'Acme')).toBe(true)
+    expect(dated(body, 'Designer')).toBe(false)
+    expect(dated(body, 'State University')).toBe(true)
+    expect(dated(body, 'BSc, Computer Science')).toBe(false)
+    expect(dated(body, 'Food Bank')).toBe(true)
+    expect(dated(body, 'Driver')).toBe(false)
+    expect(dated(body, 'DevConf')).toBe(true)
+    expect(dated(body, 'Keynote')).toBe(false)
+    // The bold stays on the title by default, now in the sub-line.
+    expect(runOf(body, 'Acme')).not.toContain('<w:b/>')
+    expect(runOf(body, 'Designer')).toContain('<w:b/>')
+  })
+
+  it('the bold follows the emphasis, not the slot', async () => {
+    const under = await unpack(withEntries({ work: { entryEmphasis: 'org' } }))
+    expect(dated(under.body, 'Designer')).toBe(true)
+    expect(runOf(under.body, 'Designer')).not.toContain('<w:b/>')
+    expect(runOf(under.body, 'Acme')).toContain('<w:b/>')
+    const lead = await unpack(withEntries({ work: { entryOrder: 'org-first', entryEmphasis: 'org' } }))
+    expect(dated(lead.body, 'Acme')).toBe(true)
+    expect(runOf(lead.body, 'Acme')).toContain('<w:b/>')
+    expect(runOf(lead.body, 'Designer')).not.toContain('<w:b/>')
+  })
+})
+
+describe('the Word export places the location and the date the way the section does', () => {
+  // Where the location prints and which side the date sits on are the
+  // section's, and the Word file follows: with-date joins the two into the
+  // one string the tab carries, and a left date leads its paragraph on a
+  // left tab stop instead of trailing it on a right one.
+  // The first run's words, without the tab the export writes beside them.
+  const firstText = (p: string) => /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/.exec(p)?.[1].replace(/\t/g, '')
+  const tabKind = (p: string) => /<w:tab w:val="(\w+)"/.exec(p)?.[1]
+  const withPlaces = (sectionSettings: Metadata['layout']['sectionSettings'] = {}, rest: MetadataOverrides = {}) => {
+    const doc = docWith({ ...rest, layout: { main: ['work', 'education', 'custom-x1'], sectionSettings } })
+    doc.content.work[0].endDate = '2023-02'
+    doc.content.work[0].location = 'Austin, TX'
+    doc.content.education = [
+      {
+        id: 'e1',
+        institution: 'State University',
+        studyType: 'BSc',
+        area: 'Computer Science',
+        location: 'Boston, MA',
+        startDate: '2015',
+        endDate: '2019',
+        courses: [],
+      },
+    ] as never
+    doc.content.custom = [
+      { id: 'x1', name: 'Talks', items: [{ id: 'i1', name: 'Keynote', subtitle: 'DevConf', date: '2022', location: 'Berlin', highlights: [] }] },
+    ] as never
+    return doc
+  }
+
+  it('by default the location sits on the sub-line under the title', async () => {
+    const all = texts((await unpack(withPlaces())).body).join('|')
+    expect(all).toContain('Acme  ·  Austin, TX')
+    expect(all).toContain('State University  ·  Boston, MA')
+    expect(all).toContain('DevConf  ·  Berlin')
+  })
+
+  it('with-date joins the location and the date on the tab, and clears the sub-line', async () => {
+    const on = { locationPlacement: 'with-date' } as const
+    const all = texts((await unpack(withPlaces({ work: on, education: on, 'custom-x1': on }))).body).join('|')
+    expect(all).toContain('Austin, TX | Mar 2021 — Feb 2023')
+    expect(all).toContain('Boston, MA | 2015 — 2019')
+    expect(all).toContain('Berlin | 2022')
+    expect(all).not.toContain('Acme  ·  Austin, TX')
+    expect(all).not.toContain('State University  ·  Boston, MA')
+    expect(all).not.toContain('DevConf  ·  Berlin')
+  })
+
+  it('a left date leads its paragraph on a left tab stop', async () => {
+    const { body } = await unpack(withPlaces({ work: { dateAlign: 'left' } }))
+    const p = paraOf(body, 'Designer')
+    expect(firstText(p)).toBe('Mar 2021 — Feb 2023')
+    expect(tabKind(p)).toBe('left')
+  })
+
+  it('the stock right date still trails its title on a right tab stop', async () => {
+    const p = paraOf((await unpack(withPlaces())).body, 'Designer')
+    expect(firstText(p)).toBe('Designer')
+    expect(tabKind(p)).toBe('right')
+  })
+
+  // A right margin column takes the date out of the head row and prints it at
+  // the page's right edge, so the Word file uses the right tab it has always
+  // had for that reading - even where the section itself asked for a left one.
+  it('a right margin column puts the date back on the right tab', async () => {
+    const doc = withPlaces({ work: { dateAlign: 'left' } })
+    doc.metadata.layout.metaColumn = 'margin'
+    const p = paraOf((await unpack(doc)).body, 'Designer')
+    expect(firstText(p)).toBe('Designer')
+    expect(tabKind(p)).toBe('right')
+  })
+
+  it('a left gutter leaves the Word file exactly as it was', async () => {
+    const doc = withPlaces({ work: { dateAlign: 'left' } })
+    doc.metadata.layout.metaColumn = 'gutter'
+    const p = paraOf((await unpack(doc)).body, 'Designer')
+    expect(firstText(p)).toBe('Mar 2021 — Feb 2023')
+    expect(tabKind(p)).toBe('left')
+    // The gutter's years are decoration, so none of them is written.
+    expect(texts((await unpack(doc)).body).join('|')).not.toContain('to now')
+  })
+
+  // A column narrower than the date it holds is no column at all: Word runs
+  // past the single stop to its own default grid, and the titles of a section
+  // land at different offsets down the page. A conservative lower bound on
+  // the width a run needs: a proportional face averages about half its point
+  // size per character, and the date prints at SIZE.date half-points, so
+  // len * (size / 2) * 0.5 * 20 twips === len * size * 5.
+  const needs = (text: string, halfPoints: number) => text.length * halfPoints * 5
+  const tabPos = (p: string) => Number(/<w:tab w:val="left" w:pos="(\d+)"/.exec(p)?.[1])
+  const indent = (p: string) => {
+    const a = /<w:ind ([^>]*)\/>/.exec(p)?.[1] ?? ''
+    const n = (k: string) => Number(new RegExp(`w:${k}="(\\d+)"`).exec(a)?.[1])
+    return { left: n('left'), hanging: n('hanging') }
+  }
+
+  it('widens the left date column to hold a long date, and hangs the title beside it', async () => {
+    const doc = withPlaces({ work: { dateAlign: 'left' } }, { dates: { month: 'long' } })
+    const p = paraOf((await unpack(doc)).body, 'Designer')
+    const date = firstText(p) ?? ''
+    expect(date).toBe('March 2021 — February 2023')
+    const pos = tabPos(p)
+    expect(pos).toBeGreaterThan(needs(date, docxMetrics(doc.metadata).sizes.date))
+    // The wrapped second line of a title stays in the title column instead of
+    // falling back under the date.
+    expect(indent(p)).toEqual({ left: pos, hanging: pos })
+  })
+
+  it('keeps a short date on a narrower column than a long one', async () => {
+    const short = paraOf((await unpack(withPlaces({ work: { dateAlign: 'left' } }))).body, 'Designer')
+    const long = paraOf(
+      (await unpack(withPlaces({ work: { dateAlign: 'left' } }, { dates: { month: 'long' } }))).body,
+      'Designer'
+    )
+    expect(tabPos(short)).toBeGreaterThan(needs(firstText(short) ?? '', docxMetrics(defaultMetadata()).sizes.date))
+    expect(tabPos(long)).toBeGreaterThan(tabPos(short))
+  })
+})
+
+describe('the Word export holds an entry to its own body when entries are kept whole', () => {
+  // Word chains one paragraph to the next; it has no "keep this group
+  // together". So the policy maps to the seam that shows: an entry's head
+  // line holds the line under it, and a page break can never leave a title
+  // alone at the foot of a page. See the note in docx.ts.
+  const keepNext = (p: string) => p.includes('<w:keepNext/>')
+  const entryDoc = (metadata: MetadataOverrides) => {
+    const doc = docWith(metadata)
+    doc.content.work[0].highlights = ['Shipped the thing']
+    return doc
+  }
+  // A bullet's text is read through a DOM element and there is none here, so
+  // the same text-only stand-in the indent suite above uses stands in.
+  const originalDocument = globalThis.document
+  beforeEach(() => {
+    globalThis.document = {
+      createElement: () => ({
+        childNodes: [] as { nodeType: number; textContent: string }[],
+        set innerHTML(html: string) {
+          this.childNodes = [{ nodeType: 3, textContent: html }]
+        },
+        get textContent() {
+          return this.childNodes.map((n) => n.textContent).join('')
+        },
+      }),
+    } as unknown as Document
+  })
+  afterEach(() => {
+    globalThis.document = originalDocument
+  })
+
+  it('holds the head line, and does not hold the bullet under it (that would glue the next entry on)', async () => {
+    const { body } = await unpack(entryDoc({ page: { keepEntriesWhole: true } }))
+    expect(keepNext(paraOf(body, 'Designer'))).toBe(true)
+    expect(keepNext(paraOf(body, 'Acme'))).toBe(true)
+    expect(keepNext(paraOf(body, 'Shipped the thing'))).toBe(false)
+  })
+
+  it('holds nothing while the document breaks pages as it always did', async () => {
+    const { body } = await unpack(entryDoc({}))
+    expect(keepNext(paraOf(body, 'Designer'))).toBe(false)
+    expect(keepNext(paraOf(body, 'Acme'))).toBe(false)
+  })
+
+  it('lets one section opt out of a document that keeps its entries whole', async () => {
+    const { body } = await unpack(
+      entryDoc({ page: { keepEntriesWhole: true }, layout: { sectionSettings: { work: { keepTogether: false } } } })
+    )
+    expect(keepNext(paraOf(body, 'Designer'))).toBe(false)
+  })
+
+  it('lets one section opt in on a document that does not', async () => {
+    const { body } = await unpack(entryDoc({ layout: { sectionSettings: { work: { keepTogether: true } } } }))
+    expect(keepNext(paraOf(body, 'Designer'))).toBe(true)
+  })
+})
+
+describe('the Word export reads the footer strip last', () => {
+  // The Word file is the linear copy: a section moved to the footer strip
+  // follows the main column and the sidebar, as the ATS text reads it, even
+  // when the body lists it first - and it keeps its words.
+  it('prints a footer section after the body', async () => {
+    const doc = docWith({ layout: { main: ['skills', 'work'], footer: ['skills'] } })
+    doc.content.skills = [{ id: 's1', name: 'Tools', level: '', keywords: ['Figma'] }]
+    const { body } = await unpack(doc)
+    const runs = texts(body)
+    const at = (re: RegExp) => runs.findIndex((t) => re.test(t))
+    expect(at(/^experience$/i)).toBeGreaterThan(-1)
+    expect(at(/^skills$/i)).toBeGreaterThan(at(/^experience$/i))
+    expect(runs.some((t) => t.includes('Figma'))).toBe(true)
+  })
+})
+
+describe('the Word export composes the header the way the page does', () => {
+  // Three of the Signature compositions have a Word approximation: a display
+  // masthead centres the name at twice its size and rules the contact line
+  // above and below; a block and a band put the header in one shaded cell
+  // with the text in whichever of white and the text colour reads better on
+  // the accent. Word draws no gradient, so a band takes the accent alone.
+  const runOf = (xml: string, text: string) => xml.split('<w:r>').slice(1).find((r) => r.includes(`>${text}</w:t>`)) ?? ''
+  const runColor = (xml: string, text: string) => runOf(xml, text).match(/<w:color w:val="([0-9A-F]{6})"/)?.[1]
+  const table = (xml: string) => xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/)?.[0] ?? ''
+
+  it('display: a centred name at twice its size, and a contact line ruled above and below', async () => {
+    const { body } = await unpack(docWith({ layout: { headerStyle: 'display' } }))
+    expect(paraOf(body, 'Jordan Rivera')).toMatch(/<w:jc w:val="center"\/>/)
+    expect(runSize(body, 'Jordan Rivera')).toBe(96)
+    expect(paraOf(body, 'Product Designer')).toMatch(/<w:jc w:val="center"\/>/)
+    const contacts = paraOf(body, 'Lisbon')
+    expect(contacts).toMatch(/<w:top [^>]*w:val="single"/)
+    expect(contacts).toMatch(/<w:bottom [^>]*w:val="single"/)
+    expect(table(body)).toBe('')
+  })
+
+  it('block and band: one cell shaded in the accent, the header inside it in white', async () => {
+    for (const headerStyle of ['block', 'band'] as const) {
+      const { body } = await unpack(docWith({ layout: { headerStyle }, theme: { primary: '#0f766e', gradientTo: '#5eead4' } }))
+      const cell = table(body)
+      expect(cell).toMatch(/<w:shd [^>]*w:fill="0F766E"/)
+      expect(cell).not.toContain('5EEAD4')
+      for (const text of ['Jordan Rivera', 'Product Designer', 'Lisbon']) {
+        expect(cell).toContain(`>${text}</w:t>`)
+        expect(runColor(cell, text)).toBe('FFFFFF')
+      }
+      // The header still reads before the first section.
+      expect(body.indexOf('Jordan Rivera')).toBeLessThan(body.indexOf('EXPERIENCE'))
+    }
+  })
+
+  it('a light block takes the text colour, and a chosen element colour still wins', async () => {
+    const light = await unpack(docWith({ layout: { headerStyle: 'block' }, theme: { primary: '#fde047', text: '#1f2937' } }))
+    expect(runColor(table(light.body), 'Jordan Rivera')).toBe('1F2937')
+    const chosen = await unpack(docWith({ layout: { headerStyle: 'band' }, theme: { primary: '#0f766e', name: '#fbbf24' } }))
+    expect(runColor(table(chosen.body), 'Jordan Rivera')).toBe('FBBF24')
+    expect(runColor(table(chosen.body), 'Lisbon')).toBe('FFFFFF')
+  })
+
+  it('the stats band never reaches the file', async () => {
+    const { body } = await unpack(docWith({ layout: { headerStyle: 'band', stats: true } }))
+    expect(texts(body).some((t) => /^(years|companies|skills)$/.test(t))).toBe(false)
+  })
+
+  it('stepped: the name, the role and the contacts on three shaded lines of their own', async () => {
+    const { body } = await unpack(docWith({ layout: { headerStyle: 'stepped' }, theme: { primary: '#123d2e' } }))
+    // The accent, then the same accent lightened 14% and 28% - the shades
+    // the page grades the three bands with (Artboard.tsx useVars).
+    expect(paraOf(body, 'Jordan Rivera')).toMatch(/<w:shd [^>]*w:fill="123D2E"/)
+    expect(paraOf(body, 'Product Designer')).toMatch(/<w:shd [^>]*w:fill="33584B"/)
+    expect(paraOf(body, 'Lisbon')).toMatch(/<w:shd [^>]*w:fill="547369"/)
+    for (const text of ['Jordan Rivera', 'Product Designer', 'Lisbon']) expect(runColor(body, text)).toBe('FFFFFF')
+    // Three paragraphs, not a table: the words stay in the reading order.
+    expect(table(body)).toBe('')
+  })
+
+  it('the art band prints as a strip above the header, and only when it was decoded', async () => {
+    // A browser decodes the band before the export runs; a test hands the
+    // builder the pixels itself (loadArtBandImage needs an image decoder,
+    // which this environment has none of).
+    setArtBandImage(PIXEL)
+    const on = await unpack(docWith({ theme: { artBand: 'emerald' } }))
+    expect(on.body).toContain('<w:drawing>')
+    expect(on.body.indexOf('<w:drawing>')).toBeLessThan(on.body.indexOf('Jordan Rivera'))
+    const off = await unpack(docWith({ theme: { artBand: 'none' } }))
+    expect(off.body).not.toContain('<w:drawing>')
+    setArtBandImage(null)
+    const undecoded = await unpack(docWith({ theme: { artBand: 'emerald' } }))
+    expect(undecoded.body).not.toContain('<w:drawing>')
+    expect(await loadArtBandImage('emerald')).toBeNull()
+  })
+})
+
+describe('the Word export writes a ring as a line', () => {
+  // A ring on the page is a level in a circle. Word gets the same fact as
+  // text - "Label - 92%", one line per ringed skill, and first, as the rings
+  // come first. A ringed category still lists its keywords below it, and a
+  // skill with no level keeps its keywords as it always did.
+  it('rings: rated skills become label - percent lines, the rest stay as they were', async () => {
+    const doc = docWith({ layout: { main: ['skills'], sectionSettings: { skills: { skillsStyle: 'rings' } } } })
+    doc.content.skills = [
+      { id: 's1', name: 'Tools', level: '', keywords: ['Docker'] },
+      { id: 's2', name: 'Frontend', level: '', keywords: ['React'], rating: 4 },
+      { id: 's3', name: 'TypeScript', level: '', keywords: [], rating: 4.6 },
+    ]
+    const { body } = await unpack(doc)
+    const runs = texts(body)
+    expect(runs).toContain('Frontend - 80%')
+    expect(runs).toContain('TypeScript - 92%')
+    expect(runs.some((t) => t.includes('Docker'))).toBe(true)
+    expect(runs.some((t) => t.includes('React'))).toBe(true)
+    expect(runs.indexOf('TypeScript - 92%')).toBeLessThan(runs.findIndex((t) => t.includes('Docker')))
+    // The leaf skill prints once, as its ring line; no meter glyphs join it.
+    expect(runs.filter((t) => t.startsWith('TypeScript')).length).toBe(1)
+  })
+})
+
+describe('the Word export shades the footer strip', () => {
+  // The strip on the page is a coloured band at the foot with its text
+  // computed for contrast. Word draws it as one shaded cell after the last
+  // section, filled with the theme's footer colour (the text colour when
+  // none is set), its words in whichever of white and the text colour reads
+  // on that fill, one paragraph per skill group.
+  const runOf = (xml: string, text: string) => xml.split('<w:r>').slice(1).find((r) => r.includes(`>${text}</w:t>`)) ?? ''
+  const runColor = (xml: string, text: string) => runOf(xml, text).match(/<w:color w:val="([0-9A-F]{6})"/)?.[1]
+  const tables = (xml: string) => xml.match(/<w:tbl>[\s\S]*?<\/w:tbl>/g) ?? []
+
+  it('one cell in the footer colour, after the body, with the groups as lines in white', async () => {
+    const doc = docWith({ layout: { main: ['work'], footer: ['skills'] }, theme: { footer: '#0f766e' } })
+    doc.content.skills = [
+      { id: 's1', name: 'Frontend', level: '', keywords: ['React', 'Vite'] },
+      { id: 's2', name: 'Data', level: '', keywords: ['SQL'] },
+    ]
+    const { body } = await unpack(doc)
+    const cell = tables(body).find((t) => t.includes('Frontend')) ?? ''
+    expect(cell).toMatch(/<w:shd [^>]*w:fill="0F766E"/)
+    expect(cell).toContain('>Frontend:  </w:t>')
+    expect(cell).toContain('>Data:  </w:t>')
+    expect(runColor(cell, 'Frontend:  ')).toBe('FFFFFF')
+    expect(runColor(cell, 'SQL')).toBe('FFFFFF')
+    // The strip reads after the body's last section.
+    expect(body.indexOf('<w:tbl>')).toBeGreaterThan(body.indexOf('EXPERIENCE'))
+  })
+
+  it('falls back to the text colour for the fill when the theme sets none', async () => {
+    const doc = docWith({ layout: { main: ['work'], footer: ['languages'] }, theme: { text: '#1a1a1a' } })
+    doc.content.languages = [{ id: 'l1', language: 'English', fluency: 'Native' }]
+    const { body } = await unpack(doc)
+    const cell = tables(body).find((t) => t.includes('English')) ?? ''
+    expect(cell).toMatch(/<w:shd [^>]*w:fill="1A1A1A"/)
+    expect(runColor(cell, 'English')).toBe('FFFFFF')
+  })
+
+  it('draws no strip at all when the footer is empty', async () => {
+    const { body } = await unpack(docWith({ layout: { main: ['work'] } }))
+    expect(tables(body)).toEqual([])
+  })
+})
+
+/**
+ * A course that has not finished yet, in the Word file. The date string is
+ * the one the shared formatter returns, so a graduation the page states as
+ * expected reaches Word as the same characters - and the date column is
+ * measured from that same string, so the tab still lands.
+ */
+describe('the Word export prints a course still under way', () => {
+  const eduDoc = (over: Record<string, unknown> = {}) => {
+    const doc = docWith({ layout: { main: ['education'] } })
+    // The fixture's open-ended job would print its own "Present" beside the
+    // education entry these assertions read.
+    doc.content.work = []
+    doc.content.education = [
+      {
+        id: 'e1',
+        institution: 'Institute of Technology',
+        area: 'Computer Science',
+        studyType: 'Integrated M.Tech',
+        startDate: '2022-08',
+        endDate: '2027-05',
+        score: '8.9 CGPA',
+        courses: [],
+        ...over,
+      },
+    ] as never
+    return doc
+  }
+
+  it('names a finish that has not happened as expected', async () => {
+    const all = texts((await unpack(eduDoc({ status: 'pursuing' }))).body).join('')
+    expect(all).toContain('Expected May 2027')
+  })
+
+  it('reads a course with no finish date as one word', async () => {
+    const all = texts((await unpack(eduDoc({ status: 'pursuing', endDate: '' }))).body).join('')
+    expect(all).toContain('Pursuing')
+    expect(all).not.toContain('Present')
+  })
+
+  it('leaves a finished course exactly as it was', async () => {
+    const all = texts((await unpack(eduDoc({ startDate: '2019-09', endDate: '2023-05' }))).body).join('')
+    expect(all).toContain('Sep 2019 — May 2023')
+    expect(all).not.toContain('Expected')
+  })
+})
+
+/**
+ * Justified prose (typography.align) in the Word file. Justification is a
+ * PROSE setting: the summary, an entry's summary, a project's description and
+ * the bullets take it, and nothing else does. A heading, an entry's lead line
+ * and a date row keep the alignment they always had - justifying a two-word
+ * heading would stretch it across the whole measure.
+ */
+describe('the Word export justifies the prose the page justifies', () => {
+  const proseDoc = (over: MetadataOverrides = {}) => {
+    const doc = docWith({ layout: { main: ['summary', 'work', 'projects'] }, ...over })
+    doc.content.basics.summary = 'A summary of the work.'
+    doc.content.work[0].summary = 'What the role covered.'
+    doc.content.work[0].highlights = ['Shipped the thing']
+    doc.content.projects = [
+      { id: 'p1', name: 'Atlas', description: 'A description of the project.', highlights: [], keywords: [] },
+    ] as never
+    return doc
+  }
+  const jc = (p: string) => p.match(/<w:jc w:val="([a-z]+)"\/>/)?.[1]
+  // Prose is read through a DOM element and there is none here, so the same
+  // text-only stand-in the bullet suite uses stands in again; `children` is
+  // empty, so a block of prose is the one paragraph it reads as.
+  const originalDocument = globalThis.document
+  beforeEach(() => {
+    globalThis.document = {
+      createElement: () => ({
+        children: [] as Element[],
+        childNodes: [] as { nodeType: number; textContent: string }[],
+        set innerHTML(html: string) {
+          this.childNodes = [{ nodeType: 3, textContent: html }]
+        },
+        get textContent() {
+          return this.childNodes.map((n) => n.textContent).join('')
+        },
+      }),
+    } as unknown as Document
+  })
+  afterEach(() => {
+    globalThis.document = originalDocument
+  })
+
+  it('justifies the summary, an entry summary, a project description and the bullets', async () => {
+    const { body } = await unpack(proseDoc({ typography: { align: 'justify' } }))
+    expect(jc(paraOf(body, 'A summary of the work.'))).toBe('both')
+    expect(jc(paraOf(body, 'What the role covered.'))).toBe('both')
+    expect(jc(paraOf(body, 'A description of the project.'))).toBe('both')
+    expect(jc(paraOf(body, 'Shipped the thing'))).toBe('both')
+  })
+
+  it('leaves the headings and the entry lead lines alone', async () => {
+    const { body } = await unpack(proseDoc({ typography: { align: 'justify' } }))
+    expect(paraOf(body, 'EXPERIENCE')).not.toContain('<w:jc ')
+    expect(paraOf(body, 'Designer')).not.toContain('<w:jc ')
+    expect(paraOf(body, 'Acme')).not.toContain('<w:jc ')
+  })
+
+  it('ragged right is what a document that never chose still prints', async () => {
+    const { body } = await unpack(proseDoc())
+    expect(paraOf(body, 'A summary of the work.')).not.toContain('<w:jc ')
+    expect(paraOf(body, 'Shipped the thing')).not.toContain('<w:jc ')
+  })
+})
+
+/**
+ * A project's visible URL line answers the section's own link style. Three of
+ * the four styles are ink - a tag, plain words, the document's own choice -
+ * and this file prints the address for all three. The fourth, 'none', says
+ * the line does not print at all, and the Word file reads the document rather
+ * than the page, so it has to drop the address itself (reported 2026-09-07).
+ */
+describe('the Word export drops a project address the section does not print', () => {
+  const linkDoc = (linkStyle?: 'auto' | 'tag' | 'plain' | 'none') => {
+    const doc = docWith({
+      layout: { main: ['projects'], ...(linkStyle ? { sectionSettings: { projects: { linkStyle } } } : {}) },
+    })
+    doc.content.projects = [
+      { id: 'p1', name: 'Ledger', url: 'https://github.com/example/ledger', highlights: [], keywords: [] },
+    ] as never
+    return doc
+  }
+
+  it('prints the address for a section that never chose', async () => {
+    const all = texts((await unpack(linkDoc())).body).join('\n')
+    expect(all).toContain('Ledger')
+    expect(all).toContain('github.com/example/ledger')
+  })
+
+  it('prints it for every style that shows the line', async () => {
+    for (const style of ['auto', 'tag', 'plain'] as const) {
+      const all = texts((await unpack(linkDoc(style))).body).join('\n')
+      expect(all, style).toContain('github.com/example/ledger')
+    }
+  })
+
+  it('prints no address at all when the section shows no line', async () => {
+    const all = texts((await unpack(linkDoc('none'))).body).join('\n')
+    expect(all).toContain('Ledger')
+    expect(all).not.toContain('github.com')
+  })
+})
+
+describe('the Word export carries no value the author never typed (2026-09-22)', () => {
+  /** The relationship part is where a hyperlink's TARGET lives in a package. */
+  async function targets(doc: ResumeDocument): Promise<string> {
+    const buf = await Packer.toBuffer(buildDocx(doc))
+    const zip = await JSZip.loadAsync(buf)
+    const rels = zip.file('word/_rels/document.xml.rels')
+    return rels ? await rels.async('string') : ''
+  }
+
+  /** The example, with its rich text removed: the Word builder reads HTML
+   *  through a DOM the node environment does not have (see the mock above),
+   *  and what these assertions are about is the LINK target, not the prose. */
+  const fromExample = () => {
+    const doc = createDocument({ sample: true, content: structuredClone(SAMPLE_CONTENT), title: 'T' })
+    for (const list of Object.values(doc.content) as unknown[]) {
+      if (!Array.isArray(list)) continue
+      for (const it of list as Array<Record<string, unknown>>) {
+        if (!it || typeof it !== 'object') continue
+        for (const k of ['summary', 'description']) if (typeof it[k] === 'string') it[k] = ''
+        if (Array.isArray(it.highlights)) it.highlights = []
+      }
+    }
+    doc.content.basics.summary = ''
+    return doc
+  }
+
+  it('an example’s company link is not a hyperlink in the file', async () => {
+    const doc = fromExample()
+    const seeded = doc.content.work[0].url
+    expect(seeded).toBeTruthy()
+    expect(await targets(doc)).not.toContain(seeded)
+  })
+
+  it('the link the AUTHOR typed is still a live hyperlink', async () => {
+    const doc = fromExample()
+    doc.content.work[0].url = 'https://my-own-employer.example'
+    expect(await targets(doc)).toContain('my-own-employer.example')
+  })
+
+  it('no seeded value survives once the author clears the visible fields', async () => {
+    const doc = fromExample()
+    for (const w of doc.content.work) {
+      w.summary = ''
+      w.highlights = []
+      w.name = ''
+      w.position = ''
+      w.location = ''
+    }
+    const xml = await targets(doc)
+    for (const seed of Object.values(doc.seeded ?? {})) expect(xml).not.toContain(seed)
+  })
+})

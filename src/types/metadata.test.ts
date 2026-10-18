@@ -1,0 +1,148 @@
+import { describe, expect, it } from 'vitest'
+import { HEADING_STYLES, LayoutSchema, PageSchema, TypographySchema } from './metadata'
+
+describe('PageSchema.breaks (pinned page breaks, 2026-08-17)', () => {
+  it('defaults to an empty pin list (existing docs parse unchanged)', () => {
+    const page = PageSchema.parse({})
+    expect(page.breaks).toEqual([])
+  })
+
+  it('round-trips section and entry pins', () => {
+    const page = PageSchema.parse({ breaks: [{ section: 'skills' }, { section: 'work', itemId: 'w2' }] })
+    expect(page.breaks).toEqual([{ section: 'skills' }, { section: 'work', itemId: 'w2' }])
+    expect(PageSchema.parse(JSON.parse(JSON.stringify(page))).breaks).toEqual(page.breaks)
+  })
+})
+
+describe('PageSchema.fit (Magic fit rules, 2026-09-09)', () => {
+  it('defaults reproduce the old fit, with a readable floor and no locks', () => {
+    const page = PageSchema.parse({})
+    expect(page.fit).toEqual({
+      target: 1,
+      minBody: null,
+      priority: 'both',
+      // Smart fit's fields (2026-09-26) default to the old fit, so a saved
+      // résumé that has never seen them fits exactly as it always did.
+      mode: 'pages',
+      minBodyBy: 'author',
+      keptPages: null,
+      relaxedFrom: null,
+      fromExample: false,
+      lock: { name: false, headline: false, contacts: false, sectionGap: false, leading: false },
+    })
+  })
+  it('keeps what the author set and refuses a target it cannot fit', () => {
+    const page = PageSchema.parse({ fit: { target: 2, minBody: 11, priority: 'type', lock: { name: true } } })
+    expect(page.fit.target).toBe(2)
+    expect(page.fit.minBody).toBe(11)
+    expect(page.fit.priority).toBe('type')
+    expect(page.fit.lock).toEqual({ name: true, headline: false, contacts: false, sectionGap: false, leading: false })
+    expect(() => PageSchema.parse({ fit: { target: 4 } })).toThrow()
+  })
+})
+
+describe('a heading style the whole document can set', () => {
+  // One vocabulary, two levels: the document's default and a section's own.
+  // They have to stay the same eight words, or a style one level offers is a
+  // parse failure at the other.
+  it('offers exactly the styles a section offers, and both take every one', () => {
+    for (const style of HEADING_STYLES) {
+      expect(TypographySchema.parse({ headingStyle: style }).headingStyle).toBe(style)
+      expect(LayoutSchema.parse({ sectionSettings: { work: { headingStyle: style } } }).sectionSettings.work).toEqual({
+        headingStyle: style,
+      })
+    }
+  })
+
+  it("is absent until it is set, and absent means the template's own", () => {
+    expect(TypographySchema.parse({}).headingStyle).toBeUndefined()
+  })
+
+  it('refuses a value it does not know rather than dropping it silently', () => {
+    // An unknown value has to fail the whole parse: a document that came back
+    // with the field quietly stripped would sit on the template's look again
+    // with nothing to say why.
+    expect(() => TypographySchema.parse({ headingStyle: 'bordered' })).toThrow()
+  })
+})
+
+describe('the running section numeral has a style of its own', () => {
+  // The numerals were always "01, 02": one shape, take it or leave it. The
+  // switch stays a switch; how the numeral is SET is a separate choice, so a
+  // document that wants plain figures or roman numerals does not have to
+  // give up the numbering to escape the zero.
+  it('defaults to the padded figures every numbered design already drew', () => {
+    expect(LayoutSchema.parse({}).sectionNumberStyle).toBe('padded')
+  })
+
+  it('takes every style it offers', () => {
+    for (const style of ['padded', 'plain', 'dot', 'roman'] as const) {
+      expect(LayoutSchema.parse({ sectionNumberStyle: style }).sectionNumberStyle).toBe(style)
+    }
+  })
+
+  it('refuses a value it does not know rather than dropping it silently', () => {
+    // Same rule as headingStyle: a value quietly stripped would leave the
+    // page drawing something the file never asked for, with nothing to say
+    // why. An unknown style fails the whole parse.
+    expect(() => LayoutSchema.parse({ sectionNumberStyle: 'letters' })).toThrow()
+  })
+})
+
+describe('the bullet mark has a size of its own', () => {
+  // Style, indent and spacing were all the author's; how big the mark itself
+  // is drawn was the browser's, whatever the body size happened to be.
+  it('defaults to the size the browser draws beside the text', () => {
+    expect(TypographySchema.parse({}).bulletSize).toBe(1)
+  })
+
+  it('takes a multiple of the body size, and refuses one that would not read', () => {
+    expect(TypographySchema.parse({ bulletSize: 1.8 }).bulletSize).toBe(1.8)
+    expect(TypographySchema.parse({ bulletSize: 0.6 }).bulletSize).toBe(0.6)
+    expect(() => TypographySchema.parse({ bulletSize: 3 })).toThrow()
+    expect(() => TypographySchema.parse({ bulletSize: 0.2 })).toThrow()
+  })
+})
+
+/**
+ * The running page foot, the kicker header and the > mark (Flare and
+ * Dossier, 2026-09-27). All additive: a file written before them parses to
+ * the page it always was.
+ */
+describe('the page foot, the kicker header and the chevron mark', () => {
+  it('a page foot is off unless a design or the author turns it on', () => {
+    expect(LayoutSchema.parse({}).pageFoot).toBe(false)
+    expect(LayoutSchema.parse({ pageFoot: true }).pageFoot).toBe(true)
+  })
+  it('the line above the name and the page foot carry the author’s own words, when they write any', () => {
+    expect(LayoutSchema.parse({}).kicker).toBeUndefined()
+    expect(LayoutSchema.parse({}).pageFootLabel).toBeUndefined()
+    const set = LayoutSchema.parse({ kicker: { show: false, left: 'Portfolio', right: '' }, pageFootLabel: 'Priya Raman · Data Scientist' })
+    expect(set.kicker).toEqual({ show: false, left: 'Portfolio', right: '' })
+    expect(set.pageFootLabel).toBe('Priya Raman · Data Scientist')
+    // however long - a longer value must never fail the whole document
+    expect(LayoutSchema.parse({ pageFootLabel: 'x'.repeat(500) }).pageFootLabel).toHaveLength(500)
+  })
+  it('the foot keeps its look until the author changes it: number, place, rule', () => {
+    const plain = LayoutSchema.parse({})
+    expect(plain.pageFootNumber).toBeUndefined()
+    expect(plain.pageFootAlign).toBeUndefined()
+    expect(plain.pageFootRule).toBeUndefined()
+    const set = LayoutSchema.parse({ pageFootNumber: 'of', pageFootAlign: 'center', pageFootRule: false })
+    expect(set).toMatchObject({ pageFootNumber: 'of', pageFootAlign: 'center', pageFootRule: false })
+    expect(() => LayoutSchema.parse({ pageFootNumber: 'roman' })).toThrow()
+  })
+  it('so are the page frame and the drafting grid', () => {
+    expect(LayoutSchema.parse({}).pageFrame).toBe(false)
+    expect(LayoutSchema.parse({}).pageGrid).toBe(false)
+    expect(LayoutSchema.parse({ pageFrame: true, pageGrid: true })).toMatchObject({ pageFrame: true, pageGrid: true })
+  })
+  it('the kicker is a header composition like the others', () => {
+    expect(LayoutSchema.parse({ headerStyle: 'kicker' }).headerStyle).toBe('kicker')
+    expect(LayoutSchema.parse({}).headerStyle).toBeUndefined()
+  })
+  it('> is a bullet mark and a contact separator', () => {
+    expect(TypographySchema.parse({ bulletStyle: 'chevron' }).bulletStyle).toBe('chevron')
+    expect(LayoutSchema.parse({ contactSeparator: 'chevron' }).contactSeparator).toBe('chevron')
+  })
+})

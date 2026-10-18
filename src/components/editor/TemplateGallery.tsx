@@ -1,7 +1,10 @@
-import { useMemo } from 'react'
-import { Check, ShieldCheck } from 'lucide-react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { Check, ChevronDown, Search, ShieldCheck, SlidersHorizontal, X, ZoomIn } from 'lucide-react'
 import type { ResumeDocument } from '@/types/document'
-import { TEMPLATES } from '@/templates/registry'
+import { TEMPLATES, galleryOrder } from '@/templates/registry'
+
+// the signature collection leads the picker, as it leads the public wall
+const GALLERY = galleryOrder(TEMPLATES)
 import { applyTemplateToMetadata } from '@/lib/templateApply'
 import { useResumeStore } from '@/store/useResumeStore'
 import { useAppStore } from '@/store/useAppStore'
@@ -9,51 +12,277 @@ import { PreviewThumb } from '@/components/preview/PreviewThumb'
 import { HoverZoom } from '@/components/preview/HoverZoom'
 import { cn } from '@/lib/utils'
 import { SAMPLE_CONTENT } from '@/data/sample'
+import { useLazyMount } from '@/components/preview/lazyMount'
+import { ThumbSkeleton } from '@/components/preview/ThumbSkeleton'
+import { usePhoneLayout } from '@/lib/layoutMode'
+import { PAGE_DIMENSIONS } from '@/types/metadata'
+// The public gallery's own filtering, kept pure so both walls narrow the
+// same way and a design found in one is found in the other.
+import {
+  EMPTY_FILTER,
+  filterTemplates,
+  isFilterActive,
+  tagChoices,
+  type TemplateFilter,
+} from '@/lib/templateFilter'
+import type { TemplateTag } from '@/types/template'
+
+/** Derived once from the registry - a new tag on a new design gets a chip. */
+const TAG_CHOICES = tagChoices(TEMPLATES)
+
+/** 'two-column' reads as a slug; the chip says it in words. */
+const tagLabel = (tag: TemplateTag) => {
+  const words = tag.replace(/-/g, ' ')
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
 
 export function TemplateGallery({ doc }: { doc: ResumeDocument }) {
   const applyTemplate = useResumeStore((s) => s.applyTemplate)
   const toast = useAppStore((s) => s.toast)
   const current = doc.metadata.template
+  // Each mounted card re-renders the whole resume when the document changes,
+  // so with this panel open every KEYSTROKE was paying for all of them at
+  // once. The thumbnails are a browsing aid: they may lag a few frames behind
+  // the text being typed, and deferring them keeps the editor responsive
+  // while they catch up. `current` above stays undeferred, so the tick
+  // marking the active template never lags behind the click that moved it.
+  const doc_ = useDeferredValue(doc)
   // A blank resume would render 52 EMPTY thumbnails — impossible to judge.
   // Preview with sample content until the user has real content of their own.
-  const isBlank = !doc.content.basics.name && !doc.content.work.length && !doc.content.education.length && !doc.content.skills.length
-  const previewBase = isBlank ? { ...doc, content: SAMPLE_CONTENT } : doc
+  const isBlank =
+    !doc_.content.basics.name &&
+    !doc_.content.work.length &&
+    !doc_.content.education.length &&
+    !doc_.content.skills.length
+  const previewBase = isBlank ? { ...doc_, content: SAMPLE_CONTENT } : doc_
+  // A phone cannot hover: the full-size look opens as a sheet from a
+  // Preview button on the card instead.
+  const phone = usePhoneLayout()
+  const [previewing, setPreviewing] = useState<(typeof TEMPLATES)[number] | null>(null)
+  // Local, not in the URL: this is a panel inside a document being edited, and
+  // the address bar belongs to the résumé rather than to what the panel is
+  // showing at the moment.
+  const [filter, setFilter] = useState<TemplateFilter>(EMPTY_FILTER)
+  const [chipsOpen, setChipsOpen] = useState(false)
+  const shown = useMemo(() => filterTemplates(GALLERY, filter), [filter])
+  const narrowed = isFilterActive(filter)
+  const toggleTag = (tag: TemplateTag) =>
+    setFilter((f) => ({ ...f, tags: f.tags.includes(tag) ? f.tags.filter((t) => t !== tag) : [...f.tags, tag] }))
+  const pick = (tpl: (typeof TEMPLATES)[number]) => {
+    applyTemplate(tpl.defaults)
+    toast(`Switched to ${tpl.name}`, 'success')
+  }
 
   return (
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        {TEMPLATES.length} templates — every one ATS-friendly. {isBlank ? 'Previews show example content until you add yours.' : 'Your content flows into every one — switch any time.'} Hover a card for a full-size look.
+        {TEMPLATES.length} templates — every one ATS-friendly.{' '}
+        {isBlank
+          ? 'Previews show example content until you add yours.'
+          : 'Your content flows into every one — switch any time.'}{' '}
+        {phone ? 'Tap Preview on a card for a full-size look.' : 'Hover a card for a full-size look.'}
       </p>
+      <label className="relative block">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        <input
+          type="search"
+          value={filter.query}
+          onChange={(e) => setFilter((f) => ({ ...f, query: e.target.value }))}
+          placeholder="Search designs"
+          aria-label="Search designs"
+          className="input h-8 w-full pl-8 pr-2 text-xs"
+        />
+      </label>
+      <button
+        type="button"
+        className="flex w-full items-center justify-between gap-2 rounded-lg border border-border px-2.5 py-1.5 text-xs text-muted-foreground transition hover:text-foreground"
+        aria-expanded={chipsOpen}
+        onClick={() => setChipsOpen((v) => !v)}
+      >
+        <span className="inline-flex items-center gap-1.5">
+          <SlidersHorizontal className="h-3.5 w-3.5" />
+          Filters
+          {filter.tags.length + (filter.atsOnly ? 1 : 0) > 0 && (
+            <span className="rounded-full bg-primary/10 px-1.5 text-[10px] font-semibold text-primary">
+              {filter.tags.length + (filter.atsOnly ? 1 : 0)}
+            </span>
+          )}
+        </span>
+        <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', !chipsOpen && '-rotate-90')} />
+      </button>
+      <div className={cn('flex flex-wrap gap-1', !chipsOpen && 'hidden')}>
+        <button
+          type="button"
+          aria-pressed={filter.atsOnly}
+          onClick={() => setFilter((f) => ({ ...f, atsOnly: !f.atsOnly }))}
+          className={cn(
+            'rounded-full border px-2 py-0.5 text-[11px] font-medium transition',
+            filter.atsOnly
+              ? 'border-primary bg-primary/10 text-primary'
+              : 'border-border text-muted-foreground hover:border-primary/40 hover:text-foreground'
+          )}
+          title="The plainest single-column layouts - the safest bet with an unusually literal parser"
+        >
+          Strictest
+        </button>
+        {TAG_CHOICES.map((tag) => {
+          const on = filter.tags.includes(tag)
+          return (
+            <button
+              key={tag}
+              type="button"
+              aria-pressed={on}
+              onClick={() => toggleTag(tag)}
+              className={cn(
+                'rounded-full border px-2 py-0.5 text-[11px] font-medium transition',
+                on
+                  ? 'border-primary bg-primary/10 text-primary'
+                  : 'border-border text-muted-foreground hover:border-primary/40 hover:text-foreground'
+              )}
+            >
+              {tagLabel(tag)}
+            </button>
+          )
+        })}
+      </div>
+      {narrowed && (
+        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <span aria-live="polite">
+            {shown.length} match{shown.length === 1 ? '' : 'es'}
+          </span>
+          <button className="transition hover:text-foreground" onClick={() => setFilter(EMPTY_FILTER)}>
+            Clear
+          </button>
+        </div>
+      )}
+      {shown.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border px-4 py-10 text-center">
+          <p className="text-xs font-medium text-foreground">Nothing matches all of those</p>
+          <p className="mx-auto mt-1 max-w-[18rem] text-xs text-muted-foreground">
+            Every filter has to hold at once, and some tags never appear together - a design is single-column or
+            two-column, not both.
+          </p>
+          <button className="btn-outline btn-xs mt-3" onClick={() => setFilter(EMPTY_FILTER)}>
+            Clear filters
+          </button>
+        </div>
+      ) : (
       <div className="grid grid-cols-2 gap-3">
-        {TEMPLATES.map((tpl) => (
+        {shown.map((tpl) => (
           <TemplateCard
             key={tpl.id}
             tpl={tpl}
             doc={previewBase}
             active={current === tpl.id}
-            onPick={() => {
-              applyTemplate(tpl.defaults)
-              toast(`Switched to ${tpl.name}`, 'success')
-            }}
+            onPick={() => pick(tpl)}
+            onPreview={phone ? () => setPreviewing(tpl) : undefined}
           />
         ))}
+      </div>
+      )}
+      {previewing && (
+        <PreviewSheet
+          tpl={previewing}
+          doc={previewBase}
+          onClose={() => setPreviewing(null)}
+          onUse={() => {
+            pick(previewing)
+            setPreviewing(null)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * The phone's full-size look: the same render the desktop's hover flyout
+ * shows, as a sheet with a Close and a "Use this design". The thumbnails
+ * draw the whole résumé at about 4px type, which cannot be judged.
+ */
+function PreviewSheet({
+  tpl,
+  doc,
+  onClose,
+  onUse,
+}: {
+  tpl: (typeof TEMPLATES)[number]
+  doc: ResumeDocument
+  onClose: () => void
+  onUse: () => void
+}) {
+  const previewDoc = useMemo<ResumeDocument>(
+    () => ({ ...doc, metadata: applyTemplateToMetadata(doc.metadata, tpl.defaults) }),
+    [doc, tpl.defaults]
+  )
+  const width = Math.min(typeof window !== 'undefined' ? window.innerWidth - 32 : 343, 380)
+  const { w: pageW, h: pageH } = PAGE_DIMENSIONS[previewDoc.metadata.page.format]
+  return (
+    <div className="fixed inset-0 z-[70] flex flex-col justify-end bg-black/40" role="dialog" aria-label={`${tpl.name} preview`}>
+      <div className="fixed inset-0" onClick={onClose} />
+      <div className="relative flex max-h-[calc(100%-24px)] flex-col rounded-t-2xl border border-border bg-surface shadow-float">
+        <div className="flex h-12 shrink-0 items-center justify-between border-b border-border pl-4 pr-2">
+          <span className="text-sm font-semibold">{tpl.name} — with your content</span>
+          <button className="btn-icon h-10 w-10" onClick={onClose} aria-label="Close preview" title="Close">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto bg-muted p-4">
+          <div className="mx-auto overflow-hidden rounded-md bg-white shadow-page" style={{ width, height: (width * pageH) / pageW }}>
+            <PreviewThumb doc={previewDoc} width={width} />
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-2 border-t border-border p-3">
+          <button className="btn-outline h-11 flex-1" onClick={onClose}>
+            Close
+          </button>
+          <button className="btn-primary h-11 flex-1" onClick={onUse}>
+            Use this design
+          </button>
+        </div>
       </div>
     </div>
   )
 }
 
+/**
+ * True once the element has come near the viewport, and true forever after.
+ *
+ * Every card renders the user's WHOLE resume in its template's look, so
+ * mounting all 52 at once cost 9.0s of frozen main thread just to open this
+ * panel, and a single template switch re-rendered all of them in ONE 8.7s
+ * task (measured 2026-08-25). Only the handful a reader can actually see is
+ * worth rendering.
+ *
+ * Deliberately measured with getBoundingClientRect rather than an
+ * IntersectionObserver: an observer is driven by the rendering pipeline and
+ * reports NOTHING in a context that is not compositing frames - measured, a
+ * hidden browser pane left every card an empty placeholder. A rect is
+ * answered synchronously by layout, which is always available.
+ *
+ * Scroll is listened for in the CAPTURE phase because the panel scrolls in an
+ * inner container and scroll events do not bubble.
+ *
+ * It latches rather than unmounting on exit: a card that scrolls out and back
+ * would otherwise pay the render again, and scrolling is exactly when the
+ * main thread is least able to afford it.
+ */
 function TemplateCard({
   tpl,
   doc,
   active,
   onPick,
+  onPreview,
 }: {
   tpl: (typeof TEMPLATES)[number]
   doc: ResumeDocument
   active: boolean
   onPick: () => void
+  /** A phone's route to the full-size look; absent where hover does it. */
+  onPreview?: () => void
 }) {
   // Render the thumbnail with the user's content but this template's look.
+  const [thumbRef, seen] = useLazyMount<HTMLDivElement>()
   const previewDoc = useMemo<ResumeDocument>(
     () => ({ ...doc, metadata: applyTemplateToMetadata(doc.metadata, tpl.defaults) }),
     [doc, tpl.defaults]
@@ -61,32 +290,58 @@ function TemplateCard({
 
   return (
     <HoverZoom doc={previewDoc} label={`${tpl.name} — with your content`}>
-    <button
-      onClick={onPick}
-      className={cn(
-        'group relative flex flex-col overflow-hidden rounded-lg border bg-surface text-left transition-all hover:shadow-card',
-        active ? 'border-primary ring-2 ring-primary/40' : 'border-border hover:border-primary/40'
+      <div className="relative">
+      {onPreview && (
+        <button
+          className="absolute bottom-10 right-1.5 z-10 flex h-10 items-center gap-1 rounded-full border border-border bg-surface/95 px-2.5 text-xs font-medium shadow-soft backdrop-blur"
+          onClick={onPreview}
+          aria-label={`Preview ${tpl.name} full size`}
+        >
+          <ZoomIn className="h-4 w-4" /> Preview
+        </button>
       )}
-      title={tpl.description}
-    >
-      <div className="relative flex justify-center overflow-hidden border-b border-border bg-white p-2">
-        <PreviewThumb doc={previewDoc} width={150} />
-        {active && (
-          <div className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
-            <Check className="h-3.5 w-3.5" />
-          </div>
+      <button
+        onClick={onPick}
+        className={cn(
+          'group relative flex w-full flex-col overflow-hidden rounded-lg border bg-surface text-left transition-all hover:shadow-card',
+          active ? 'border-primary ring-2 ring-primary/40' : 'border-border hover:border-primary/40'
         )}
+        title={tpl.description}
+      >
+        <div
+          ref={thumbRef}
+          // The placeholder holds the card's exact height, so nothing jumps as
+          // previews arrive and the scrollbar stays honest while scrolling.
+          style={{ minHeight: 150 * 1.294 + 16 }}
+          className="relative flex justify-center overflow-hidden border-b border-border bg-white p-2"
+        >
+          {/* The template's own accent sketches the card while the real
+              render arrives - blank white read as the theme failing. */}
+          {seen ? (
+            <PreviewThumb doc={previewDoc} width={150} />
+          ) : (
+            <ThumbSkeleton accent={(tpl.defaults as { theme?: { primary?: string } })?.theme?.primary} />
+          )}
+          {active && (
+            <div className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+              <Check className="h-3.5 w-3.5" />
+            </div>
+          )}
+        </div>
+        <div className="flex items-center justify-between gap-1 px-2.5 py-2">
+          <span className="text-[13px] font-medium text-foreground">{tpl.name}</span>
+          {tpl.atsSafe && (
+            <span
+              className="inline-flex items-center gap-1 text-[10px] font-medium text-success"
+              title="Parses cleanly in ATS"
+            >
+              <ShieldCheck className="h-3 w-3" />
+              ATS
+            </span>
+          )}
+        </div>
+      </button>
       </div>
-      <div className="flex items-center justify-between gap-1 px-2.5 py-2">
-        <span className="text-[13px] font-medium text-foreground">{tpl.name}</span>
-        {tpl.atsSafe && (
-          <span className="inline-flex items-center gap-1 text-[10px] font-medium text-success" title="Parses cleanly in ATS">
-            <ShieldCheck className="h-3 w-3" />
-            ATS
-          </span>
-        )}
-      </div>
-    </button>
     </HoverZoom>
   )
 }

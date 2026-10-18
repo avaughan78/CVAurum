@@ -1,9 +1,23 @@
+import { useEffect, useRef, useState } from 'react'
 import type { ResumeDocument } from '@/types/document'
+import type { HeadingStyle } from '@/types/metadata'
 import { useResumeStore } from '@/store/useResumeStore'
-import { cn } from '@/lib/utils'
-import { Slider, Toggle, Segmented, ColorField, FieldGroup } from '../fields/Controls'
+import { cn, DATE_LANGUAGE_OPTIONS } from '@/lib/utils'
+import { Slider, Toggle, Segmented, Select, ColorField, FieldGroup } from '../fields/Controls'
+import { TextField } from '../fields/Inputs'
 import { FontSelect } from '../fields/FontSelect'
-import { HEADER_STYLES, HeaderMini } from '@/templates/_shared/headerStyles'
+import { ArtBandRow, HEADER_STYLES, HeaderMini } from '@/templates/_shared/headerStyles'
+import { StatTilesEditor } from '@/templates/_shared/StatTilesEditor'
+import { MagicFitCard } from './MagicFitCard'
+import { useEditorStore } from '@/store/useEditorStore'
+import { fitSizesPt } from '@/lib/fitReadout'
+import { ContrastCard, useContrastNote } from './ContrastCard'
+import { DESIGN_RANGES } from '@/lib/designRanges'
+import { OFFERED_WEIGHTS } from '@/lib/typeStyle'
+import type { ElementColorKey } from '@/lib/elementColors'
+import { getTemplate } from '@/templates/registry'
+import { SECTION_NUMBER_STYLES } from '@/templates/_shared/sectionNumeral'
+import { FootFields, KickerFields } from '@/templates/_shared/PageWordsFields'
 
 const BULLET_OPTIONS = [
   ['disc', '●'],
@@ -13,8 +27,120 @@ const BULLET_OPTIONS = [
   ['arrow', '›'],
   ['check', '✓'],
   ['diamond', '◆'],
+  ['chevron', '>'],
   ['none', '∅'],
 ] as const
+
+/**
+ * The document-wide section-heading treatments, named with the same words
+ * the section gear uses for the same eight styles, so one row cannot say
+ * "Rule" where the other says "Rule after" for the same look. '' is Auto:
+ * no document default at all, which leaves every section on the template's
+ * own - exactly what the gear's Auto means for one section.
+ */
+const HEADING_STYLE_OPTIONS: { label: string; value: '' | HeadingStyle; title: string }[] = [
+  { label: 'Auto', value: '', title: "The template's own heading style" },
+  { label: 'Underline', value: 'underline', title: 'A rule under the title' },
+  { label: 'Rule', value: 'rule-after', title: 'A rule running on after the words' },
+  { label: 'On-line', value: 'strike', title: 'The words sitting on a rule that crosses the column' },
+  { label: 'Bar', value: 'bar', title: 'A bar standing before the title' },
+  { label: 'Filled', value: 'boxed', title: 'The title in a filled block' },
+  { label: 'Lead', value: 'lead-rule', title: 'A short rule leading into the title' },
+  { label: 'Badge', value: 'badge', title: 'The title behind a badge' },
+  { label: 'Plain', value: 'plain', title: 'The words alone, no rule or fill' },
+]
+
+/** Button labels for the named weights the panel offers. */
+const WEIGHT_LABELS = { bold: 'Bold', regular: 'Regular', light: 'Light' } as const
+
+/** The five element colours, each with the theme colour the base stylesheet
+ *  derives it from while it is unset (a template may derive differently). */
+const ELEMENT_COLOR_ROWS: { key: ElementColorKey; label: string; from: 'primary' | 'text' | 'muted' }[] = [
+  { key: 'name', label: 'Name', from: 'text' },
+  { key: 'headline', label: 'Headline', from: 'primary' },
+  { key: 'headings', label: 'Section titles', from: 'primary' },
+  { key: 'contacts', label: 'Contacts', from: 'muted' },
+  { key: 'links', label: 'Links', from: 'text' },
+]
+
+/** Where an entry's dates go: nowhere in particular, a left gutter of big
+ *  years, or a right margin holding the date itself. */
+const META_COLUMNS: { label: string; value: 'none' | 'gutter' | 'margin' }[] = [
+  { label: 'None', value: 'none' },
+  { label: 'Gutter', value: 'gutter' },
+  { label: 'Margin', value: 'margin' },
+]
+
+/** Tiny visual mock of each meta column: a tinted left strip with a big
+ *  numeral, a thin right column, or neither. */
+function MetaMini({ kind }: { kind: string }) {
+  const bar = 'rounded-[1px] bg-slate-600'
+  const line = 'rounded-[1px] bg-slate-300'
+  const body = (
+    <span className="flex flex-1 flex-col gap-[3px]">
+      <span className={`h-[3px] w-2/3 ${bar}`} />
+      <span className={`h-[2px] w-full ${line}`} />
+      <span className={`h-[2px] w-5/6 ${line}`} />
+    </span>
+  )
+  if (kind === 'gutter')
+    return (
+      <span className="flex w-full items-start gap-[4px]">
+        <span className="flex w-1/3 flex-col items-end gap-[2px] rounded-[2px] bg-primary/15 p-[2px]">
+          <span className="h-[6px] w-full rounded-[1px] bg-primary/70" />
+          <span className="h-[2px] w-3/4 rounded-[1px] bg-primary/40" />
+        </span>
+        {body}
+      </span>
+    )
+  if (kind === 'margin')
+    return (
+      <span className="flex w-full items-start gap-[4px]">
+        {body}
+        <span className="flex w-1/4 flex-col gap-[2px] border-l border-slate-300 pl-[3px]">
+          <span className={`h-[2px] w-full ${line}`} />
+          <span className={`h-[2px] w-3/4 ${line}`} />
+        </span>
+      </span>
+    )
+  return <span className="flex w-full items-start gap-[4px]">{body}</span>
+}
+
+/** Where a section's title sits: over its content, or in a column of its
+ *  own beside it. */
+const HEADING_PLACEMENTS: { label: string; value: 'above' | 'side' }[] = [
+  { label: 'Above', value: 'above' },
+  { label: 'Beside', value: 'side' },
+]
+
+/** Tiny visual mock of each heading placement: a full-width title over the
+ *  lines, or a short right-aligned title in a left column. */
+function HeadsMini({ kind }: { kind: string }) {
+  const bar = 'rounded-[1px] bg-primary/70'
+  const line = 'rounded-[1px] bg-slate-300'
+  const lines = (
+    <span className="flex flex-1 flex-col gap-[3px]">
+      <span className={`h-[2px] w-full ${line}`} />
+      <span className={`h-[2px] w-5/6 ${line}`} />
+      <span className={`h-[2px] w-2/3 ${line}`} />
+    </span>
+  )
+  if (kind === 'side')
+    return (
+      <span className="flex w-full items-start gap-[4px]">
+        <span className="flex w-1/3 justify-end">
+          <span className={`h-[3px] w-3/4 ${bar}`} />
+        </span>
+        {lines}
+      </span>
+    )
+  return (
+    <span className="flex w-full flex-col gap-[3px]">
+      <span className={`h-[3px] w-2/5 ${bar}`} />
+      {lines}
+    </span>
+  )
+}
 
 const PALETTES: { name: string; color: string }[] = [
   { name: 'Indigo', color: '#2563eb' },
@@ -35,42 +161,419 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
   const update = useResumeStore((s) => s.updateMetadata)
   const m = doc.metadata
   const twoCol = m.layout.columns === 2
+  // The page count the canvas last measured: the foot says whether numbers print.
+  const footPages = useEditorStore((s) => s.fitResult?.pages)
+
+  // What each colour control's words MEASURE on the page, read from the live
+  // check the preview runs on the print tree (ContrastCard). A two-colour
+  // estimate here would disagree with it: a muted colour painted at 85% in a
+  // sidebar fails where the raw pair passes, and a large name passes where
+  // the raw pair fails.
+  const notes = {
+    text: useContrastNote('theme.text'),
+    muted: useContrastNote('theme.muted'),
+    background: useContrastNote('theme.background', 'ground'),
+    sidebar: useContrastNote('theme.sidebar', 'ground'),
+    sidebarText: useContrastNote('theme.sidebarText'),
+    name: useContrastNote('theme.name'),
+    headline: useContrastNote('theme.headline'),
+    headings: useContrastNote('theme.headings'),
+    contacts: useContrastNote('theme.contacts'),
+    links: useContrastNote('theme.links'),
+  }
+
+  // A click on a running numeral on the canvas asks for this row by name
+  // (Artboard openSectionNumbers). The panel is long, so the row is scrolled
+  // to and flashed: landing somewhere near it is not finding it.
+  const numbersRef = useRef<HTMLDivElement>(null)
+  const [numbersFlash, setNumbersFlash] = useState(false)
+  useEffect(() => {
+    const onOpen = () => {
+      numbersRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      setNumbersFlash(true)
+      setTimeout(() => setNumbersFlash(false), 1600)
+    }
+    window.addEventListener('cvaurum:open-section-numbers', onOpen)
+    return () => window.removeEventListener('cvaurum:open-section-numbers', onOpen)
+  }, [])
 
   return (
     <div className="space-y-6">
+      <ContrastCard />
       <FieldGroup title="Accent color">
         <div className="grid grid-cols-6 gap-2">
           {PALETTES.map((p) => (
             <button
               key={p.name}
               title={p.name}
-              onClick={() => update((md) => { md.theme.primary = p.color })}
+              onClick={() =>
+                update((md) => {
+                  md.theme.primary = p.color
+                })
+              }
               className="h-8 w-full rounded-md border border-border transition-transform hover:scale-110"
-              style={{ background: p.color, outline: m.theme.primary === p.color ? '2px solid hsl(var(--ring))' : undefined, outlineOffset: 2 }}
+              style={{
+                background: p.color,
+                outline: m.theme.primary === p.color ? '2px solid hsl(var(--ring))' : undefined,
+                outlineOffset: 2,
+              }}
             />
           ))}
         </div>
-        <ColorField label="Primary" value={m.theme.primary} onChange={(v) => update((md) => { md.theme.primary = v })} />
-        <ColorField label="Body text" value={m.theme.text} onChange={(v) => update((md) => { md.theme.text = v })} />
-        <ColorField label="Muted text" value={m.theme.muted} onChange={(v) => update((md) => { md.theme.muted = v })} />
-        <ColorField label="Background" value={m.theme.background} onChange={(v) => update((md) => { md.theme.background = v })} />
+        <ColorField
+          label="Primary"
+          value={m.theme.primary}
+          onChange={(v) =>
+            update((md) => {
+              md.theme.primary = v
+            })
+          }
+        />
+        <ColorField
+          label="Body text"
+          value={m.theme.text}
+          note={notes.text}
+          onChange={(v) =>
+            update((md) => {
+              md.theme.text = v
+            })
+          }
+        />
+        <ColorField
+          label="Muted text"
+          value={m.theme.muted}
+          note={notes.muted}
+          onChange={(v) =>
+            update((md) => {
+              md.theme.muted = v
+            })
+          }
+        />
+        <ColorField
+          label="Background"
+          value={m.theme.background}
+note={notes.background}
+          onChange={(v) =>
+            update((md) => {
+              md.theme.background = v
+            })
+          }
+        />
         {twoCol && (
           <>
-            <ColorField label="Sidebar" value={m.theme.sidebar} onChange={(v) => update((md) => { md.theme.sidebar = v })} />
-            <ColorField label="Sidebar text" value={m.theme.sidebarText} onChange={(v) => update((md) => { md.theme.sidebarText = v })} />
+            <ColorField
+              label="Sidebar"
+              value={m.theme.sidebar}
+              note={notes.sidebar}
+              onChange={(v) =>
+                update((md) => {
+                  md.theme.sidebar = v
+                })
+              }
+            />
+            <ColorField
+              label="Sidebar text"
+              value={m.theme.sidebarText}
+              note={notes.sidebarText}
+              onChange={(v) =>
+                update((md) => {
+                  md.theme.sidebarText = v
+                })
+              }
+            />
           </>
         )}
       </FieldGroup>
 
+      <FieldGroup title="Element colors" defaultOpen={false}>
+        {ELEMENT_COLOR_ROWS.map((r) => (
+          <ColorField
+            key={r.key}
+            label={r.label}
+            value={m.theme[r.key]}
+            fallback={m.theme[r.from]}
+note={notes[r.key]}
+            onChange={(v) =>
+              update((md) => {
+                // An emptied box is Auto again, not a colour of nothing.
+                if (v) md.theme[r.key] = v
+                else delete md.theme[r.key]
+              })
+            }
+            onClear={() =>
+              update((md) => {
+                delete md.theme[r.key]
+              })
+            }
+          />
+        ))}
+        <p className="-mt-1 text-[11px] text-muted-foreground">
+          Auto follows the template. A sidebar keeps its own text colour; a linked title keeps the title&apos;s.
+        </p>
+      </FieldGroup>
+
       <FieldGroup title="Typography">
-        <FontSelect label="Body font" value={m.typography.fontFamily} onChange={(v) => update((md) => { md.typography.fontFamily = v })} />
-        <FontSelect label="Heading font" value={m.typography.headingFamily} onChange={(v) => update((md) => { md.typography.headingFamily = v })} allowInherit />
-        <FontSelect label="Name font" value={m.typography.nameFamily} onChange={(v) => update((md) => { md.typography.nameFamily = v })} allowInherit />
-        <Slider label="Font size" value={m.typography.fontSize} min={8} max={14} step={0.25} unit="pt" onChange={(v) => update((md) => { md.typography.fontSize = v })} />
-        <Slider label="Line height" value={m.typography.lineHeight} min={1} max={2} step={0.02} onChange={(v) => update((md) => { md.typography.lineHeight = v })} format={(v) => v.toFixed(2)} />
-        <Slider label="Letter spacing" value={m.typography.letterSpacing} min={-0.02} max={0.1} step={0.005} onChange={(v) => update((md) => { md.typography.letterSpacing = v })} format={(v) => `${v.toFixed(3)}em`} />
-        <Slider label="Name size" value={m.typography.headingScale} min={1} max={2.4} step={0.05} onChange={(v) => update((md) => { md.typography.headingScale = v })} format={(v) => `${v.toFixed(2)}×`} />
-        <Toggle label="Uppercase headings" checked={m.typography.uppercaseHeadings} onChange={(v) => update((md) => { md.typography.uppercaseHeadings = v })} />
+        <FontSelect
+          label="Body font"
+          value={m.typography.fontFamily}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.fontFamily = v
+            })
+          }
+        />
+        <FontSelect
+          label="Heading font"
+          value={m.typography.headingFamily}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.headingFamily = v
+            })
+          }
+          allowInherit
+        />
+        <FontSelect
+          label="Name font"
+          value={m.typography.nameFamily}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.nameFamily = v
+            })
+          }
+          allowInherit
+        />
+        <Slider
+          label="Font size"
+          value={m.typography.fontSize}
+          {...DESIGN_RANGES.fontSize}
+          unit="pt"
+          onChange={(v) =>
+            update((md) => {
+              md.typography.fontSize = v
+            })
+          }
+        />
+        <PrintedSizeNote doc={doc} />
+        <Slider
+          label="Line height"
+          value={m.typography.lineHeight}
+          {...DESIGN_RANGES.lineHeight}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.lineHeight = v
+            })
+          }
+          format={(v) => v.toFixed(2)}
+        />
+        <Slider
+          label="Letter spacing"
+          value={m.typography.letterSpacing}
+          {...DESIGN_RANGES.letterSpacing}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.letterSpacing = v
+            })
+          }
+          format={(v) => `${v.toFixed(3)}em`}
+        />
+        <Slider
+          label="Name size"
+          value={m.typography.headingScale}
+          {...DESIGN_RANGES.headingScale}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.headingScale = v
+            })
+          }
+          format={(v) => `${v.toFixed(2)}×`}
+        />
+        <Slider
+          label="Section title size"
+          value={m.typography.sectionTitleScale}
+          {...DESIGN_RANGES.sectionTitleScale}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.sectionTitleScale = v
+            })
+          }
+          format={(v) => `${v.toFixed(2)}×`}
+        />
+        <div>
+          <div className="grid grid-cols-2 gap-3">
+            <Slider
+              label="Headline size"
+              value={m.typography.headlineScale}
+              {...DESIGN_RANGES.headlineScale}
+              onChange={(v) =>
+                update((md) => {
+                  md.typography.headlineScale = v
+                })
+              }
+              format={(v) => `${v.toFixed(2)}×`}
+            />
+            <Slider
+              label="Contact size"
+              value={m.typography.contactScale}
+              {...DESIGN_RANGES.contactScale}
+              onChange={(v) =>
+                update((md) => {
+                  md.typography.contactScale = v
+                })
+              }
+              format={(v) => `${v.toFixed(2)}×`}
+            />
+          </div>
+          <p className="-mt-1 text-[11px] text-muted-foreground">Each as a multiple of the body size.</p>
+        </div>
+        <div>
+          <label className="label">Align</label>
+          <Segmented
+            value={m.typography.align ?? 'left'}
+            options={[
+              { value: 'left', label: 'Ragged' },
+              { value: 'justify', label: 'Justified' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.typography.align = v
+              })
+            }
+          />
+          <p className="-mt-1 text-[11px] text-muted-foreground">
+            Justified squares off the right edge of summaries and bullets. Headings, dates and the sidebar keep their
+            own edge.
+          </p>
+        </div>
+        <div>
+          <label className="label">Heading case</label>
+          <Segmented
+            value={m.typography.headingCase ?? 'auto'}
+            options={[
+              { value: 'auto', label: 'Auto' },
+              { value: 'upper', label: 'Upper' },
+              { value: 'smallcaps', label: 'Small caps' },
+              { value: 'none', label: 'As typed' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                // Auto hands the case back to the template: no explicit
+                // choice, and the legacy flag on the template's own default.
+                if (v === 'auto') {
+                  delete md.typography.headingCase
+                  md.typography.uppercaseHeadings = getTemplate(md.template).defaults.typography.uppercaseHeadings
+                } else {
+                  md.typography.headingCase = v
+                  md.typography.uppercaseHeadings = v === 'upper'
+                }
+              })
+            }
+          />
+          <p className="-mt-1 text-[11px] text-muted-foreground">Auto follows the template.</p>
+        </div>
+        <div>
+          <label className="label">Name weight</label>
+          <Segmented
+            value={m.typography.nameWeight ?? 'auto'}
+            options={[
+              { value: 'auto', label: 'Auto' },
+              // Only weights a bundled face can draw; see OFFERED_WEIGHTS.
+              ...OFFERED_WEIGHTS.map((w) => ({ value: w, label: WEIGHT_LABELS[w] })),
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                if (v === 'auto') delete md.typography.nameWeight
+                else md.typography.nameWeight = v
+              })
+            }
+          />
+        </div>
+        <div>
+          <label className="label">Heading weight</label>
+          <Segmented
+            value={m.typography.headingWeight ?? 'auto'}
+            options={[
+              { value: 'auto', label: 'Auto' },
+              { value: 'bold', label: 'Bold' },
+              { value: 'regular', label: 'Regular' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                if (v === 'auto') delete md.typography.headingWeight
+                else md.typography.headingWeight = v
+              })
+            }
+          />
+          <p className="-mt-1 text-[11px] text-muted-foreground">Auto keeps the template's own weights.</p>
+        </div>
+        <div>
+          <label className="label">Heading style</label>
+          <div className="grid grid-cols-3 gap-1.5">
+            {HEADING_STYLE_OPTIONS.map((s) => {
+              const on = (m.typography.headingStyle ?? '') === s.value
+              return (
+                <button
+                  key={s.value || 'auto'}
+                  type="button"
+                  title={s.title}
+                  aria-pressed={on}
+                  onClick={() =>
+                    update((md) => {
+                      // Auto is the ABSENCE of a document default, not a
+                      // ninth style: the sections fall back to the template
+                      // again, and a section that set its own keeps it either
+                      // way.
+                      if (s.value) md.typography.headingStyle = s.value
+                      else delete md.typography.headingStyle
+                    })
+                  }
+                  className={cn(
+                    'min-w-0 truncate rounded-md border px-1 py-1.5 text-xs font-medium transition',
+                    on
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-border text-muted-foreground hover:border-primary/50 hover:text-foreground'
+                  )}
+                >
+                  {s.label}
+                </button>
+              )
+            })}
+          </div>
+          <p className="-mt-1 text-[11px] text-muted-foreground">
+            How every section title is drawn, in one move. A section that picked its own in its Style sheet keeps it;
+            Auto hands them all back to the template.
+          </p>
+        </div>
+        <Slider
+          label="Heading spacing"
+          value={m.typography.headingGap}
+          {...DESIGN_RANGES.headingGap}
+          onChange={(v) =>
+            update((md) => {
+              md.typography.headingGap = v
+            })
+          }
+          format={(v) => `${v.toFixed(2)}×`}
+        />
+        <div>
+          <label className="label">Heading rule</label>
+          <Segmented
+            value={m.typography.headingRuleWidth ? String(m.typography.headingRuleWidth) : 'auto'}
+            options={[
+              { value: 'auto', label: 'Auto' },
+              { value: '1', label: 'Thin' },
+              { value: '2', label: 'Thick' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                if (v === 'auto') delete md.typography.headingRuleWidth
+                else md.typography.headingRuleWidth = v === '2' ? 2 : 1
+              })
+            }
+          />
+          <p className="-mt-1 text-[11px] text-muted-foreground">
+            The air under a section title, and the weight of its rule. Auto keeps the template's rule.
+          </p>
+        </div>
         <div>
           <label className="label">Bullet style</label>
           <div className="grid grid-cols-4 gap-1.5">
@@ -79,7 +582,11 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
                 key={val}
                 type="button"
                 title={val[0].toUpperCase() + val.slice(1)}
-                onClick={() => update((md) => { md.typography.bulletStyle = val })}
+                onClick={() =>
+                  update((md) => {
+                    md.typography.bulletStyle = val
+                  })
+                }
                 className={cn(
                   'flex h-9 items-center justify-center rounded-md border text-base leading-none transition',
                   m.typography.bulletStyle === val
@@ -93,6 +600,46 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
           </div>
         </div>
         <div>
+          <div className="grid grid-cols-2 gap-3">
+            <Slider
+              label="Bullet indent"
+              value={m.typography.bulletIndent}
+              {...DESIGN_RANGES.bulletIndent}
+              onChange={(v) =>
+                update((md) => {
+                  md.typography.bulletIndent = v
+                })
+              }
+              format={(v) => `${v.toFixed(2)}em`}
+            />
+            <Slider
+              label="Bullet spacing"
+              value={m.typography.bulletGap}
+              {...DESIGN_RANGES.bulletGap}
+              onChange={(v) =>
+                update((md) => {
+                  md.typography.bulletGap = v
+                })
+              }
+              format={(v) => `${v.toFixed(2)}em`}
+            />
+            <Slider
+              label="Bullet size"
+              value={m.typography.bulletSize}
+              {...DESIGN_RANGES.bulletSize}
+              onChange={(v) =>
+                update((md) => {
+                  md.typography.bulletSize = v
+                })
+              }
+              format={(v) => `${Math.round(v * 100)}%`}
+            />
+          </div>
+          <p className="-mt-1 text-[11px] text-muted-foreground">
+            How far bullets sit in, and the air between them.
+          </p>
+        </div>
+        <div>
           <label className="label">Skill &amp; language level</label>
           <Segmented
             value={m.typography.proficiency}
@@ -103,10 +650,145 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
               { value: 'text', label: 'Text' },
               { value: 'none', label: 'Off' },
             ]}
-            onChange={(v) => update((md) => { md.typography.proficiency = v })}
+            onChange={(v) =>
+              update((md) => {
+                md.typography.proficiency = v
+              })
+            }
           />
-          <p className="-mt-1 text-[11px] text-muted-foreground">How the 0–5 rating on skills &amp; languages is shown.</p>
+          <p className="-mt-1 text-[11px] text-muted-foreground">
+            How the 0–5 rating on skills &amp; languages is shown.
+          </p>
         </div>
+        <div>
+          <label className="label">Language level</label>
+          <Segmented
+            value={m.layout.levelPlacement ?? 'end'}
+            wrap
+            options={[
+              { value: 'end', label: 'Aligned' },
+              { value: 'inline', label: 'After name' },
+              { value: 'tag', label: 'Tag' },
+              { value: 'line', label: 'One line' },
+              { value: 'cards', label: 'Cards' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.levelPlacement = v
+              })
+            }
+          />
+          <p className="-mt-1 text-[11px] text-muted-foreground">
+            Where a language's level sits: in an aligned column, right after the language, as a small tag, all on one line, or each language as a card.
+          </p>
+        </div>
+      </FieldGroup>
+
+      <FieldGroup title="Dates" defaultOpen={false}>
+        <div>
+          <label className="label">Where dates sit</label>
+          <Segmented
+            wrap
+            value={m.layout.dateAlign ?? 'right'}
+            options={[
+              { value: 'right', label: 'Right edge' },
+              { value: 'title', label: 'After title' },
+              { value: 'inline', label: 'Company / issuer line' },
+              { value: 'left', label: 'Left column' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.dateAlign = v === 'right' ? undefined : v
+              })
+            }
+          />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            For every section; a section's own Style sheet can still choose for itself. A date column in Layout takes precedence.
+          </p>
+        </div>
+        <div>
+          <label className="label">Month</label>
+          <Segmented
+            value={m.dates?.month ?? 'short'}
+            options={[
+              { value: 'short', label: 'Jan' },
+              { value: 'long', label: 'January' },
+              { value: 'numeric', label: '01' },
+              { value: 'none', label: 'Year' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.dates.month = v
+              })
+            }
+          />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            How every date reads — on the page, in the PDF, in the Word file and in the ATS text.
+          </p>
+        </div>
+        <div>
+          <label className="label">Between dates</label>
+          <Segmented
+            value={m.dates?.separator ?? 'emdash'}
+            options={[
+              { value: 'emdash', label: '—' },
+              { value: 'endash', label: '–' },
+              { value: 'hyphen', label: '-' },
+              { value: 'to', label: 'to' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.dates.separator = v
+              })
+            }
+          />
+        </div>
+        <TextField
+          label="Word for current roles"
+          value={m.dates?.present ?? 'Present'}
+          placeholder="Present"
+          hint="Ends an open range: Present, Current, Now, or a word in your language."
+          onChange={(v) =>
+            update((md) => {
+              md.dates.present = v
+            })
+          }
+        />
+        <TextField
+          label="Word for an unfinished course"
+          value={m.dates?.expected ?? 'Expected'}
+          placeholder="Expected"
+          hint="Goes before a finish that has not happened yet: Expected May 2027."
+          onChange={(v) =>
+            update((md) => {
+              md.dates.expected = v
+            })
+          }
+        />
+        <TextField
+          label="Word for a course with no end date"
+          value={m.dates?.pursuing ?? 'Pursuing'}
+          placeholder="Pursuing"
+          hint="Stands in for the whole range: Pursuing, Ongoing, or a word in your language."
+          onChange={(v) =>
+            update((md) => {
+              md.dates.pursuing = v
+            })
+          }
+        />
+        <Select
+          label="Language"
+          value={m.dates?.language ?? 'en'}
+          options={DATE_LANGUAGE_OPTIONS}
+          onChange={(v) =>
+            update((md) => {
+              md.dates.language = v
+            })
+          }
+        />
+        <p className="-mt-1 text-[11px] text-muted-foreground">
+          Month names and time-span words; the PDF declares this language too.
+        </p>
       </FieldGroup>
 
       <FieldGroup title="Layout">
@@ -120,18 +802,228 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
                   key={h.value || 'auto'}
                   type="button"
                   title={h.label}
-                  onClick={() => update((md) => { md.layout.headerStyle = (h.value || undefined) as typeof md.layout.headerStyle })}
+                  onClick={() =>
+                    update((md) => {
+                      md.layout.headerStyle = (h.value || undefined) as typeof md.layout.headerStyle
+                    })
+                  }
                   className={`flex w-[64px] flex-col items-center gap-1 rounded-lg border p-1.5 transition ${on ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border bg-surface hover:border-primary/50'}`}
                 >
                   <span className="flex h-8 w-full items-center justify-center overflow-hidden rounded-[3px] border border-border/70 bg-white p-1">
                     <HeaderMini kind={h.value} />
                   </span>
-                  <span className={`text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}>{h.label}</span>
+                  <span
+                    className={`text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}
+                  >
+                    {h.label}
+                  </span>
                 </button>
               )
             })}
           </div>
-          <p className="-mt-0 text-[11px] text-muted-foreground">How your name &amp; contacts compose — on top of any template.</p>
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            How your name &amp; contacts compose — on top of any template.
+          </p>
+        </div>
+        {(m.layout.headerStyle ?? getTemplate(m.template).header) === 'kicker' ? (
+          <KickerFields doc={doc} editMeta={update} />
+        ) : null}
+        <div>
+          <label className="label">Numbers band</label>
+          <StatTilesEditor doc={doc} editMeta={update} />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            Which figures the band shows, in what order, with your own labels.
+          </p>
+        </div>
+        <div>
+          <label className="label">Art behind the header</label>
+          <ArtBandRow
+            value={m.theme.artBand ?? 'none'}
+            onPick={(band) =>
+              update((md) => {
+                md.theme.artBand = band as typeof md.theme.artBand
+              })
+            }
+          />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            A band of abstract art behind your name, washed in the page colour so the words still read. None is one tap
+            away.
+          </p>
+        </div>
+        <div>
+          <label className="label">Meta column</label>
+          <div className="flex flex-wrap gap-1.5">
+            {META_COLUMNS.map((c) => {
+              const on = (m.layout.metaColumn ?? 'none') === c.value
+              return (
+                <button
+                  key={c.value}
+                  type="button"
+                  title={c.label}
+                  onClick={() =>
+                    update((md) => {
+                      md.layout.metaColumn = c.value
+                    })
+                  }
+                  className={`flex w-[64px] flex-col items-center gap-1 rounded-lg border p-1.5 transition ${on ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border bg-surface hover:border-primary/50'}`}
+                >
+                  <span className="flex h-8 w-full items-center justify-center overflow-hidden rounded-[3px] border border-border/70 bg-white p-1">
+                    <MetaMini kind={c.value} />
+                  </span>
+                  <span
+                    className={`text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}
+                  >
+                    {c.label}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            Give your dates a column: big years down the left, or the date itself out in the right margin.
+          </p>
+        </div>
+        <div>
+          <label className="label">Headings</label>
+          <div className="flex flex-wrap gap-1.5">
+            {HEADING_PLACEMENTS.map((h) => {
+              const on = (m.layout.headingPlacement ?? 'above') === h.value
+              return (
+                <button
+                  key={h.value}
+                  type="button"
+                  title={h.label}
+                  onClick={() =>
+                    update((md) => {
+                      md.layout.headingPlacement = h.value
+                    })
+                  }
+                  className={`flex w-[64px] flex-col items-center gap-1 rounded-lg border p-1.5 transition ${on ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-border bg-surface hover:border-primary/50'}`}
+                >
+                  <span className="flex h-8 w-full items-center justify-center overflow-hidden rounded-[3px] border border-border/70 bg-white p-1">
+                    <HeadsMini kind={h.value} />
+                  </span>
+                  <span
+                    className={`text-[9px] font-medium leading-none ${on ? 'text-primary' : 'text-muted-foreground'}`}
+                  >
+                    {h.label}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            Beside the content, a section title keeps to a column of its own on the left.
+          </p>
+        </div>
+        {(m.layout.headingPlacement ?? 'above') === 'side' ? (
+          <div>
+            <label className="label">Side heading style</label>
+            <Segmented
+              value={m.layout.sideHeadingStyle ?? 'rail'}
+              options={[
+                { value: 'rail', label: 'Rail' },
+                { value: 'hanging', label: 'Hanging' },
+                { value: 'tick', label: 'Tick' },
+              ]}
+              onChange={(v) =>
+                update((md) => {
+                  md.layout.sideHeadingStyle = v
+                })
+              }
+            />
+            <p className="-mt-0 text-[11px] text-muted-foreground">
+              Rail runs a thin line between titles and content; Hanging hangs each title under a hairline; Tick marks it with a short accent stroke.
+            </p>
+          </div>
+        ) : null}
+        {/* The running numerals before section titles, offered on EVERY
+            design. The row used to be gated - first on the design, then on
+            the design OR the current value - because only the two designs
+            that ship numerals styled one, so anywhere else the switch would
+            have drawn an unspaced, untinted span. The base stylesheet sets
+            the numeral on all of them now (artboard.css), so the reason for
+            the gate is gone and the answer is the same everywhere: numbering
+            is a choice about the résumé, not a property of the design.
+            A second, older copy of this same switch sat further down the
+            group under its own gate. One field written from two rows meant
+            the panel offered the identical switch twice on the two numbered
+            designs; that copy is gone. */}
+        <div
+          ref={numbersRef}
+          className={cn(
+            '-mx-1 rounded-md px-1 py-1 transition-colors',
+            numbersFlash && 'bg-primary/10 ring-1 ring-primary'
+          )}
+        >
+          <Toggle
+            label="Number the sections"
+            checked={m.layout.sectionNumbers}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.sectionNumbers = v
+              })
+            }
+          />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            A running numeral before each section title — decoration only, never in the text a parser reads.
+          </p>
+          {/* ...and in what figures. Not everyone who wants their sections
+              counted wants the two-digit folio: the same switch now covers a
+              plain figure, a numbered-list full stop and roman capitals.
+              Inside the switch's own branch, because a style picker above a
+              switch that is off would style nothing. */}
+          {m.layout.sectionNumbers && (
+            <div className="mt-2">
+              <label className="label">Numeral style</label>
+              {/* The styles and their figures come from the formatter that
+                  draws them (sectionNumeral.ts), because the section Style
+                  sheet offers the same four and two hand-written copies of
+                  the list would drift. */}
+              <Segmented
+                value={m.layout.sectionNumberStyle}
+                options={SECTION_NUMBER_STYLES}
+                onChange={(v) =>
+                  update((md) => {
+                    md.layout.sectionNumberStyle = v
+                  })
+                }
+              />
+            </div>
+          )}
+        </div>
+        <div className="flex flex-col gap-2">
+          <Toggle
+            label="Name and page number at the foot"
+            checked={m.layout.pageFoot}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.pageFoot = v
+              })
+            }
+          />
+          {m.layout.pageFoot ? <FootFields doc={doc} editMeta={update} pages={footPages} /> : null}
+          <Toggle
+            label="Frame every page"
+            checked={m.layout.pageFrame}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.pageFrame = v
+              })
+            }
+          />
+          <Toggle
+            label="Drafting grid"
+            checked={m.layout.pageGrid}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.pageGrid = v
+              })
+            }
+          />
+          <p className="text-[11px] text-muted-foreground">
+            Drawn on every page of the PDF as decoration - never in the text a parser reads.
+          </p>
         </div>
         <div>
           <label className="label">Columns</label>
@@ -141,19 +1033,21 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
               { value: '1', label: 'Single' },
               { value: '2', label: 'Two column' },
             ]}
-            onChange={(v) => update((md) => {
-              md.layout.columns = v === '2' ? 2 : 1
-              // seed a sidebar if switching to two-column with none.
-              if (md.layout.columns === 2 && md.layout.aside.length === 0) {
-                const move = ['skills', 'languages', 'interests'].filter((k) => md.layout.main.includes(k))
-                md.layout.main = md.layout.main.filter((k) => !move.includes(k))
-                md.layout.aside = move
-              }
-              if (md.layout.columns === 1) {
-                md.layout.main = [...md.layout.main, ...md.layout.aside]
-                md.layout.aside = []
-              }
-            })}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.columns = v === '2' ? 2 : 1
+                // seed a sidebar if switching to two-column with none.
+                if (md.layout.columns === 2 && md.layout.aside.length === 0) {
+                  const move = ['skills', 'languages', 'interests'].filter((k) => md.layout.main.includes(k))
+                  md.layout.main = md.layout.main.filter((k) => !move.includes(k))
+                  md.layout.aside = move
+                }
+                if (md.layout.columns === 1) {
+                  md.layout.main = [...md.layout.main, ...md.layout.aside]
+                  md.layout.aside = []
+                }
+              })
+            }
           />
         </div>
         {twoCol && (
@@ -166,17 +1060,193 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
                   { value: 'left', label: 'Left' },
                   { value: 'right', label: 'Right' },
                 ]}
-                onChange={(v) => update((md) => { md.layout.sidebar = v })}
+                onChange={(v) =>
+                  update((md) => {
+                    md.layout.sidebar = v
+                  })
+                }
               />
             </div>
-            <Slider label="Sidebar width" value={m.layout.sidebarWidth} min={0.24} max={0.44} step={0.01} onChange={(v) => update((md) => { md.layout.sidebarWidth = v })} format={(v) => `${Math.round(v * 100)}%`} />
+            <Slider
+              label="Sidebar width"
+              value={Math.round(m.layout.sidebarWidth * 100)}
+              min={Math.round(DESIGN_RANGES.sidebarWidth.min * 100)}
+              max={Math.round(DESIGN_RANGES.sidebarWidth.max * 100)}
+              step={1}
+              unit="%"
+              onChange={(v) =>
+                update((md) => {
+                  md.layout.sidebarWidth = v / 100
+                })
+              }
+            />
           </>
         )}
-        <Slider label="Section spacing" value={m.layout.sectionGap} min={4} max={30} step={1} unit="pt" onChange={(v) => update((md) => { md.layout.sectionGap = v })} />
-        <Slider label="Item spacing" value={m.layout.itemGap} min={2} max={20} step={1} unit="pt" onChange={(v) => update((md) => { md.layout.itemGap = v })} />
-        <Toggle label="Show contact icons" checked={m.layout.icons} onChange={(v) => update((md) => { md.layout.icons = v })} />
-        <Toggle label="Show photo" checked={m.layout.showPhoto} onChange={(v) => update((md) => { md.layout.showPhoto = v })} />
-        {m.layout.showPhoto && (
+        <Slider
+          label="Section spacing"
+          value={m.layout.sectionGap}
+          {...DESIGN_RANGES.sectionGap}
+          unit="pt"
+          onChange={(v) =>
+            update((md) => {
+              md.layout.sectionGap = v
+            })
+          }
+        />
+        <Slider
+          label="Item spacing"
+          value={m.layout.itemGap}
+          {...DESIGN_RANGES.itemGap}
+          unit="pt"
+          onChange={(v) =>
+            update((md) => {
+              md.layout.itemGap = v
+            })
+          }
+        />
+        <Toggle
+          label="Show contact icons"
+          checked={m.layout.icons}
+          onChange={(v) =>
+            update((md) => {
+              md.layout.icons = v
+            })
+          }
+        />
+        <div>
+          <label className="label">Contact line</label>
+          <Segmented
+            value={m.layout.contactStyle ?? 'inline'}
+            options={[
+              { value: 'inline', label: 'Inline' },
+              { value: 'stacked', label: 'Stacked' },
+              { value: 'strip', label: 'Strip' },
+              { value: 'pills', label: 'Pills' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.contactStyle = v
+              })
+            }
+          />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            Strip sets each detail under a small label (EMAIL, PHONE, LINKEDIN) in a ruled row; Pills gives each its own capsule.
+          </p>
+        </div>
+        <div>
+          <label className="label">Contact position</label>
+          <Segmented
+            value={m.layout.contactPlacement === 'sidebar' && !twoCol ? 'below' : (m.layout.contactPlacement ?? 'below')}
+            options={[
+              { value: 'below', label: 'Below name' },
+              { value: 'beside', label: 'Beside' },
+              { value: 'above', label: 'Above' },
+              ...(twoCol ? [{ value: 'sidebar' as const, label: 'Sidebar' }] : []),
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.contactPlacement = v
+              })
+            }
+          />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            {m.layout.contactPlacement === 'sidebar' && twoCol
+              ? 'At the top of the sidebar. The file reads the main column first, so parsers meet your contacts after it; Below name keeps them first.'
+              : 'Where your details sit around your name. The reading order stays name, headline, contacts.'}
+          </p>
+        </div>
+        {m.layout.contactStyle === 'strip' && m.links?.display === 'full' ? (
+          <div>
+            <label className="label">Whole links in the strip</label>
+            <Segmented
+              value={m.layout.contactLinks ?? 'ledger'}
+              options={[
+                { value: 'ledger', label: 'Ledger' },
+                { value: 'columns', label: 'Two columns' },
+                { value: 'wrap', label: 'Wrap' },
+              ]}
+              onChange={(v) =>
+                update((md) => {
+                  md.layout.contactLinks = v
+                })
+              }
+            />
+            <p className="-mt-0 text-[11px] text-muted-foreground">
+              {m.layout.contactLinks === 'wrap'
+                ? 'Wrap breaks a long address at its slashes, and a parser reads a broken address as two pieces; Ledger and Two columns keep every address whole.'
+                : 'Ledger lists each link on its own row under the strip; Two columns gives each address room for one line.'}
+            </p>
+          </div>
+        ) : null}
+        <div>
+          <label className="label">Between contacts</label>
+          <Segmented
+            value={m.layout.contactSeparator ?? 'none'}
+            options={[
+              { value: 'none', label: 'Space' },
+              { value: 'node', label: '●' },
+              { value: 'dot', label: '·' },
+              { value: 'pipe', label: '|' },
+              { value: 'slash', label: '/' },
+              { value: 'dash', label: '–' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.contactSeparator = v
+              })
+            }
+          />
+          <p className="-mt-0 text-[11px] text-muted-foreground">
+            What sits between inline contacts — on the page, in the PDF and in the Word file.
+          </p>
+        </div>
+        <div>
+          <label className="label">Section icons</label>
+          <Segmented
+            wrap
+            value={m.layout.sectionIconStyle ?? 'folio'}
+            options={[
+              { value: 'folio', label: 'Folio' },
+              { value: 'chip', label: 'Chip' },
+              { value: 'plain', label: 'Plain' },
+              { value: 'filled', label: 'Filled' },
+              { value: 'circle', label: 'Circle' },
+              { value: 'outline', label: 'Outline' },
+              { value: 'none', label: 'None' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.sectionIconStyle = v
+              })
+            }
+          />
+        </div>
+        <div>
+          <label className="label">Icon size</label>
+          <Segmented
+            value={m.layout.sectionIconSize ?? 'm'}
+            options={[
+              { value: 's', label: 'S' },
+              { value: 'm', label: 'M' },
+              { value: 'l', label: 'L' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.layout.sectionIconSize = v
+              })
+            }
+          />
+        </div>
+        <Toggle
+          label="Show photo"
+          checked={m.layout.showPhoto}
+          onChange={(v) =>
+            update((md) => {
+              md.layout.showPhoto = v
+            })
+          }
+        />
+        {(m.layout.showPhoto || m.layout.monogram) && (
           <>
             <div>
               <label className="label">Photo shape</label>
@@ -186,9 +1256,17 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
                   { value: 'circle', label: 'Circle' },
                   { value: 'rounded', label: 'Rounded' },
                   { value: 'square', label: 'Square' },
+                  { value: 'diamond', label: 'Diamond' },
                 ]}
-                onChange={(v) => update((md) => { md.layout.photoShape = v })}
+                onChange={(v) =>
+                  update((md) => {
+                    md.layout.photoShape = v
+                  })
+                }
               />
+              <p className="-mt-0 text-[11px] text-muted-foreground">
+                Shape of the photo or monogram badge. Diamond turns the badge; a photo keeps square corners.
+              </p>
             </div>
             <div>
               <label className="label">Photo size</label>
@@ -199,7 +1277,27 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
                   { value: 'm', label: 'Medium' },
                   { value: 'l', label: 'Large' },
                 ]}
-                onChange={(v) => update((md) => { md.layout.photoSize = v })}
+                onChange={(v) =>
+                  update((md) => {
+                    md.layout.photoSize = v
+                  })
+                }
+              />
+            </div>
+            <div>
+              <label className="label">Photo position</label>
+              <Segmented
+                value={m.layout.photoAlign}
+                options={[
+                  { value: 'left', label: 'Left' },
+                  { value: 'center', label: 'Center' },
+                  { value: 'right', label: 'Right' },
+                ]}
+                onChange={(v) =>
+                  update((md) => {
+                    md.layout.photoAlign = v
+                  })
+                }
               />
             </div>
           </>
@@ -215,13 +1313,129 @@ export function DesignPanel({ doc }: { doc: ResumeDocument }) {
               { value: 'A4', label: 'A4' },
               { value: 'Letter', label: 'US Letter' },
             ]}
-            onChange={(v) => update((md) => { md.page.format = v })}
+            onChange={(v) =>
+              update((md) => {
+                md.page.format = v
+              })
+            }
           />
         </div>
-        <Slider label="Margins" value={m.page.margin} min={6} max={30} step={1} unit="mm" onChange={(v) => update((md) => { md.page.margin = v })} />
-        <Toggle label="Fit to one page" checked={m.page.autoFit} onChange={(v) => update((md) => { md.page.autoFit = v })} />
-        <p className="-mt-1 text-[11px] text-muted-foreground">Auto-shrinks type &amp; spacing so a near-full resume fits one page.</p>
+        <Slider
+          label="Margins"
+          value={m.page.margin}
+          {...DESIGN_RANGES.margin}
+          unit="mm"
+          onChange={(v) =>
+            update((md) => {
+              md.page.margin = v
+            })
+          }
+        />
+        <MagicFitCard doc={doc} />
+        <Toggle
+          label="Keep entries whole"
+          checked={m.page.keepEntriesWhole}
+          onChange={(v) =>
+            update((md) => {
+              md.page.keepEntriesWhole = v
+            })
+          }
+        />
+        <p className="-mt-1 text-[11px] text-muted-foreground">
+          Moves a whole entry to the next page instead of breaking one across it; any section can decide for itself in
+          its Style sheet.
+        </p>
+      </FieldGroup>
+
+      <FieldGroup title="Links" defaultOpen={false}>
+        <div>
+          <label className="label">Link style</label>
+          <Segmented
+            value={m.links?.style ?? 'tag'}
+            options={[
+              { value: 'tag', label: 'Tag' },
+              { value: 'plain', label: 'Plain' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.links.style = v
+              })
+            }
+          />
+        </div>
+        <p className="-mt-1 text-[11px] text-muted-foreground">
+          Tag sets named links (a project&apos;s Portfolio, a credential&apos;s Verify) in a small paper tag; Plain
+          prints the bare word. Contact links are never tagged.
+        </p>
+        <div>
+          <label className="label">Show URLs as</label>
+          <Segmented
+            value={m.links?.display ?? 'pretty'}
+            options={[
+              { value: 'pretty', label: 'Tidy' },
+              { value: 'full', label: 'Full' },
+              { value: 'short', label: 'Short' },
+            ]}
+            onChange={(v) =>
+              update((md) => {
+                md.links.display = v
+              })
+            }
+          />
+        </div>
+        <p className="-mt-1 text-[11px] text-muted-foreground">
+          Tidy drops https://, Full shows the address exactly as entered, Short keeps just the handle. How a link
+          reads is separate from whether it is clickable - the toggle below decides that.
+        </p>
+        <Toggle
+          label="Clickable links (PDF and Word)"
+          checked={m.links?.clickable !== false}
+          onChange={(v) =>
+            update((md) => {
+              md.links.clickable = v
+            })
+          }
+        />
+        <Toggle
+          label="Underline links"
+          checked={m.links?.underline ?? false}
+          onChange={(v) =>
+            update((md) => {
+              md.links.underline = v
+            })
+          }
+        />
       </FieldGroup>
     </div>
+  )
+}
+
+/** Under the font size: what the page actually prints, when Magic fit has
+ *  shrunk it. The slider says the size set; without this line "I set 10pt"
+ *  and a page printed at 8.6pt looked like the app ignoring the slider
+ *  (reported 2026-09-26). */
+function PrintedSizeNote({ doc }: { doc: ResumeDocument }) {
+  const result = useEditorStore((s) => s.fitResult)
+  const updateDoc = useResumeStore((s) => s.updateDoc)
+  if (!doc.metadata.page.autoFit || !result) return null
+  const set = doc.metadata.typography.fontSize
+  const body = fitSizesPt(doc.metadata, result.fit).body
+  if (Math.abs(body - set) < 0.05) return null
+  const p = (x: number) => `${Math.round(x * 10) / 10}pt`
+  return (
+    <p className="-mt-1 text-[11px] leading-snug text-muted-foreground" data-testid="printed-size-note">
+      Printing at {p(body)}: Magic fit {body < set ? 'shrank' : 'enlarged'} it to reach {result.pages} page{result.pages === 1 ? '' : 's'}.{' '}
+      <button
+        type="button"
+        className="font-medium text-primary underline-offset-2 hover:underline"
+        onClick={() =>
+          updateDoc((d) => {
+            d.metadata.page.autoFit = false
+          })
+        }
+      >
+        Print at {p(set)}
+      </button>
+    </p>
   )
 }

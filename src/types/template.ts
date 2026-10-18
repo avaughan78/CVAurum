@@ -22,6 +22,9 @@ export interface TemplateProps {
 }
 
 export type TemplateTag =
+  /** Nothing on the page but type: no heading badge, employer mark, keyword
+   *  chip or level meter. The quiet end of the collection. */
+  | 'bare'
   | 'ats-safe'
   | 'single-column'
   | 'two-column'
@@ -36,6 +39,7 @@ export type TemplateTag =
   | 'compact'
   | 'elegant'
   | 'premium'
+  | 'signature' // the Signature collection: one column, one structural primitive each
 
 /** How the name/contact header is laid out. */
 export type HeaderVariant =
@@ -44,6 +48,11 @@ export type HeaderVariant =
   | 'banner' // colored full-width band behind the header
   | 'split' // name left / contacts right, divider rule
   | 'compact' // single line name + inline contacts
+  | 'display' // the name set huge across the width, contacts as a byline between rules
+  | 'block' // the name fills a colour block in tall capitals
+  | 'band' // a two-stop gradient band carries the name, with a slot for the stats
+  | 'stepped' // three full-width bands in graded shades: name, role, contacts
+  | 'kicker' // a small decorative line over a large name: a label, and the city and year
 
 /** Section heading treatment. */
 export type SectionStyle =
@@ -73,6 +82,14 @@ export interface TemplateConfig {
   /** show an icon chip beside each section title (premium look). Defaults on
    *  for modern templates, off for traditional/minimal ones. */
   sectionIcons?: boolean
+  /** Families the template's own stylesheet names outright - a meta line
+   *  set in a mono face whatever the body is. The export waits for them and
+   *  the offline warmer fetches them, like the document's own three faces. */
+  fonts?: string[]
+  /** The name is set several times the body, so the word-fit pass keeps its
+   *  longest word on one line (keywordFit.ts, `rm-fit-name`). The kicker
+   *  header always is. */
+  fitName?: boolean
   /** the metadata this template applies when selected */
   defaults: Pick<Metadata, 'theme' | 'typography' | 'layout'> & { template: string }
   /** optional fully-custom component (rare; overrides the generic Artboard) */

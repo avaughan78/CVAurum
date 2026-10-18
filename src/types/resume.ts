@@ -26,6 +26,13 @@ export const ProfileSchema = z.object({
   network: z.string().optional().default(''),
   username: z.string().optional().default(''),
   url: z.string().optional().default(''),
+  /** What the reader SEES for this link. Empty means "derive it from the URL",
+   *  which is what every profile did before: the displayed text was the
+   *  address, so wanting to show "Portfolio" instead was simply not possible,
+   *  and editing the text on the canvas overwrote the address itself. */
+  label: z.string().optional(),
+  /** An explicit icon choice, overriding the guess made from `network`. */
+  icon: z.string().optional(),
 })
 
 export const BasicsSchema = z.object({
@@ -38,6 +45,12 @@ export const BasicsSchema = z.object({
   /** Rich-text (sanitized HTML) professional summary. */
   summary: z.string().optional().default(''),
   location: LocationSchema.optional().default({}),
+  /** What the reader sees for `url` - see ProfileSchema.label. */
+  urlLabel: z.string().optional(),
+  /** An explicit icon for the website link. Profiles could already choose one
+   *  and this row could not, so the first link on the page was the only one
+   *  stuck with the globe. */
+  urlIcon: z.string().optional(),
   profiles: z.array(ProfileSchema).optional().default([]),
 })
 
@@ -48,6 +61,12 @@ export const WorkSchema = z.object({
   name: z.string().optional().default(''), // company
   /** small company logo, locally-encoded data URI only (CVAurum extension) */
   logo: z.string().optional(),
+  /** per-entry badge override: absent follows the section's showBadges
+   *  setting; true/false forces it for this entry (CVAurum extension) */
+  badge: z.boolean().optional(),
+  /** the rail's numerals and the word beneath them, when the author set
+   *  them (CVAurum extension) */
+  rail: z.object({ year: z.string().optional(), word: z.string().optional() }).optional(),
   position: z.string().optional().default(''),
   url: z.string().optional().default(''),
   location: z.string().optional().default(''),
@@ -64,6 +83,11 @@ export const EducationSchema = z.object({
   institution: z.string().optional().default(''),
   /** small institution logo, locally-encoded data URI only (CVAurum extension) */
   logo: z.string().optional(),
+  /** per-entry badge override (see WorkSchema.badge) */
+  badge: z.boolean().optional(),
+  /** the rail's numerals and the word beneath them, when the author set
+   *  them (CVAurum extension) */
+  rail: z.object({ year: z.string().optional(), word: z.string().optional() }).optional(),
   url: z.string().optional().default(''),
   area: z.string().optional().default(''),
   studyType: z.string().optional().default(''),
@@ -73,13 +97,40 @@ export const EducationSchema = z.object({
   score: z.string().optional().default(''),
   summary: z.string().optional().default(''),
   courses: z.array(z.string()).optional().default([]),
+  /** Whether the course has finished (CVAurum extension). Absent lets the end
+   *  date answer: a finish still ahead of today is a course under way, which
+   *  is what a student's resume needs - an end date of 2027 printed as though
+   *  the degree were already in hand. */
+  status: z.enum(['completed', 'pursuing']).optional(),
+  /** What kind of schooling this is (CVAurum extension). It decides what the
+   *  EDITOR calls studyType/area/score and what it suggests - a school entry
+   *  should not be asked for a degree - and nothing else: the stored fields
+   *  and every rendered string are the same either way. */
+  level: z.enum(['degree', 'diploma', 'intermediate', 'secondary', 'certificate']).optional(),
 })
+
+/** One named link. The label is what the reader sees, the url is where it
+ *  goes. A project routinely has more than one - a repository, a demo, a
+ *  write-up - and three bare addresses read far worse than three short names. */
+export const NamedLinkSchema = z.object({
+  id: z.string().optional(),
+  label: z.string().optional().default(''),
+  url: z.string().optional().default(''),
+})
+
+export type NamedLink = z.infer<typeof NamedLinkSchema>
 
 export const ProjectSchema = z.object({
   id: z.string().optional(),
   name: z.string().optional().default(''),
   description: z.string().optional().default(''),
   url: z.string().optional().default(''),
+  /** Further named links, printed after the description as short names rather
+   *  than addresses. `url` above stays the project's primary link. */
+  links: z.array(NamedLinkSchema).optional(),
+  /** the rail's numerals and the word beneath them, when the author set
+   *  them (CVAurum extension) */
+  rail: z.object({ year: z.string().optional(), word: z.string().optional() }).optional(),
   startDate: z.string().optional().default(''),
   endDate: z.string().optional().default(''),
   highlights: z.array(z.string()).optional().default([]),
@@ -100,6 +151,11 @@ export const AwardSchema = z.object({
   title: z.string().optional().default(''),
   date: z.string().optional().default(''),
   awarder: z.string().optional().default(''),
+  /** Where the award can be checked, and the short word that stands for it -
+   *  the same Verify a credential line ends with. Leave the name empty and the
+   *  award's own title carries the link instead. */
+  url: z.string().optional(),
+  urlLabel: z.string().optional(),
   summary: z.string().optional().default(''),
 })
 
@@ -109,6 +165,14 @@ export const CertificateSchema = z.object({
   date: z.string().optional().default(''),
   issuer: z.string().optional().default(''),
   url: z.string().optional().default(''),
+  /** Name the link and it is printed AFTER the issuer as a short word - the
+   *  "Verify" that a credential line usually ends with - leaving the title as
+   *  plain text. Leave it empty and the title itself is the link, which is how
+   *  this behaved before. */
+  urlLabel: z.string().optional(),
+  /** A small issuer logo beside the name - AWS's cube, Google's G - the same
+   *  locally-encoded-only deal an entry logo gets. */
+  logo: z.string().optional(),
 })
 
 export const PublicationSchema = z.object({
@@ -145,6 +209,11 @@ export const VolunteerSchema = z.object({
   organization: z.string().optional().default(''),
   /** small organization logo, locally-encoded data URI only (CVAurum extension) */
   logo: z.string().optional(),
+  /** per-entry badge override (see WorkSchema.badge) */
+  badge: z.boolean().optional(),
+  /** the rail's numerals and the word beneath them, when the author set
+   *  them (CVAurum extension) */
+  rail: z.object({ year: z.string().optional(), word: z.string().optional() }).optional(),
   position: z.string().optional().default(''),
   url: z.string().optional().default(''),
   startDate: z.string().optional().default(''),
@@ -158,6 +227,9 @@ export const CustomItemSchema = z.object({
   id: z.string().optional(),
   name: z.string().optional().default(''),
   subtitle: z.string().optional().default(''),
+  /** the rail's numerals and the word beneath them, when the author set
+   *  them (CVAurum extension) */
+  rail: z.object({ year: z.string().optional(), word: z.string().optional() }).optional(),
   date: z.string().optional().default(''),
   location: z.string().optional().default(''),
   url: z.string().optional().default(''),

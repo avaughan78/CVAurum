@@ -14,8 +14,7 @@ import { BODY_SECTION_KEYS, DEFAULT_LABELS } from '@/lib/sections'
 import { useResumeStore } from '@/store/useResumeStore'
 import { useEditorStore } from '@/store/useEditorStore'
 import { useAppStore } from '@/store/useAppStore'
-import { saveDoc } from '@/lib/storage'
-import { openPrintWindow } from '@/lib/pdf'
+import { runPdfExport } from '@/lib/pdf/exportFlow'
 
 interface Cmd {
   id: string
@@ -110,6 +109,7 @@ export function CommandPalette({ doc }: { doc: ResumeDocument }) {
       { id: 'skim', group: 'View', label: 'Toggle recruiter skim heatmap', hint: 'where a 7-second skim lands — deterministic, on-device', run: () => { useEditorStore.getState().setSkimView(!useEditorStore.getState().skimView) } },
       { id: 'panel-content', group: 'View', label: 'Open Content panel', run: () => { ed.setLeftTab('content'); ed.setLeftOpen(true) } },
       { id: 'panel-design', group: 'View', label: 'Open Design panel', run: () => { ed.setLeftTab('design'); ed.setLeftOpen(true) } },
+      { id: 'magic-fit-suggest', group: 'View', label: 'Magic fit: suggest', hint: 'measure a few moves that fit better', run: () => { ed.setLeftTab('design'); ed.setLeftOpen(true); setTimeout(() => window.dispatchEvent(new Event('cvaurum:magic-fit-suggest')), 60) } },
       { id: 'panel-templates', group: 'View', label: 'Open Templates panel', run: () => { ed.setLeftTab('templates'); ed.setLeftOpen(true) } },
       { id: 'panel-ats', group: 'View', label: 'Open ATS & Tailoring panel', run: () => { ed.setLeftTab('ats'); ed.setLeftOpen(true) } },
       { id: 'semantic', group: 'View', label: 'Semantic JD match', hint: 'meaning-level match — in the ATS panel', run: () => { ed.setLeftTab('ats'); ed.setLeftOpen(true) } },
@@ -122,12 +122,10 @@ export function CommandPalette({ doc }: { doc: ResumeDocument }) {
         id: 'export-pdf',
         group: 'Export',
         label: 'Download PDF',
-        hint: 'crisp & selectable',
-        run: async () => {
-          const d = useResumeStore.getState().doc ?? doc
-          await saveDoc(d)
-          openPrintWindow(d.id)
-        },
+        hint: 'crisp, selectable, ATS-exact',
+        // The same flow as the top bar's Download PDF button: one in-flight
+        // guard, one visible generating state, one outcome message.
+        run: () => runPdfExport(useResumeStore.getState().doc ?? doc),
       },
       { id: 'export-menu', group: 'Export', label: 'Open export menu…', hint: 'Word, JSON Resume, PDF', run: () => window.dispatchEvent(new Event('cvaurum:open-export')) },
       { id: 'share', group: 'Export', label: 'Share privately…', hint: 'private link or encrypted file', run: () => window.dispatchEvent(new Event('cvaurum:open-share')) },
@@ -227,7 +225,7 @@ export function CommandPalette({ doc }: { doc: ResumeDocument }) {
   if (!open) return null
   return createPortal(
     <div className="fixed inset-0 z-[85]" role="dialog" aria-modal="true" aria-label="Command palette">
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={() => setOpen(false)} />
+      <div className="absolute inset-0 bg-black/50" onClick={() => setOpen(false)} />
       <div className="absolute left-1/2 top-[12vh] w-[min(38rem,calc(100vw-2rem))] -translate-x-1/2 overflow-hidden rounded-2xl border border-border bg-surface shadow-float">
         <div className="flex items-center gap-2 border-b border-border px-4">
           <Command className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -251,7 +249,7 @@ export function CommandPalette({ doc }: { doc: ResumeDocument }) {
           {results.map((c, i) => (
             <button
               key={c.id}
-              className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm transition ${i === sel ? 'bg-primary/10 text-foreground' : 'text-foreground hover:bg-muted/60'}`}
+              className={`flex min-h-[40px] w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm transition ${i === sel ? 'bg-primary/10 text-foreground' : 'text-foreground hover:bg-muted/60'}`}
               // mouseMOVE, not mouseenter: when the list re-renders under a
               // stationary cursor, mouseenter fires and silently steals the
               // selection from the keyboard — Enter then runs the wrong command.
@@ -263,7 +261,10 @@ export function CommandPalette({ doc }: { doc: ResumeDocument }) {
                 <span className="truncate">{c.label}</span>
               </span>
               <span className="flex shrink-0 items-center gap-2">
-                {c.hint && <span className="max-w-[12rem] truncate text-xs text-muted-foreground">{c.hint}</span>}
+                {/* The hint is the second thing you read, so on a phone it
+                    yields: sharing 375px with it truncated the command's own
+                    name to "T…", which is the one word you are searching for. */}
+                {c.hint && <span className="hidden max-w-[12rem] truncate text-xs text-muted-foreground sm:inline">{c.hint}</span>}
                 {i === sel && <CornerDownLeft className="h-3.5 w-3.5 text-muted-foreground" />}
               </span>
             </button>

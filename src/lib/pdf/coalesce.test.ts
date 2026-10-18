@@ -1,0 +1,95 @@
+import { describe, expect, it } from 'vitest'
+import { coalesceTextOps } from './coalesce'
+import type { DrawOp, TextRun } from './types'
+
+const RUN: TextRun = {
+  text: 'x',
+  xPx: 0,
+  widthPx: 10,
+  baselinePx: 100,
+  sizePx: 12,
+  family: 'Inter',
+  weight: 400,
+  italic: false,
+  color: { r: 0, g: 0, b: 0, a: 1 },
+  letterSpacingPx: 0,
+  smallCapsScale: 0,
+  isDecorative: false,
+}
+
+const op = (text: string, xPx: number, widthPx: number, over: Partial<TextRun> = {}, rest: Partial<Extract<DrawOp, { kind: 'text' }>> = {}): DrawOp => ({
+  kind: 'text',
+  run: { ...RUN, ...over, text, xPx, widthPx },
+  role: 'P',
+  column: 'main',
+  blockId: 1,
+  ...rest,
+})
+
+const texts = (ops: DrawOp[]) => ops.filter((o) => o.kind === 'text').map((o) => (o as Extract<DrawOp, { kind: 'text' }>).run.text)
+
+describe('coalesceTextOps', () => {
+  it('joins runs that sit flush against each other on one baseline', () => {
+    const out = coalesceTextOps([op('Architected an', 65, 57), op(' ', 122, 2), op('event-driven', 124, 47)])
+    expect(texts(out)).toEqual(['Architected an event-driven'])
+    const run = (out[0] as Extract<DrawOp, { kind: 'text' }>).run
+    expect(run.xPx).toBe(65)
+    expect(run.widthPx).toBeCloseTo(106, 5) // 124 + 47 - 65
+  })
+
+  it('keeps runs separated by a real gap apart — that gap is a column, not a word space', () => {
+    const out = coalesceTextOps([op('Engineer Role 7', 56, 90), op('Mar 2021', 486, 60)])
+    expect(texts(out)).toEqual(['Engineer Role 7', 'Mar 2021'])
+  })
+
+  it('never joins across a baseline, a style change, or a different logical block', () => {
+    expect(texts(coalesceTextOps([op('a', 0, 10), op('b', 10, 10, { baselinePx: 120 })]))).toEqual(['a', 'b'])
+    expect(texts(coalesceTextOps([op('a', 0, 10), op('b', 10, 10, { weight: 700 })]))).toEqual(['a', 'b'])
+    expect(texts(coalesceTextOps([op('a', 0, 10), op('b', 10, 10, {}, { blockId: 2 })]))).toEqual(['a', 'b'])
+  })
+
+  it('leaves non-text ops and their order alone', () => {
+    const rect = { kind: 'rect', xPx: 0, yPx: 0, wPx: 5, hPx: 5, fill: RUN.color } as unknown as DrawOp
+    const out = coalesceTextOps([op('a', 0, 10), rect, op('b', 10, 10)])
+    expect(out).toHaveLength(3)
+    expect(texts(out)).toEqual(['a', 'b'])
+  })
+})
+
+describe('coalesceTextOps — decoration is part of a run style', () => {
+  // Underline and strike-through are ruled by the painter, not by the font, so
+  // two runs that differ only in decoration LOOK identical to a style test that
+  // ignores it. Merging them keeps the FIRST run's flags and silently drops the
+  // rest: "Plain start <u>underlined middle</u>" exported with no underline at
+  // all, even though the DOM computed `text-decoration-line: underline`.
+  it('does not merge an underlined run into a plain neighbour', () => {
+    const out = coalesceTextOps([op('Plain start ', 0, 60), op('underlined middle', 60, 80, { underline: true })])
+    expect(texts(out)).toEqual(['Plain start ', 'underlined middle'])
+  })
+
+  it('does not merge a struck run into a plain neighbour', () => {
+    const out = coalesceTextOps([op('kept ', 0, 30), op('struck', 30, 40, { lineThrough: true })])
+    expect(texts(out)).toEqual(['kept ', 'struck'])
+  })
+
+  it('still merges two runs that share the same decoration', () => {
+    const out = coalesceTextOps([op('under', 0, 30, { underline: true }), op('lined', 30, 30, { underline: true })])
+    expect(texts(out)).toEqual(['underlined'])
+  })
+})
+
+describe('0008: linkUrl is part of a run’s identity', () => {
+  it('never joins adjacent Link runs with different destinations', () => {
+    const a = op('a@b.c', 0, 30, {}, { role: 'Link', linkUrl: 'mailto:a@b.c' })
+    const b = op('+15550128', 32, 50, {}, { role: 'Link', linkUrl: 'tel:+15550128' })
+    expect(texts(coalesceTextOps([a, b]))).toEqual(['a@b.c', '+15550128'])
+  })
+
+  it('still joins one hyperlink’s flush runs and keeps its URL', () => {
+    const a = op('long-', 0, 30, {}, { role: 'Link', linkUrl: 'https://w.example/' })
+    const b = op('link', 30, 25, {}, { role: 'Link', linkUrl: 'https://w.example/' })
+    const out = coalesceTextOps([a, b])
+    expect(texts(out)).toEqual(['long-link'])
+    expect((out[0] as Extract<DrawOp, { kind: 'text' }>).linkUrl).toBe('https://w.example/')
+  })
+})

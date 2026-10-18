@@ -1,18 +1,9 @@
-﻿import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
-import {
-  FileText,
-  Plus,
-  FileUp,
-  Copy,
-  Trash2,
-  MoreVertical,
-  KanbanSquare,
-  DatabaseBackup,
-} from 'lucide-react'
+import { BookOpen, FileText, Plus, FileUp, Copy, Trash2, MoreVertical, KanbanSquare, DatabaseBackup } from 'lucide-react'
 import { useAppStore } from '@/store/useAppStore'
-import { saveDoc, deleteDoc } from '@/lib/storage'
-import { exportFullBackup, importFullBackup } from '@/lib/backup'
+import { saveDoc, deleteDoc, requestDurability, getDurabilityStatus, getLoadReport, type DurabilityStatus, type LoadReport } from '@/lib/storage'
+import { exportFullBackup, exportRawStored, importFullBackup } from '@/lib/backup'
 import { uid, timeAgo } from '@/lib/utils'
 import type { ResumeDocument } from '@/types/document'
 import { PreviewThumb } from '@/components/preview/PreviewThumb'
@@ -21,11 +12,136 @@ import { ThemeToggle } from '@/components/ui/ThemeToggle'
 import { useResumeActions, NewResumeModal, SamplePicker } from '@/components/dashboard/newResume'
 import { InstallButton } from '@/components/ui/InstallButton'
 import { useTitle } from '@/lib/useTitle'
+import { useLazyMount } from '@/components/preview/lazyMount'
+import { ThumbSkeleton } from '@/components/preview/ThumbSkeleton'
+
+const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000
+// Settling grace before the backup-staleness notice can fire — same window the
+// old per-session toast nudge used, so a user importing/creating resumes in one
+// sitting (or a brand-new library) isn't nagged immediately.
+const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000
+const DURABILITY_DISMISS_KEY = 'cvaurum:durability-notice-dismissed'
+const BACKUP_DISMISS_KEY = 'cvaurum:backup-notice-dismissed'
+
+/** try/catch guard per the backup.ts precedent — never let a storage read/write block the dashboard. */
+function readTimestamp(key: string): number {
+  try {
+    return Number(localStorage.getItem(key) || 0)
+  } catch {
+    return 0
+  }
+}
+function writeTimestamp(key: string) {
+  try {
+    localStorage.setItem(key, String(Date.now()))
+  } catch {
+    /* private mode */
+  }
+}
+
+export type StorageNoticeKind = 'durability' | 'backup'
+
+export interface StorageNoticeInput {
+  durability: DurabilityStatus
+  library: { createdAt: number }[]
+  lastBackup: number
+  dismissedAt: { durability: number; backup: number }
+  now: number
+}
+
+/**
+ * Pure decision for which (if any) storage notice to show — no React, no DOM, so
+ * it's directly unit-testable. Neither fires on an empty library: there is
+ * nothing to lose yet, and nothing for the offered backup to carry.
+ * Durability-denied (real risk of silent data loss) then wins over backup
+ * staleness (one notice at a time). Backup staleness
+ * restores the coverage the old per-session toast nudge had: ANY library with
+ * >= 1 resume, once the OLDEST one has settled in for two days (skips brand-new
+ * users/imports so they aren't nagged immediately), with no backup on record or
+ * one older than 14 days.
+ */
+export function computeStorageNotice({
+  durability,
+  library,
+  lastBackup,
+  dismissedAt,
+  now,
+}: StorageNoticeInput): StorageNoticeKind | null {
+  // Nothing to warn about until there is something to lose. The durability
+  // notice used to fire on an empty library: an orange "it may clear your
+  // resumes" above the page title, on a first visit, offering to back up
+  // nothing. Unlike backup staleness it does NOT wait for the résumé to settle
+  // — a browser that has refused durable storage can drop it the same day.
+  if (!library.length) return null
+  if (durability === 'denied' && now - dismissedAt.durability > FOURTEEN_DAYS_MS) return 'durability'
+  const oldest = Math.min(...library.map((r) => r.createdAt || now))
+  const settledIn = now - oldest > TWO_DAYS_MS
+  const backupStale = !lastBackup || now - lastBackup > FOURTEEN_DAYS_MS
+  if (settledIn && backupStale && now - dismissedAt.backup > FOURTEEN_DAYS_MS) return 'backup'
+  return null
+}
+
+/** How many résumés this browser holds but the list cannot show - 'all' when
+ *  the library could not be read at all - or null when nothing is missing. */
+export function unreadableResumes(report: LoadReport): number | 'all' | null {
+  if (report.failed) return 'all'
+  const missing = report.stored - report.shown
+  return missing > 0 ? missing : null
+}
+
+/** Résumés stored here that cannot be opened: never left out in silence, and
+ *  always one tap from a file that keeps every word of them. */
+function UnreadableNotice({ count, onSave }: { count: number | 'all'; onSave: () => void }) {
+  const message =
+    count === 'all'
+      ? 'Your saved resumes could not be read just now. They are still in this browser: save a copy before anything else.'
+      : `${count} saved resume${count === 1 ? '' : 's'} in this browser could not be opened. ${count === 1 ? 'It is' : 'They are'} still stored: save a copy so nothing is lost.`
+  return (
+    <div role="alert" className="mb-6 flex flex-wrap items-start gap-x-2.5 gap-y-2 rounded-xl border border-danger/30 bg-danger/5 px-3.5 py-2.5 text-xs leading-relaxed text-foreground">
+      <span aria-hidden>⚠️</span>
+      <span className="min-w-0 flex-1 basis-56">{message}</span>
+      <button className="btn-outline btn-sm ml-auto h-7 shrink-0 phone:h-10" onClick={onSave}>
+        <DatabaseBackup className="h-3.5 w-3.5" /> Save a copy
+      </button>
+    </div>
+  )
+}
+
+/** Dismissible inline notice — same visual language as the canvas's BlankCanvasTip hint. */
+function StorageNotice({
+  kind,
+  onBackup,
+  onDismiss,
+}: {
+  kind: StorageNoticeKind
+  onBackup: () => void
+  onDismiss: () => void
+}) {
+  const message =
+    kind === 'durability'
+      ? 'Your browser has not guaranteed permanent storage for this site — it may clear your resumes under disk pressure. Download a backup.'
+      : 'It has been a while since your last backup. Download one so a cleared browser can never lose your resumes.'
+  return (
+    // One row on a wide screen; on a narrow one the message keeps a readable
+    // column and the two controls drop to a line of their own instead of
+    // squeezing the sentence into a sliver.
+    <div className="mb-6 flex flex-wrap items-start gap-x-2.5 gap-y-2 rounded-xl border border-warning/30 bg-warning/5 px-3.5 py-2.5 text-xs leading-relaxed text-foreground">
+      <span aria-hidden>⚠️</span>
+      <span className="min-w-0 flex-1 basis-56">{message}</span>
+      <button className="btn-outline btn-sm ml-auto h-7 shrink-0" onClick={onBackup}>
+        <DatabaseBackup className="h-3.5 w-3.5" /> Back up now
+      </button>
+      <button className="btn-icon h-6 w-6 shrink-0" onClick={onDismiss} aria-label="Dismiss">
+        ✕
+      </button>
+    </div>
+  )
+}
 
 /** The resume library / dashboard (/app). The explainer homepage lives at /. */
 export function Dashboard() {
   // Safari (not installed as an app) deletes ALL site data after 7 days
-  // without a visit â€” for a local-first app that means losing resumes.
+  // without a visit — for a local-first app that means losing resumes.
   // One honest, one-time heads-up with the two real mitigations.
   useEffect(() => {
     try {
@@ -38,34 +154,51 @@ export function Dashboard() {
         localStorage.setItem('cvaurum:safari-nudge', '1')
         useAppStore
           .getState()
-          .toast('Heads-up: Safari clears local site data after 7 days without a visit. Install CVAurum as an app or export a backup to keep your resumes safe.', 'info')
+          .toast(
+            'Heads-up: Safari clears local site data after 7 days without a visit. Install CVAurum as an app or export a backup to keep your resumes safe.',
+            'info'
+          )
       }
     } catch {
       /* never block the dashboard over a nudge */
     }
   }, [])
-  useTitle('Your Resumes Â· CVAurum')
+  useTitle('Your Resumes · CVAurum')
   const navigate = useNavigate()
   const library = useAppStore((s) => s.library)
-  // Durability reminder: local-first means a cleared browser = lost rÃ©sumÃ©s.
-  // If there's real work and no recent backup, nudge once per session.
+  const libraryLoaded = useAppStore((s) => s.libraryLoaded)
+
+  // Storage durability: local-first means a denied persist() grant can end in
+  // the browser silently evicting all site data under disk pressure. Check the
+  // HONEST outcome (not fire-and-forget) once per session, and if it's denied,
+  // surface it — that's the one case where "just export a backup" is real advice.
+  const [durability, setDurability] = useState<DurabilityStatus>(getDurabilityStatus())
   useEffect(() => {
-    try {
-      if (!library.length) return
-      if (sessionStorage.getItem('cvaurum:backup-nudged')) return
-      const last = Number(localStorage.getItem('cvaurum:last-backup') || 0)
-      const stale = !last || Date.now() - last > 14 * 24 * 60 * 60 * 1000
-      // Skip brand-new users (nothing worth backing up yet).
-      const oldest = Math.min(...library.map((r) => r.createdAt || Date.now()))
-      const settledIn = Date.now() - oldest > 2 * 24 * 60 * 60 * 1000
-      if (stale && settledIn) {
-        sessionStorage.setItem('cvaurum:backup-nudged', '1')
-        useAppStore.getState().toast('Tip: back up your rÃ©sumÃ©s (Backup â†’ Export) so a cleared browser can never lose them.', 'info')
-      }
-    } catch {
-      /* never block the dashboard over a nudge */
+    let alive = true
+    requestDurability().then((status) => {
+      if (alive) setDurability(status)
+    })
+    return () => {
+      alive = false
     }
-  }, [library])
+  }, [])
+
+  // Dismissal for both notices below is remembered in localStorage and re-shown
+  // after 14 days — same snooze window as the staleness check itself.
+  const [dismissedAt, setDismissedAt] = useState(() => ({
+    durability: readTimestamp(DURABILITY_DISMISS_KEY),
+    backup: readTimestamp(BACKUP_DISMISS_KEY),
+  }))
+  const now = Date.now()
+  const lastBackup = readTimestamp('cvaurum:last-backup')
+  const notice = computeStorageNotice({ durability, library, lastBackup, dismissedAt, now })
+  const dismissNotice = () => {
+    if (!notice) return
+    const key = notice === 'durability' ? DURABILITY_DISMISS_KEY : BACKUP_DISMISS_KEY
+    writeTimestamp(key)
+    setDismissedAt((s) => ({ ...s, [notice]: Date.now() }))
+  }
+
   const refreshLibrary = useAppStore((s) => s.refreshLibrary)
   const toast = useAppStore((s) => s.toast)
   const { create, importFile, importPdf } = useResumeActions()
@@ -89,12 +222,25 @@ export function Dashboard() {
       toast('Could not create the backup', 'error')
     }
   }
+  // Read after every library load (the store re-reads on each visit).
+  const unreadable = libraryLoaded ? unreadableResumes(getLoadReport()) : null
+  const onSaveStored = async () => {
+    try {
+      const n = await exportRawStored()
+      toast(`Saved ${n} stored resume${n === 1 ? '' : 's'}`, 'success')
+    } catch {
+      toast('Could not read this browser’s storage', 'error')
+    }
+  }
   const onRestore = async (file?: File) => {
     if (!file) return
     try {
       const r = await importFullBackup(file, 'merge')
       await refreshLibrary()
-      toast(`Restored ${r.resumes} resume${r.resumes === 1 ? '' : 's'}${r.tracker ? ` + ${r.tracker} application${r.tracker === 1 ? '' : 's'}` : ''}`, 'success')
+      toast(
+        `Restored ${r.resumes} resume${r.resumes === 1 ? '' : 's'}${r.tracker ? ` + ${r.tracker} application${r.tracker === 1 ? '' : 's'}` : ''}`,
+        'success'
+      )
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Could not restore that backup', 'error')
     }
@@ -102,22 +248,51 @@ export function Dashboard() {
 
   return (
     <div className="relative min-h-full overflow-x-clip bg-background">
-      {/* ambient aurora â€” quiet in light mode, cinematic in dark */}
+      {/* ambient aurora — quiet in light mode, cinematic in dark */}
       <div aria-hidden className="pointer-events-none absolute inset-0 -z-0">
-        <div className="absolute -top-48 right-[-8%] h-[30rem] w-[30rem] rounded-full opacity-[0.10] blur-3xl dark:opacity-[0.22]" style={{ background: 'radial-gradient(closest-side,#d4982f,transparent)' }} />
-        <div className="absolute top-1/2 left-[-10%] h-[26rem] w-[26rem] rounded-full opacity-[0.06] blur-3xl dark:opacity-[0.14]" style={{ background: 'radial-gradient(closest-side,#5b5df0,transparent)' }} />
+        <div
+          className="absolute -top-48 right-[-8%] h-[30rem] w-[30rem] rounded-full opacity-[0.10] blur-3xl dark:opacity-[0.22]"
+          style={{ background: 'radial-gradient(closest-side,#d4982f,transparent)' }}
+        />
+        <div
+          className="absolute top-1/2 left-[-10%] h-[26rem] w-[26rem] rounded-full opacity-[0.06] blur-3xl dark:opacity-[0.14]"
+          style={{ background: 'radial-gradient(closest-side,#5b5df0,transparent)' }}
+        />
       </div>
       <header className="sticky top-0 z-20 border-b border-border bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">
+        {/* On a phone the wording drops away and each control becomes a
+            comfortably tappable glyph — with the labels in, this row was 400px
+            wide in a 375px window and pushed the theme switch off the edge,
+            where nothing could scroll it back. */}
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-2 px-4 py-3 sm:px-6">
           <Logo to="/" />
-          <div className="flex items-center gap-2">
-            <InstallButton />
-            <Link className="btn-ghost btn-sm" to="/tracker">
-              <KanbanSquare className="h-4 w-4" /> Job Tracker
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            <InstallButton className="btn-outline btn-sm h-10 sm:h-8" />
+            {/* Nothing inside the app led to the example library, so the only
+                way to the hundred and eight was to leave for the public site
+                and find it there. */}
+            <Link
+              className="btn-ghost btn-sm h-10 sm:h-8"
+              to="/examples"
+              title="Browse the resume examples"
+              aria-label="Examples"
+            >
+              <BookOpen className="h-4 w-4" />
+              <span className="hidden sm:inline">Examples</span>
+            </Link>
+            <Link className="btn-ghost btn-sm h-10 sm:h-8" to="/tracker" title="Job Tracker" aria-label="Job Tracker">
+              <KanbanSquare className="h-4 w-4" />
+              <span className="hidden sm:inline">Job Tracker</span>
             </Link>
             <div className="relative">
-              <button className="btn-ghost btn-sm" onClick={() => setBackupMenu((o) => !o)} title="Back up or restore all your data">
-                <DatabaseBackup className="h-4 w-4" /> Backup
+              <button
+                className="btn-ghost btn-sm h-10 sm:h-8"
+                onClick={() => setBackupMenu((o) => !o)}
+                title="Back up or restore all your data"
+                aria-label="Backup"
+              >
+                <DatabaseBackup className="h-4 w-4" />
+                <span className="hidden sm:inline">Backup</span>
               </button>
               {backupMenu && (
                 <>
@@ -125,36 +300,82 @@ export function Dashboard() {
                   <div className="card absolute right-0 z-20 mt-1 w-60 overflow-hidden p-1 shadow-float">
                     <button className="btn-ghost h-auto w-full flex-col items-start gap-0 py-1.5" onClick={onBackup}>
                       <span className="text-sm font-medium">Export backup</span>
-                      <span className="text-[11px] font-normal text-muted-foreground">All resumes + settings + tracker, one file</span>
+                      <span className="text-[11px] font-normal text-muted-foreground">
+                        All resumes + settings + tracker, one file
+                      </span>
                     </button>
-                    <button className="btn-ghost h-auto w-full flex-col items-start gap-0 py-1.5" onClick={() => { setBackupMenu(false); backupRef.current?.click() }}>
+                    <button
+                      className="btn-ghost h-auto w-full flex-col items-start gap-0 py-1.5"
+                      onClick={() => {
+                        setBackupMenu(false)
+                        backupRef.current?.click()
+                      }}
+                    >
                       <span className="text-sm font-medium">Restore from backup</span>
-                      <span className="text-[11px] font-normal text-muted-foreground">Import into this browser (keeps existing)</span>
+                      <span className="text-[11px] font-normal text-muted-foreground">
+                        Import into this browser (keeps existing)
+                      </span>
                     </button>
                   </div>
                 </>
               )}
             </div>
-            <ThemeToggle />
+            <ThemeToggle className="btn-icon h-10 w-10 sm:h-9 sm:w-9" />
           </div>
         </div>
       </header>
 
-      <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={(e) => importFile(e.target.files?.[0])} />
-      <input ref={pdfRef} type="file" accept="application/pdf,.pdf" className="hidden" onChange={(e) => importPdf(e.target.files?.[0])} />
-      <input ref={backupRef} type="file" accept="application/json,.json" className="hidden" onChange={(e) => onRestore(e.target.files?.[0])} />
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={(e) => importFile(e.target.files?.[0])}
+      />
+      <input
+        ref={pdfRef}
+        type="file"
+        accept="application/pdf,.pdf"
+        className="hidden"
+        onChange={(e) => importPdf(e.target.files?.[0])}
+      />
+      <input
+        ref={backupRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={(e) => onRestore(e.target.files?.[0])}
+      />
 
       <main className="mx-auto max-w-6xl px-6 py-10">
+        {libraryLoaded && unreadable !== null ? <UnreadableNotice count={unreadable} onSave={onSaveStored} /> : null}
+        {notice && <StorageNotice kind={notice} onBackup={onBackup} onDismiss={dismissNotice} />}
         <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Your resumes</h1>
-            <p className="mt-1 text-sm text-muted-foreground">Private &amp; local â€” everything is saved in this browser. Nothing leaves your device.</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Private &amp; local — everything is saved in this browser. Nothing leaves your device.
+            </p>
           </div>
-          <div className="flex gap-2">
-            <button className="btn-ghost btn-sm" onClick={() => pdfRef.current?.click()} title="Import an existing PDF rÃ©sumÃ© â€” parsed in your browser, never uploaded">
+          {/* Wraps on a narrow screen: the three pills are 362px wide and a
+              phone gives the row 327px, which used to slice the primary
+              button in half against the right edge. From sm: up the row is
+              back to one line - wrapping there would let this flex item
+              shrink to its min-content width and break the alignment with
+              the card grid below. */}
+          <div className="flex flex-wrap gap-2 sm:flex-nowrap">
+            <button
+              className="btn-ghost btn-sm"
+              onClick={() => pdfRef.current?.click()}
+              title="Import an existing PDF résumé — parsed in your browser, never uploaded"
+            >
               <FileUp className="h-4 w-4" /> Import PDF
             </button>
-            <button className="btn-outline btn-sm" onClick={() => setSampleOpen(true)} title="Start from a complete example resume">
+            <button
+              className="btn-outline btn-sm"
+              onClick={() => setSampleOpen(true)}
+              title="Start from a complete example resume"
+            >
               <FileText className="h-4 w-4" /> Example
             </button>
             <button className="btn-primary btn-sm" onClick={() => setChooser(true)}>
@@ -163,13 +384,31 @@ export function Dashboard() {
           </div>
         </div>
 
-        {library.length === 0 ? (
-          <EmptyState onNew={() => setChooser(true)} onExample={() => setSampleOpen(true)} onImport={() => fileRef.current?.click()} />
+        {!libraryLoaded ? (
+          // The library now loads behind the first paint - showing the empty
+          // state before it arrives would flash "no resumes yet" at someone
+          // who has twelve.
+          <div className="grid grid-cols-2 gap-5 sm:grid-cols-3 lg:grid-cols-4" aria-busy>
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="aspect-[210/297] animate-pulse rounded-xl border border-border bg-muted/40" />
+            ))}
+          </div>
+        ) : library.length === 0 ? (
+          <EmptyState
+            onNew={() => setChooser(true)}
+            onExample={() => setSampleOpen(true)}
+            onImport={() => fileRef.current?.click()}
+          />
         ) : (
           <div className="grid grid-cols-2 gap-5 sm:grid-cols-3 lg:grid-cols-4">
             <NewCard onClick={() => setChooser(true)} />
             {library.map((doc) => (
-              <ResumeCard key={doc.id} doc={doc} onOpen={() => navigate(`/resume/${doc.id}`)} onChanged={refreshLibrary} />
+              <ResumeCard
+                key={doc.id}
+                doc={doc}
+                onOpen={() => navigate(`/resume/${doc.id}`)}
+                onChanged={refreshLibrary}
+              />
             ))}
           </div>
         )}
@@ -177,28 +416,56 @@ export function Dashboard() {
 
       {chooser && (
         <NewResumeModal
-          onBlank={() => { setChooser(false); create(false) }}
-          onExample={() => { setChooser(false); setSampleOpen(true) }}
-          onImport={() => { setChooser(false); fileRef.current?.click() }}
-          onImportPdf={() => { setChooser(false); pdfRef.current?.click() }}
+          onBlank={() => {
+            setChooser(false)
+            create(false)
+          }}
+          onExample={() => {
+            setChooser(false)
+            setSampleOpen(true)
+          }}
+          onImport={() => {
+            setChooser(false)
+            fileRef.current?.click()
+          }}
+          onImportPdf={() => {
+            setChooser(false)
+            pdfRef.current?.click()
+          }}
           onClose={() => setChooser(false)}
         />
       )}
       {sampleOpen && (
-        <SamplePicker onClose={() => setSampleOpen(false)} onPick={(p) => { setSampleOpen(false); create(true, p.template, p.content, p.tweaks) }} />
+        <SamplePicker
+          onClose={() => setSampleOpen(false)}
+          onPick={(p) => {
+            setSampleOpen(false)
+            create(true, p.template, p.content, p.tweaks, `${p.role} resume`)
+          }}
+        />
       )}
     </div>
   )
 }
 
-function EmptyState({ onNew, onExample, onImport }: { onNew: () => void; onExample: () => void; onImport: () => void }) {
+function EmptyState({
+  onNew,
+  onExample,
+  onImport,
+}: {
+  onNew: () => void
+  onExample: () => void
+  onImport: () => void
+}) {
   return (
     <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border py-20 text-center">
       <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10 text-primary">
         <FileText className="h-7 w-7" />
       </div>
       <h2 className="mt-4 text-lg font-semibold">No resumes yet</h2>
-      <p className="mt-1 max-w-sm text-sm text-muted-foreground">Create your first rÃ©sumÃ© from a blank canvas or a ready-made example â€” it stays private to this browser.</p>
+      <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+        Create your first résumé from a blank canvas or a ready-made example — it stays private to this browser.
+      </p>
       <div className="mt-6 flex flex-wrap justify-center gap-2">
         <button className="btn-primary btn-sm" onClick={onNew}>
           <Plus className="h-4 w-4" /> New resume
@@ -206,11 +473,17 @@ function EmptyState({ onNew, onExample, onImport }: { onNew: () => void; onExamp
         <button className="btn-outline btn-sm" onClick={onExample}>
           <FileText className="h-4 w-4" /> Start with an example
         </button>
-        <button className="btn-ghost btn-sm" onClick={onImport} title="Import a JSON Resume file (.json) â€” not a PDF or Word doc">
+        <button
+          className="btn-ghost btn-sm"
+          onClick={onImport}
+          title="Import a JSON Resume file (.json) — not a PDF or Word doc"
+        >
           <FileUp className="h-4 w-4" /> Import JSON
         </button>
       </div>
-      <p className="mt-3 text-xs text-muted-foreground/70">Import a JSON Resume file â€” or use Import PDF above to bring in an existing PDF rÃ©sumÃ©.</p>
+      <p className="mt-3 text-xs text-muted-foreground/70">
+        Import a JSON Resume file — or use Import PDF above to bring in an existing PDF résumé.
+      </p>
     </div>
   )
 }
@@ -228,6 +501,7 @@ function NewCard({ onClick }: { onClick: () => void }) {
 }
 
 function ResumeCard({ doc, onOpen, onChanged }: { doc: ResumeDocument; onOpen: () => void; onChanged: () => void }) {
+  const [thumbRef, seen] = useLazyMount<HTMLDivElement>()
   const [menu, setMenu] = useState(false)
   const toast = useAppStore((s) => s.toast)
 
@@ -257,8 +531,12 @@ function ResumeCard({ doc, onOpen, onChanged }: { doc: ResumeDocument; onOpen: (
         onClick={onOpen}
         className="block w-full overflow-hidden rounded-xl border border-border bg-white shadow-soft transition-all hover:-translate-y-0.5 hover:shadow-card"
       >
-        <div className="flex aspect-[210/297] justify-center overflow-hidden bg-white">
-          <PreviewThumb doc={doc} width={210} />
+        <div ref={thumbRef} className="flex aspect-[210/297] justify-center overflow-hidden bg-white">
+          {/* One full resume per SAVED DOCUMENT rendered in the route's first
+              commit, unbounded - the same storm the template gallery had. The
+              aspect box holds the size; the resume arrives via the shared
+              idle queue. */}
+          {seen ? <PreviewThumb doc={doc} width={210} /> : <ThumbSkeleton accent={doc.metadata?.theme?.primary} />}
         </div>
       </button>
       <div className="mt-2 flex items-start justify-between gap-2 px-0.5">

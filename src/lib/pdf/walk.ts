@@ -1,0 +1,3073 @@
+import { parseColor, parseFontWeight, parsePx, type Rgba } from './style'
+import { roleForElement, linkUrlForElement } from './tagging'
+import { mainColumnTextFirst } from './readingOrder'
+import { keepFlagsForParagraph, KEEP_WHOLE_MAX_LINES, KEEP_WHOLE_MAX_LINES_TWO_COL } from './widows'
+import { coalesceTextOps } from './coalesce'
+import { collectLinkOps } from './links'
+import { ascentPx, extractRuns, measureLaidOutWidthPx, measureTextWidthPx, textNodeLineSegments } from './text'
+import type { CornerRadii, DrawOp, LinearGradient, TextRun } from './types'
+import { combineColumns, type PageBlock } from './paginate'
+import { keepShortSectionsWhole, keepEntryWhole } from './sectionKeep'
+
+/**
+ * `background: linear-gradient(<angle>deg, <c1>, <c2>)` sets `background-
+ * image`, not `background-color` — `getComputedStyle().backgroundColor` for
+ * such an element is transparent, so `boxOps` used to draw nothing at all
+ * for creative's header banner/sidebar and spotlight's header banner (task-
+ * 10c report — confirmed the single biggest contributor to both templates'
+ * pixel diffs, including losing the name/contact text painted on top, which
+ * became invisible without its background). Chromium serializes the two
+ * color stops as `rgb()` or `color(srgb ...)` (see style.ts's `parseColor`
+ * for why `color-mix()` shows up as the latter) — by the time
+ * getComputedStyle reports it, custom properties and color-mix()
+ * are already resolved to concrete numbers, verified empirically against a
+ * real element rather than assumed. Only the exact 2-stop, degree-angle
+ * shape our own CSS uses is matched; anything else (keyword direction,
+ * radial-gradient, 3+ stops) returns null and falls through to no
+ * background, same as before this existed.
+ *
+ * The angle segment is OPTIONAL: `180deg` ("to bottom") is CSS's own default
+ * direction for a bare `linear-gradient(c1, c2)`, and Chromium's computed-
+ * style serializer OMITS the angle whenever it equals that default —
+ * confirmed empirically against `.tpl-creative .rm-col-aside`, which is
+ * authored with an EXPLICIT `linear-gradient(180deg, …)` in templates.css
+ * but reports back as `linear-gradient(rgb(...), color(...))` with no `deg`
+ * token at all. Missing the angle group entirely (rather than requiring it)
+ * was the reason the sidebar's gradient still failed to parse on the first
+ * pass even after the header banner's (120deg, never elided) started
+ * working.
+ */
+export function parseLinearGradient(backgroundImage: string): LinearGradient | null {
+  const m = (backgroundImage || '').match(
+    /^linear-gradient\(\s*(?:([\d.]+)deg\s*,\s*)?((?:rgba?|color)\([^)]*\))\s*,\s*((?:rgba?|color)\([^)]*\))\s*\)$/i
+  )
+  if (!m) return null
+  const c1 = parseColor(m[2])
+  const c2 = parseColor(m[3])
+  if (!c1 || !c2) return null
+  return { angleDeg: m[1] === undefined ? 180 : Number(m[1]), stops: [c1, c2] }
+}
+
+/**
+ * Resolve a computed `content` value (own or pseudo-element) to the literal
+ * text it paints, or '' when it paints no text at all (none/normal/counter/
+ * url/attr/…). Only quoted string literals are supported; CSS unicode
+ * escapes (`\2022`) are decoded to their glyph.
+ */
+export function pseudoContentText(content: string): string {
+  const s = (content || '').trim()
+  const m = s.match(/^"((?:[^"\\]|\\.)*)"$|^'((?:[^'\\]|\\.)*)'$/)
+  if (!m) return ''
+  const inner = m[1] ?? m[2] ?? ''
+  return inner.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+}
+
+/** Element box relative to `root`'s bounding box, in CSS px. */
+function boxOf(el: Element, root: HTMLElement) {
+  const r = el.getBoundingClientRect()
+  const rootRect = root.getBoundingClientRect()
+  return { xPx: r.left - rootRect.left, yPx: r.top - rootRect.top, wPx: r.width, hPx: r.height }
+}
+
+/** CSS paints a border INSIDE the element's box (e.g. border-bottom's OUTER
+ *  edge is the element's own bottom edge; the stroke occupies [bottom -
+ *  width, bottom]), but pdf-lib's `drawLine` strokes CENTERED on the given
+ *  coordinates — passing the box edge straight through (as this used to)
+ *  paints half the stroke width OUTSIDE the box. Each edge is inset by
+ *  width/2 toward the box interior so the drawn line's centerline lands
+ *  where the CSS stroke's own centerline does. Every coordinate fn takes the
+ *  same (box, borderWidthPx) signature, even the ones that don't need the
+ *  width, so the four edges share one uniform, TS-friendly shape. */
+type EdgeCoord = (b: ReturnType<typeof boxOf>, w: number) => number
+/** Exported so the border-inset arithmetic (task 14) can be unit-tested
+ *  directly against a plain `{xPx, yPx, wPx, hPx}` box, without needing a
+ *  real `Element`/`getComputedStyle` (boxOps itself isn't independently
+ *  testable outside a DOM). */
+export const BORDER_EDGES: Array<{ side: string; x1: EdgeCoord; y1: EdgeCoord; x2: EdgeCoord; y2: EdgeCoord }> = [
+  { side: 'Top', x1: (b) => b.xPx, y1: (b, w) => b.yPx + w / 2, x2: (b) => b.xPx + b.wPx, y2: (b, w) => b.yPx + w / 2 },
+  {
+    side: 'Right',
+    x1: (b, w) => b.xPx + b.wPx - w / 2,
+    y1: (b) => b.yPx,
+    x2: (b, w) => b.xPx + b.wPx - w / 2,
+    y2: (b) => b.yPx + b.hPx,
+  },
+  {
+    side: 'Bottom',
+    x1: (b) => b.xPx,
+    y1: (b, w) => b.yPx + b.hPx - w / 2,
+    x2: (b) => b.xPx + b.wPx,
+    y2: (b, w) => b.yPx + b.hPx - w / 2,
+  },
+  {
+    side: 'Left',
+    x1: (b, w) => b.xPx + w / 2,
+    y1: (b) => b.yPx,
+    x2: (b, w) => b.xPx + w / 2,
+    y2: (b) => b.yPx + b.hPx,
+  },
+]
+
+/** A single resolved border edge — width/style/color all already validated
+ *  non-degenerate (width > 0, style not none/hidden, color not fully
+ *  transparent). Shared shape `readBorderEdge` returns and `borderOps`
+ *  compares across edges to detect the uniform case. */
+type BorderEdgeInfo = { width: number; style: string; color: Rgba }
+
+/** Reads and validates one `border-<side>-{width,style,color}` triple —
+ *  `side` is the LOWERCASE edge name (`top`/`right`/`bottom`/`left`), same
+ *  spelling `boxOps`'s old inline loop built via `edge.side.toLowerCase()`.
+ *  Returns null for a degenerate edge (zero/negative width, `none`/`hidden`
+ *  style, or fully-transparent/unparseable color) exactly like the old
+ *  inline `continue` guards did — same three checks, just factored out so
+ *  `borderOps` can inspect an edge's info WITHOUT immediately committing to
+ *  drawing it (needed to detect the uniform-across-all-four-edges case
+ *  before deciding whether to emit one rounded path or four lines). */
+function readBorderEdge(cs: CSSStyleDeclaration, side: string): BorderEdgeInfo | null {
+  const width = parsePx(cs.getPropertyValue(`border-${side}-width`))
+  const style = cs.getPropertyValue(`border-${side}-style`)
+  if (width <= 0 || style === 'none' || style === 'hidden') return null
+  const color = parseColor(cs.getPropertyValue(`border-${side}-color`))
+  if (!color || color.a === 0) return null
+  return { width, style, color }
+}
+
+/** True when the box has ANY nonzero corner radius — the trigger for
+ *  attempting the rounded-border path in `borderOps` below. */
+function hasAnyRadius(radii: CornerRadii): boolean {
+  return radii.tl > 0 || radii.tr > 0 || radii.br > 0 || radii.bl > 0
+}
+
+/**
+ * Emits border draw op(s) for a box — shared by `boxOps` and `pseudoOps`
+ * (task 22: pseudo-elements previously got NO border handling at all,
+ * `pseudoOps` painted background+text only, so `.tpl-timeline`'s circular
+ * `::before` marker — `border-radius: 50%`, `border: 2px solid` — silently
+ * lost its ring in the export).
+ *
+ * Straight per-edge lines (`BORDER_EDGES`, task 14's width/2 inset) remain
+ * the default and, for a ZERO-radius box, the ONLY path — no operator churn
+ * for the overwhelming common case (plain rectangular borders).
+ *
+ * When the box has ANY nonzero corner radius AND all four edges are
+ * PRESENT and share the exact same width/style/color (the common "rounded
+ * card" shape — `.tpl-obsidian`'s entry cards, `border: 1px solid` +
+ * `border-radius: 12px`, and `.tpl-timeline`'s circular marker, `border: 2px
+ * solid` + `border-radius: 50%`), the four lines are replaced with ONE
+ * stroked rounded-rect path (`roundedBorder` op) instead — a straight
+ * line's flat ends overshoot a curved corner, which a single path traced
+ * around the actual curve does not. A rounded box with MIXED per-edge
+ * borders (missing edges, or different width/style/color across the four
+ * that exist) is rare and has no single centerline that represents every
+ * edge correctly — falls back to the straight-line per-edge behavior, with
+ * a dev-warn since silently drawing a mixed-border rounded box as straight
+ * lines is a real (if minor) fidelity loss worth surfacing loudly in dev.
+ */
+function borderOps(
+  el: Element,
+  cs: CSSStyleDeclaration,
+  box: Box,
+  radii: CornerRadii,
+  opacityMul: number,
+  ops: DrawOp[]
+): void {
+  const present = BORDER_EDGES.map((edge) => ({ edge, info: readBorderEdge(cs, edge.side.toLowerCase()) })).filter(
+    (e): e is { edge: (typeof BORDER_EDGES)[number]; info: BorderEdgeInfo } => e.info !== null
+  )
+  if (!present.length) return
+
+  if (hasAnyRadius(radii)) {
+    const first = present[0].info
+    const uniform =
+      present.length === 4 &&
+      present.every(
+        (e) =>
+          e.info.width === first.width &&
+          e.info.style === first.style &&
+          e.info.color.r === first.color.r &&
+          e.info.color.g === first.color.g &&
+          e.info.color.b === first.color.b &&
+          e.info.color.a === first.color.a
+      )
+    if (uniform) {
+      const inset = first.width / 2
+      ops.push({
+        kind: 'roundedBorder',
+        xPx: box.xPx + inset,
+        yPx: box.yPx + inset,
+        wPx: box.wPx - first.width,
+        hPx: box.hPx - first.width,
+        radii: {
+          tl: Math.max(0, radii.tl - inset),
+          tr: Math.max(0, radii.tr - inset),
+          br: Math.max(0, radii.br - inset),
+          bl: Math.max(0, radii.bl - inset),
+        },
+        widthPx: first.width,
+        color: { ...first.color, a: first.color.a * opacityMul },
+        dashed: first.style === 'dashed' || first.style === 'dotted',
+      })
+      return
+    }
+    if (import.meta.env.DEV) {
+      console.warn('[pdf] rounded box has mixed per-edge borders, falling back to straight-line borders', el)
+    }
+  }
+
+  for (const { edge, info } of present) {
+    ops.push({
+      kind: 'line',
+      x1Px: edge.x1(box, info.width),
+      y1Px: edge.y1(box, info.width),
+      x2Px: edge.x2(box, info.width),
+      y2Px: edge.y2(box, info.width),
+      widthPx: info.width,
+      color: { ...info.color, a: info.color.a * opacityMul },
+      dashed: info.style === 'dashed' || info.style === 'dotted',
+    })
+  }
+}
+
+/** Computed `opacity`, defaulting to 1 for anything unparseable — shared by
+ *  boxOps and pseudoOps so a `position: absolute` accent rule painted at
+ *  `opacity: 0.38` (e.g. `.sec-ov-strike`'s heading rule) doesn't paint fully
+ *  solid; CSS `opacity` is a separate compositing multiplier from whatever
+ *  alpha the color itself already carries (e.g. from `color-mix()`), so this
+ *  always MULTIPLIES rather than replaces. */
+export function elementOpacity(cs: CSSStyleDeclaration): number {
+  const s = (cs.opacity || '').trim()
+  if (!s) return 1 // Number('') is 0, not NaN — guard explicitly so an empty/missing value defaults to opaque
+  const n = Number(s)
+  return Number.isFinite(n) ? n : 1
+}
+
+/** Reads all FOUR computed corner radii (fix round 2: `boxOps` used to read
+ *  only `border-top-left-radius` and apply that single value to every
+ *  corner, so an asymmetric box — spotlight's header banner, `border-
+ *  radius: 0 0 18px 18px`, square top / rounded bottom — painted as a plain
+ *  rectangle). An elliptical corner (two values, e.g. `10px 5px` for
+ *  differing horizontal/vertical radii) collapses to its first (horizontal)
+ *  value — `parsePx`'s `parseFloat` already stops at the first non-numeric
+ *  token, so this needs no special-casing; none of our own CSS uses
+ *  elliptical radii today. */
+export function cornerRadii(cs: CSSStyleDeclaration): CornerRadii {
+  return {
+    tl: parsePx(cs.borderTopLeftRadius),
+    tr: parsePx(cs.borderTopRightRadius),
+    br: parsePx(cs.borderBottomRightRadius),
+    bl: parsePx(cs.borderBottomLeftRadius),
+  }
+}
+
+/** background, borders, then image — in that paint order. */
+function boxOps(el: HTMLElement, root: HTMLElement, ops: DrawOp[]): void {
+  const cs = getComputedStyle(el)
+  const box = boxOf(el, root)
+  const opacityMul = elementOpacity(cs)
+  const radii = cornerRadii(cs)
+
+  const bg = parseColor(cs.backgroundColor)
+  const bgFill = bg && bg.a > 0 ? { ...bg, a: bg.a * opacityMul } : null
+  const gradient = parseLinearGradient(cs.backgroundImage)
+
+  // A ROTATED or skewed element measures as the bounding box of its tilted
+  // shape, so painting `box` as a rect squares it back up AND inflates it by
+  // the tilt (the badge heading chip: a 20.98px square at 45° measures
+  // 25.52px, and that square landed on the heading's first letter). Its own
+  // border-box size plus the composed map give back the shape itself; the
+  // client rect still supplies the centre, which is exact whatever the
+  // transform-origin is, because an affine image of a rectangle is a
+  // parallelogram and a parallelogram's centre is its bounding box's.
+  //
+  // Untransformed elements — everything on the page but a handful of chips —
+  // skip the whole computation: `hasTransform` is four string reads against
+  // the computed style we already hold.
+  const tilt = hasTransform(cs) ? tiltOf(el, cs) : null
+  if (tilt) {
+    if (gradient && import.meta.env.DEV) {
+      console.warn('[pdf] rotated box has a gradient background, painting its solid fill only', el)
+    }
+    transformedBoxOps(
+      el,
+      cs,
+      box.xPx + box.wPx / 2,
+      box.yPx + box.hPx / 2,
+      tilt.size.wPx,
+      tilt.size.hPx,
+      radii,
+      tilt.m,
+      bgFill,
+      opacityMul,
+      ops
+    )
+  } else if (gradient) {
+    // background-image paints OVER background-color in CSS paint order —
+    // matched here by only emitting the gradient when both are present
+    // (never happens in our own CSS today: `background: linear-gradient(…)`
+    // never sets background-color, confirmed empirically) but future-proof
+    // either way since a solid fill is drawn first if bg is also opaque.
+    if (bgFill) {
+      ops.push({ kind: 'rect', xPx: box.xPx, yPx: box.yPx, wPx: box.wPx, hPx: box.hPx, fill: bgFill, radii })
+    }
+    ops.push({ kind: 'rect', xPx: box.xPx, yPx: box.yPx, wPx: box.wPx, hPx: box.hPx, radii, fillGradient: gradient })
+  } else if (bgFill) {
+    ops.push({ kind: 'rect', xPx: box.xPx, yPx: box.yPx, wPx: box.wPx, hPx: box.hPx, fill: bgFill, radii })
+  }
+
+  // A tilted box's borders went out with its fill, on the same traced path.
+  if (!tilt) borderOps(el, cs, box, radii, opacityMul, ops)
+
+  if (el instanceof HTMLImageElement && el.src) {
+    // The picture is painted inside the padding and the border, as CSS
+    // paints a replaced element's content; the background and the border
+    // above already took the whole box. An entry logo carries 0.08em of
+    // padding on its white card, and drawing the mark into the border box
+    // made every mark in the file 8.5% larger than the one on the page
+    // (measured: border box 28.88px, content box 26.63px).
+    const inner = contentBoxOf(box, cs)
+    const isSvg = /^data:image\/svg\+xml/i.test(el.src)
+    // A rounded <img> clips its picture to the element's own BORDER box (the
+    // photo slot's default shape is a full circle), so the vector path carries
+    // that same rounded box along as a clip. The raster path below already
+    // clips on `radii` inside paint.ts.
+    const clip = hasAnyRadius(radii) ? { ...box, radii } : undefined
+    if (!isSvg || !svgLogoOps(el, inner, ops, clip)) {
+      // The element's own object-fit travels with the op: a source the
+      // painter has to re-encode is drawn into the box the same way the
+      // canvas draws it (paint.ts), rather than always stretched.
+      const fit = cs.objectFit === 'cover' || cs.objectFit === 'contain' ? cs.objectFit : undefined
+      ops.push({ kind: 'image', xPx: inner.xPx, yPx: inner.yPx, wPx: inner.wPx, hPx: inner.hPx, src: el.src, radii, fit })
+    }
+  }
+}
+
+/** The box inside an element's border and padding: where CSS paints a
+ *  replaced element's picture. Exported so the arithmetic can be pinned
+ *  against a plain computed-style record without a DOM. A box that padding
+ *  would turn inside out collapses to zero rather than to a negative size. */
+export function contentBoxOf(
+  box: { xPx: number; yPx: number; wPx: number; hPx: number },
+  cs: CSSStyleDeclaration
+): { xPx: number; yPx: number; wPx: number; hPx: number } {
+  const l = parsePx(cs.paddingLeft) + parsePx(cs.borderLeftWidth)
+  const r = parsePx(cs.paddingRight) + parsePx(cs.borderRightWidth)
+  const t = parsePx(cs.paddingTop) + parsePx(cs.borderTopWidth)
+  const b = parsePx(cs.paddingBottom) + parsePx(cs.borderBottomWidth)
+  if (l + r + t + b === 0) return box
+  return { xPx: box.xPx + l, yPx: box.yPx + t, wPx: Math.max(0, box.wPx - l - r), hPx: Math.max(0, box.hPx - t - b) }
+}
+
+/** #rgb / #rrggbb — the only color form our own SVG "logo" marks (see
+ *  samples.ts's `mark()`) emit. */
+function parseHexColor(s: string): Rgba | null {
+  const m = (s || '').trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i)
+  if (!m) return null
+  let hex = m[1]
+  if (hex.length === 3)
+    hex = hex
+      .split('')
+      .map((c) => c + c)
+      .join('')
+  const n = parseInt(hex, 16)
+  return { r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255, a: 1 }
+}
+
+/** Decode a `data:image/svg+xml` URI's payload synchronously — media-type
+ *  parameters before the comma vary (samples.ts's `mark()` emits
+ *  `;utf8,<encodeURIComponent>`; a foreign source might use `;base64,` or
+ *  `;charset=utf-8,`), so accept any `;param` list and only special-case
+ *  base64. */
+function decodeSvgDataUri(src: string): string | null {
+  const m = src.match(/^data:image\/svg\+xml((?:;[a-z0-9-]+(?:=[^;,]*)?)*),([\s\S]*)$/i)
+  if (!m) return null
+  const isBase64 = /(^|;)base64(;|$)/i.test(m[1])
+  try {
+    return isBase64 ? atob(m[2]) : decodeURIComponent(m[2])
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The little of one SVG element the shape walk below needs, with no DOM in it.
+ * `svgLogoOps` adapts a parsed `Element` to this shape, which leaves the walk
+ * itself a pure function a unit test can drive under vitest's plain `node`
+ * environment (no jsdom in this repo — see vitest.config.ts).
+ */
+export type SvgNode = { tag: string; attr: (name: string) => string | null; text: string; children: SvgNode[] }
+
+/** One shape the walk resolved: path data in the svg's own user units, with
+ *  its paint already resolved through every ancestor `<g>` and any transform
+ *  already baked into the coordinates. */
+export type SvgResolvedShape = { d: string; fill?: Rgba; stroke?: Rgba; strokeWidthPx: number }
+
+/** Presentation state as it cascades down the tree. `fill`/`stroke`/
+ *  `strokeWidth` are the raw attribute strings (null = never specified, which
+ *  for fill means SVG's own black default); the two *-opacity values are
+ *  inherited properties; `opacity` is a GROUP compositing factor that does not
+ *  inherit but is multiplied down anyway — an approximation that is exact for
+ *  every non-overlapping mark we ship and never silently drops ink. */
+type SvgPaintState = {
+  fill: string | null
+  stroke: string | null
+  strokeWidth: string | null
+  fillOpacity: number
+  strokeOpacity: number
+  opacity: number
+  m: Matrix2D
+}
+
+/** Shapes `svgShapeToPathD` converts. */
+const SVG_LOGO_SHAPES = new Set(['rect', 'circle', 'ellipse', 'path', 'line', 'polygon', 'polyline'])
+/** Metadata-only children: they paint nothing, so skipping them is not a
+ *  partial drawing. */
+const SVG_LOGO_IGNORED = new Set(['title', 'desc', 'metadata'])
+/** Attributes that change what an element paints in ways this painter does not
+ *  reproduce. Their presence refuses the WHOLE image rather than painting a
+ *  shape without them. */
+const SVG_LOGO_REFUSED_ATTRS = [
+  'style',
+  'clip-path',
+  'mask',
+  'filter',
+  'fill-rule',
+  'stroke-dasharray',
+  'marker-start',
+  'marker-mid',
+  'marker-end',
+]
+
+const isIdentity2D = (m: Matrix2D): boolean =>
+  Math.abs(m.a - 1) < 1e-9 &&
+  Math.abs(m.b) < 1e-9 &&
+  Math.abs(m.c) < 1e-9 &&
+  Math.abs(m.d - 1) < 1e-9 &&
+  Math.abs(m.e) < 1e-9 &&
+  Math.abs(m.f) < 1e-9
+
+/**
+ * One SVG `transform` ATTRIBUTE (not the CSS property — that grammar is
+ * `parseTransformMatrix`'s) as a matrix, or null when it is anything this
+ * painter cannot bake into path coordinates.
+ *
+ * Supported: `translate`, `scale`, `matrix`, in any order and any number,
+ * composed left-to-right the way SVG applies them. The composed result must
+ * come out DIAGONAL (no rotation, no skew): only then does every path command
+ * — including arcs, whose radii are axis-aligned — survive being rewritten
+ * coordinate by coordinate. A rotate/skew (or a `matrix` that amounts to one)
+ * returns null, which sends the whole image to the raster path rather than
+ * painting it un-rotated.
+ */
+export function parseSvgTransform(value: string): Matrix2D | null {
+  const s = (value || '').trim()
+  if (!s) return IDENTITY_2D
+  const fn = /([a-zA-Z]+)\s*\(([^)]*)\)/g
+  let m = IDENTITY_2D
+  let seen = 0
+  let consumed = 0
+  for (let hit = fn.exec(s); hit; hit = fn.exec(s)) {
+    // Anything between two function calls that is not a separator means the
+    // attribute is not the simple list this understands.
+    if (s.slice(consumed, hit.index).trim() !== '') return null
+    consumed = hit.index + hit[0].length
+    seen++
+    const name = hit[1].toLowerCase()
+    const args = hit[2]
+      .trim()
+      .split(/[\s,]+/)
+      .filter(Boolean)
+      .map(Number)
+    if (args.some((n) => !Number.isFinite(n))) return null
+    let next: Matrix2D | null = null
+    if (name === 'translate' && (args.length === 1 || args.length === 2))
+      next = { ...IDENTITY_2D, e: args[0], f: args[1] ?? 0 }
+    else if (name === 'scale' && (args.length === 1 || args.length === 2))
+      next = { ...IDENTITY_2D, a: args[0], d: args[1] ?? args[0] }
+    else if (name === 'matrix' && args.length === 6)
+      next = { a: args[0], b: args[1], c: args[2], d: args[3], e: args[4], f: args[5] }
+    if (!next) return null
+    m = mul2D(m, next)
+  }
+  if (!seen || s.slice(consumed).trim() !== '') return null
+  if (Math.abs(m.b) > 1e-9 || Math.abs(m.c) > 1e-9) return null
+  if (!Number.isFinite(m.a) || !Number.isFinite(m.d) || m.a === 0 || m.d === 0) return null
+  return m
+}
+
+/** Command letter -> how many numbers one of its argument groups takes. */
+const SVG_PATH_ARGC: Record<string, number> = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 }
+
+/**
+ * Rewrites a path's `d` with a DIAGONAL map baked into its coordinates, so the
+ * emitted op needs no transform of its own (the `svg` DrawOp carries none —
+ * see types.ts). Relative commands stay relative and take only the map's
+ * SCALE; absolute commands take scale and translation both, which is why a
+ * leading lowercase `m` — absolute per the SVG grammar despite its case — must
+ * be normalised by `absolutizeLeadingMoveto` before this sees it.
+ *
+ * Arc radii are axis-aligned lengths, so they scale per axis; a negative scale
+ * mirrors the shape and therefore flips the sweep flag. An arc carrying its own
+ * x-axis-rotation under a NON-uniform scale becomes an ellipse of a different
+ * tilt, which this does not attempt: null, and the caller falls back.
+ *
+ * Returns null for a `d` it cannot lex (an unknown command letter, a truncated
+ * argument group) rather than emitting a half-transformed path.
+ */
+export function transformPathD(pathD: string, m: Matrix2D): string | null {
+  if (Math.abs(m.b) > 1e-9 || Math.abs(m.c) > 1e-9) return null
+  const sx = m.a
+  const sy = m.d
+  if (!Number.isFinite(sx) || !Number.isFinite(sy) || sx === 0 || sy === 0) return null
+  // expandArcFlags first: SVG lets an arc's two 0/1 flags pack against the next
+  // number with no separator, and a generic number lexer reads `011.5` as one.
+  const tokens = expandArcFlags(pathD).match(/[MmLlHhVvCcSsQqTtAaZz]|[+-]?(?:\d*\.\d+|\d+\.?)(?:[eE][+-]?\d+)?/g)
+  if (!tokens || !tokens.length) return null
+  const isLetter = (t: string): boolean => /^[A-Za-z]$/.test(t)
+  const n4 = (v: number): string => String(Math.round(v * 1e4) / 1e4)
+  const out: string[] = []
+  let cmd = ''
+  let i = 0
+  while (i < tokens.length) {
+    if (isLetter(tokens[i])) {
+      cmd = tokens[i]
+      out.push(cmd)
+      i++
+      if (cmd === 'z' || cmd === 'Z') continue
+    } else {
+      // An implicit repeat of the previous command; after a moveto the
+      // repeats are linetos, of the same case.
+      if (!cmd) return null
+      if (cmd === 'M') cmd = 'L'
+      else if (cmd === 'm') cmd = 'l'
+      if (cmd === 'z' || cmd === 'Z') return null
+    }
+    const key = cmd.toLowerCase()
+    const argc = SVG_PATH_ARGC[key]
+    if (argc === undefined) return null
+    if (argc === 0) continue
+    const args: number[] = []
+    for (let k = 0; k < argc; k++) {
+      const t = tokens[i + k]
+      if (t === undefined || isLetter(t) || !Number.isFinite(Number(t))) return null
+      args.push(Number(t))
+    }
+    i += argc
+    const rel = cmd === key
+    const X = (v: number): number => (rel ? sx * v : sx * v + m.e)
+    const Y = (v: number): number => (rel ? sy * v : sy * v + m.f)
+    if (key === 'h') out.push(n4(X(args[0])))
+    else if (key === 'v') out.push(n4(Y(args[0])))
+    else if (key === 'a') {
+      const [rx, ry, rot, laf, sf, x, y] = args
+      if (rot !== 0 && Math.abs(Math.abs(sx) - Math.abs(sy)) > 1e-9) return null
+      const mirrored = sx * sy < 0
+      out.push(
+        n4(Math.abs(sx) * rx),
+        n4(Math.abs(sy) * ry),
+        n4(rot),
+        laf ? '1' : '0',
+        (mirrored ? !sf : !!sf) ? '1' : '0',
+        n4(X(x)),
+        n4(Y(y))
+      )
+    } else {
+      for (let k = 0; k < argc; k += 2) out.push(n4(X(args[k])), n4(Y(args[k + 1])))
+    }
+  }
+  return out.join(' ')
+}
+
+/** SVG paint resolved to a colour, to "paints nothing", or to a refusal. */
+type SvgPaintResult = { ok: false } | { ok: true; color: Rgba | null }
+
+/** `#rgb`/`#rrggbb`, `none`/`transparent`, or — for a value this painter has
+ *  no honest answer for (a gradient `url(#id)`, `currentColor`, a CSS colour
+ *  keyword) — a refusal, which sends the whole image to the raster path. */
+function svgPaintColor(value: string | null, alphaMul: number, defaultsToBlack: boolean): SvgPaintResult {
+  const raw = value === null ? (defaultsToBlack ? '#000000' : null) : value.trim()
+  if (raw === null || raw === '' || /^(none|transparent)$/i.test(raw)) return { ok: true, color: null }
+  const c = parseHexColor(raw)
+  if (!c) return { ok: false }
+  return { ok: true, color: { ...c, a: Math.max(0, Math.min(1, c.a * alphaMul)) } }
+}
+
+/** The child's own presentation attributes cascaded onto the parent's state,
+ *  or null when one of them is unusable. */
+function inheritSvgPaint(parent: SvgPaintState, node: SvgNode): SvgPaintState | null {
+  const unitInterval = (name: string, fallback: number): number | null => {
+    const v = node.attr(name)
+    if (v === null) return fallback
+    const n = parseFloat(v)
+    if (!Number.isFinite(n)) return null
+    return Math.max(0, Math.min(1, n))
+  }
+  const fillOpacity = unitInterval('fill-opacity', parent.fillOpacity)
+  const strokeOpacity = unitInterval('stroke-opacity', parent.strokeOpacity)
+  const own = unitInterval('opacity', 1)
+  if (fillOpacity === null || strokeOpacity === null || own === null) return null
+  const t = node.attr('transform')
+  let m = parent.m
+  if (t !== null) {
+    const mine = parseSvgTransform(t)
+    if (!mine) return null
+    m = mul2D(parent.m, mine)
+  }
+  return {
+    fill: node.attr('fill') ?? parent.fill,
+    stroke: node.attr('stroke') ?? parent.stroke,
+    strokeWidth: node.attr('stroke-width') ?? parent.strokeWidth,
+    fillOpacity,
+    strokeOpacity,
+    opacity: parent.opacity * own,
+    m,
+  }
+}
+
+/**
+ * Every paintable shape under an `<svg>`, in document order, with `<g>`
+ * inheritance and transforms resolved — or NULL when the tree contains
+ * anything this painter does not fully reproduce.
+ *
+ * All-or-nothing is the whole point. The previous version walked only the
+ * svg's DIRECT children and only six shape kinds, then returned "drawn" if it
+ * had recognised ANY of them: the library's drawn portraits (avatar.ts) are an
+ * `<ellipse>` head and a `<g>` of glasses among ordinary paths and circles, so
+ * every example résumé that shows a face exported the backdrop, the hair and
+ * the eyes with no head under them. A partial drawing is the worst outcome
+ * available — it looks like ink to every gate that only asks whether the box
+ * is empty — so anything unrecognised now refuses the image outright and
+ * paint.ts redraws the source through a canvas instead (`transcodeBytes`).
+ */
+export function svgShapeWalk(root: SvgNode): { shapes: SvgResolvedShape[]; texts: SvgNode[] } | null {
+  const shapes: SvgResolvedShape[] = []
+  const texts: SvgNode[] = []
+  const visit = (node: SvgNode, inherited: SvgPaintState): boolean => {
+    for (const child of node.children) {
+      const tag = child.tag.toLowerCase()
+      if (SVG_LOGO_IGNORED.has(tag)) continue
+      for (const name of SVG_LOGO_REFUSED_ATTRS) if (child.attr(name) !== null) return false
+      const state = inheritSvgPaint(inherited, child)
+      if (!state) return false
+      if (tag === 'g') {
+        if (!visit(child, state)) return false
+        continue
+      }
+      if (tag === 'text') {
+        // The mark's monogram letter, drawn by the caller with the DOCUMENT's
+        // own font. One, untransformed, is the whole of what is supported.
+        if (texts.length || !isIdentity2D(state.m)) return false
+        texts.push(child)
+        continue
+      }
+      if (!SVG_LOGO_SHAPES.has(tag)) return false
+      const raw = svgShapeToPathD(tag, (name) => child.attr(name))
+      // A shape with no usable geometry (r=0, a `<path>` with no `d`) paints
+      // nothing in a browser either, so skipping it loses no ink.
+      if (!raw) continue
+      const fill = svgPaintColor(state.fill, state.opacity * state.fillOpacity, true)
+      if (!fill.ok) return false
+      const stroke = svgPaintColor(state.stroke, state.opacity * state.strokeOpacity, false)
+      if (!stroke.ok) return false
+      const widthAttr = state.strokeWidth === null ? 1 : parseFloat(state.strokeWidth)
+      if (!Number.isFinite(widthAttr) || widthAttr < 0) return false
+      // A stroke under a non-uniform scale is an elliptical pen, which a
+      // single PDF line width cannot express.
+      if (stroke.color && widthAttr > 0 && Math.abs(Math.abs(state.m.a) - Math.abs(state.m.d)) > 1e-9) return false
+      const strokeColor = stroke.color && widthAttr > 0 ? stroke.color : undefined
+      if (!fill.color && !strokeColor) continue
+      let d = raw
+      if (!isIdentity2D(state.m)) {
+        const baked = transformPathD(absolutizeLeadingMoveto(raw), state.m)
+        if (!baked) return false
+        d = baked
+      }
+      shapes.push({
+        d,
+        fill: fill.color ?? undefined,
+        stroke: strokeColor,
+        strokeWidthPx: strokeColor ? widthAttr * Math.abs(state.m.a) : 0,
+      })
+    }
+    return true
+  }
+  const base: SvgPaintState = {
+    fill: null,
+    stroke: null,
+    strokeWidth: null,
+    fillOpacity: 1,
+    strokeOpacity: 1,
+    opacity: 1,
+    m: IDENTITY_2D,
+  }
+  const rootState = inheritSvgPaint(base, root)
+  if (!rootState) return null
+  for (const name of SVG_LOGO_REFUSED_ATTRS) if (root.attr(name) !== null) return null
+  if (!visit(root, rootState)) return null
+  return { shapes, texts }
+}
+
+/** Adapts a parsed SVG `Element` tree to the DOM-free shape `svgShapeWalk`
+ *  takes. */
+function elementToSvgNode(el: Element): SvgNode {
+  return {
+    tag: el.tagName.toLowerCase(),
+    attr: (name) => el.getAttribute(name),
+    text: el.textContent ?? '',
+    children: Array.from(el.children).map(elementToSvgNode),
+  }
+}
+
+/**
+ * A "logo" or portrait `<img>` whose src is an inline SVG data URI can't be
+ * embedded as a raster image the way boxOps normally handles `<img>` — pdf-
+ * lib's embedPng/embedJpg only accept real PNG/JPEG bytes. Rather than
+ * rasterise an already-vector source, the shapes are walked into native `svg`
+ * ops (one per shape, in the viewBox's own units, so paint.ts scales the path
+ * and its stroke width together) plus one optional text op for a monogram
+ * letter.
+ *
+ * Returns false — and paints NOTHING — for any source it does not fully
+ * reproduce, so boxOps falls through to the ordinary image op and paint.ts
+ * redraws the source through a canvas (`transcodeBytes`, which decodes an
+ * SVG data URI with no external references perfectly well). See
+ * `svgShapeWalk` for why all-or-nothing is the only safe contract here.
+ */
+export function svgLogoOps(
+  el: HTMLImageElement,
+  box: ReturnType<typeof boxOf>,
+  ops: DrawOp[],
+  clip?: { xPx: number; yPx: number; wPx: number; hPx: number; radii: CornerRadii }
+): boolean {
+  const xml = decodeSvgDataUri(el.src)
+  if (!xml) return false
+
+  let svg: Element | null
+  try {
+    svg = new DOMParser().parseFromString(xml, 'image/svg+xml').documentElement
+  } catch {
+    return false
+  }
+  if (!svg || svg.nodeName !== 'svg' || svg.querySelector('parsererror')) return false
+
+  const vb = (svg.getAttribute('viewBox') || '')
+    .trim()
+    .split(/[\s,]+/)
+    .map(Number)
+  const [vbX, vbY, vbW, vbH] = vb.length === 4 && vb.every(Number.isFinite) ? vb : [0, 0, box.wPx, box.hPx]
+  if (vbW <= 0 || vbH <= 0) return false
+  const scaleX = box.wPx / vbW
+  const scaleY = box.hPx / vbH
+
+  const walked = svgShapeWalk(elementToSvgNode(svg))
+  if (!walked) return false
+  const textEl = walked.texts[0]
+  const label = textEl?.text.trim() ?? ''
+  if (!walked.shapes.length && !label) return false
+
+  // Nothing is pushed onto the caller's list until the whole image is known to
+  // be reproducible: a half-painted mark is worse than a redrawn one.
+  const drawn: DrawOp[] = []
+  for (const shape of walked.shapes) {
+    drawn.push({
+      kind: 'svg',
+      xPx: box.xPx,
+      yPx: box.yPx,
+      wPx: box.wPx,
+      hPx: box.hPx,
+      viewBox: [vbX, vbY, vbW, vbH],
+      d: shape.d,
+      fill: shape.fill,
+      stroke: shape.stroke,
+      strokeWidthPx: shape.strokeWidthPx,
+      clip,
+    })
+  }
+
+  if (textEl && label) {
+    const sizePx = parseFloat(textEl.attr('font-size') || '0') * scaleY
+    if (sizePx > 0) {
+      // Draw with the DOCUMENT's own font, not the SVG's declared one (our
+      // marks say Arial) — only the résumé's chosen fonts get embedded in
+      // the PDF, so an arbitrary family from the SVG source would throw at
+      // export time (PdfFontMissingError) instead of just looking slightly
+      // off.
+      const family = getComputedStyle(el).fontFamily
+      const weight = parseFontWeight(textEl.attr('font-weight') || '400')
+      const font = `${weight} ${sizePx}px ${family}`
+      const width = measureTextWidthPx(label, font)
+      const cx = box.xPx + (parseFloat(textEl.attr('x') || '0') - vbX) * scaleX
+      const anchor = textEl.attr('text-anchor')
+      const xPx = anchor === 'middle' ? cx - width / 2 : anchor === 'end' ? cx - width : cx
+      const baselinePx = box.yPx + (parseFloat(textEl.attr('y') || '0') - vbY) * scaleY
+      const fill = parseHexColor(textEl.attr('fill') || '') || { r: 1, g: 1, b: 1, a: 1 }
+      // DECORATIVE: this is the logo mark's monogram letter, not résumé
+      // content — paint.ts draws it as vector glyph outlines so it can't
+      // leak into the extractable text layer (see types.ts's TextRun.isDecorative).
+      // widthPx: 0 — no measured DOM rect backs this synthesized run (see
+      // types.ts's TextRun.widthPx); it's also isDecorative so paint.ts's
+      // Tz scaling never looks at it anyway.
+      drawn.push({
+        kind: 'text',
+        run: {
+          text: label,
+          xPx,
+          widthPx: 0,
+          baselinePx,
+          sizePx,
+          family,
+          weight,
+          italic: false,
+          color: fill,
+          letterSpacingPx: 0,
+          isDecorative: true,
+        },
+      })
+    }
+  }
+
+  if (!drawn.length) return false
+  ops.push(...drawn)
+  return true
+}
+
+/** A run drawn from a computed style rather than a real DOM text node — same
+ *  shape text.ts builds for real runs, reused for generated content (pseudo
+ *  ::before/::after text, synthesized list markers). Always DECORATIVE: every
+ *  caller (pseudoOps, markerOps) synthesizes a separator/bullet glyph, never
+ *  real résumé content (confirmed exhaustively against templates.css's own
+ *  `content:` declarations — see the task-10b report) — see types.ts's
+ *  TextRun.isDecorative. */
+function styledTextRun(cs: CSSStyleDeclaration, text: string, xPx: number, topPx: number): TextRun | null {
+  const color = parseColor(cs.color)
+  if (!color || color.a === 0) return null
+  const sizePx = parsePx(cs.fontSize)
+  if (sizePx <= 0) return null
+  const font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`
+  return {
+    text,
+    xPx,
+    // No measured DOM rect backs a synthesized pseudo/marker run — 0 rather
+    // than guess (see types.ts's TextRun.widthPx); also always isDecorative,
+    // so paint.ts's Tz scaling never looks at it anyway.
+    widthPx: 0,
+    baselinePx: topPx + ascentPx(font),
+    sizePx,
+    family: cs.fontFamily,
+    weight: parseFontWeight(cs.fontWeight),
+    italic: cs.fontStyle === 'italic',
+    color,
+    letterSpacingPx: cs.letterSpacing === 'normal' ? 0 : parsePx(cs.letterSpacing),
+    isDecorative: true,
+  }
+}
+
+/** The subset of a host's computed style `pseudoBox`'s flex-item branch
+ *  needs — a plain `Pick`, not a full `CSSStyleDeclaration`, so tests can
+ *  fake it without a real DOM. */
+type FlexHostStyle = Pick<CSSStyleDeclaration, 'display' | 'alignItems' | 'columnGap' | 'rowGap' | 'flexDirection'>
+type Box = { xPx: number; yPx: number; wPx: number; hPx: number }
+
+/**
+ * Resolves a pseudo's own box from the HOST's box plus the pseudo's computed
+ * `left`/`top`/`right`/`bottom`/`width`/`height` — used for `position:
+ * absolute`/`relative` pseudos, whose containing block is the host itself
+ * (every positioned pseudo in our CSS sits on a `position: relative` host,
+ * confirmed against every `sec-ov-*`/`tpl-*` heading-accent rule that uses
+ * one). `getComputedStyle` resolves `left`/`top`/etc to a used PX value
+ * (including percentages, e.g. `.sec-ov-strike`'s `top: 50%`) or the literal
+ * string `'auto'` when unset. When `left` AND `right` are both set with
+ * `width: auto` (`.sec-ov-strike`'s full-width rule), CSS computes width as
+ * the remaining space between them — matched here explicitly since there's
+ * no layout engine to derive it for us; ditto `top`+`bottom` with `height:
+ * auto`.
+ *
+ * A `position: static` pseudo is normally left at the pre-existing
+ * approximation: painted at the host's own origin, sized to its own width/
+ * height (or the host's width / the pseudo's own font-size as a fallback) —
+ * exact static flow position isn't attempted, and that's fine for a simple
+ * inline `content: '•'` separator glyph (most of our own ::before/::after
+ * usage). It is NOT fine when the host is a `display: flex` container (e.g.
+ * `.sec-rule-after`'s `.rm-section-title { display:flex; align-items:center
+ * }`, whose `::after { flex: 1 }` rule fills the row's remaining width; or
+ * `.rm-header-centered { display:flex; flex-direction:column }`, whose
+ * `.tpl-sienna`/`.tpl-elegant` `::after { width:44px; margin:12px auto 0 }`
+ * name-underline rule centers itself in the column via auto margins) — there
+ * the pseudo is a genuine FLEX ITEM laid out by the flex algorithm, not
+ * normal block/inline flow, and the host-origin approximation either crosses
+ * straight through the row's other content (row case, onyx-noir, task-13
+ * fix round 1) or paints a whole 44px rule at the CONTAINER's own top-left
+ * corner instead of centered below all its other content (column case,
+ * sienna/elegant, fix round 2 — confirmed live: the DOM has NOTHING within
+ * 16px of where our old approximation painted it). `hostCs`/`lastChildBox`
+ * are undefined/null for callers that don't have (or don't need) them.
+ *
+ * ROW: items lay out left-to-right in box order, so `::after` (always LAST
+ * in box order) starts right after the last REAL child box the caller
+ * supplies, plus the container's `column-gap`; cross-axis (Y) position
+ * follows `align-items`, same as the flex algorithm would place any item.
+ * `::before` is always FIRST in box order, so the host-origin x is already
+ * right for it — only the cross-axis correction still applies to it.
+ *
+ * COLUMN: the roles of the two axes swap. Main-axis (Y) position for
+ * `::after` is the last real child's bottom edge plus the container's
+ * `row-gap` plus the pseudo's own `margin-top` (margins and `gap` are
+ * ADDITIVE in flex layout, never collapsed the way block-layout margins
+ * are) — `::before` skips the "after last child" term but still gets its
+ * own `margin-top`. Cross-axis (X) is resolved from the pseudo's OWN
+ * computed `margin-left`/`margin-right` when either is nonzero: a flex
+ * item's `getComputedStyle().marginLeft` reports the actual USED value
+ * whether it was authored as an explicit length or as `auto` (auto-margin
+ * centering — sienna's case, verified live: equal resolved left/right
+ * margins that sum to exactly the container's leftover width) — trusting it
+ * directly needs no "was this literally the word auto" check, which
+ * `getComputedStyle` doesn't expose post-layout anyway. Falls back to
+ * `align-items` only when neither margin is in play (both resolve to 0).
+ */
+export function pseudoBox(
+  cs: CSSStyleDeclaration,
+  host: Box,
+  which: '::before' | '::after' = '::before',
+  hostCs?: FlexHostStyle,
+  lastChildBox?: Box | null
+): Box {
+  let xPx = host.xPx
+  let yPx = host.yPx
+  let wPx = parsePx(cs.width) || host.wPx
+  let hPx = parsePx(cs.height) || parsePx(cs.fontSize)
+
+  if (cs.position === 'absolute' || cs.position === 'relative') {
+    const left = cs.left === 'auto' ? null : parsePx(cs.left)
+    const right = cs.right === 'auto' ? null : parsePx(cs.right)
+    if (left !== null) {
+      xPx = host.xPx + left
+      if (right !== null && cs.width === 'auto') wPx = host.wPx - left - right
+    } else if (right !== null) {
+      xPx = host.xPx + host.wPx - right - wPx
+    }
+
+    const top = cs.top === 'auto' ? null : parsePx(cs.top)
+    const bottom = cs.bottom === 'auto' ? null : parsePx(cs.bottom)
+    if (top !== null) {
+      yPx = host.yPx + top
+      if (bottom !== null && cs.height === 'auto') hPx = host.hPx - top - bottom
+    } else if (bottom !== null) {
+      yPx = host.yPx + host.hPx - bottom - hPx
+    }
+    return { xPx, yPx, wPx, hPx }
+  }
+
+  const isFlex = hostCs && (hostCs.display === 'flex' || hostCs.display === 'inline-flex')
+  const isColumn = isFlex && (hostCs!.flexDirection === 'column' || hostCs!.flexDirection === 'column-reverse')
+  const isRow = isFlex && !isColumn && (!hostCs!.flexDirection || hostCs!.flexDirection === 'row')
+
+  if (isRow) {
+    if (which === '::after' && lastChildBox) {
+      xPx = lastChildBox.xPx + lastChildBox.wPx + (parsePx(hostCs!.columnGap) || 0)
+    }
+    if (hostCs!.alignItems === 'center') yPx = host.yPx + (host.hPx - hPx) / 2
+    else if (hostCs!.alignItems === 'flex-end') yPx = host.yPx + host.hPx - hPx
+  } else if (isColumn) {
+    const marginTopPx = parsePx(cs.marginTop)
+    yPx = host.yPx + marginTopPx
+    if (which === '::after' && lastChildBox) {
+      yPx = lastChildBox.yPx + lastChildBox.hPx + (parsePx(hostCs!.rowGap) || 0) + marginTopPx
+    }
+
+    const marginLeftPx = parsePx(cs.marginLeft)
+    const marginRightPx = parsePx(cs.marginRight)
+    if (marginLeftPx > 0 || marginRightPx > 0) {
+      xPx = host.xPx + marginLeftPx
+    } else if (hostCs!.alignItems === 'center') {
+      xPx = host.xPx + (host.wPx - wPx) / 2
+    } else if (hostCs!.alignItems === 'flex-end') {
+      xPx = host.xPx + host.wPx - wPx
+    }
+  }
+
+  return { xPx, yPx, wPx, hPx }
+}
+
+/** One of `::before`/`::after`: background rect, then generated text —
+ *  matching CSS paint order within the pseudo itself. Caller controls WHICH
+ *  of the two, and WHEN relative to the host's real children, to get the
+ *  document-order requirement right at the buildDrawList level: `::before`
+ *  paints before them, `::after` after — see buildDrawList's `openForAfter`.
+ *  Most of our own ::before/::after usage is a small `content: '•'`-style
+ *  separator glyph before a repeated element (contact list dots, tag
+ *  separators); those are `position: static` and render at the pseudo's own
+ *  host box, which is where the content is inserted in normal flow. Native
+ *  `<li>` bullets are a completely different mechanism (see markerOps) —
+ *  browsers never surface those through ::before. */
+/**
+ * A 2D affine map in CSS px, columns first like CSS's own `matrix()`:
+ * `x' = a·x + c·y + e`, `y' = b·x + d·y + f`.
+ */
+export type Matrix2D = { a: number; b: number; c: number; d: number; e: number; f: number }
+
+const IDENTITY_2D: Matrix2D = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }
+
+/** `m` then `n` — i.e. `n` applies to a point FIRST (m · n, as CSS composes). */
+function mul2D(m: Matrix2D, n: Matrix2D): Matrix2D {
+  return {
+    a: m.a * n.a + m.c * n.b,
+    b: m.b * n.a + m.d * n.b,
+    c: m.a * n.c + m.c * n.d,
+    d: m.b * n.c + m.d * n.d,
+    e: m.a * n.e + m.c * n.f + m.e,
+    f: m.b * n.e + m.d * n.f + m.f,
+  }
+}
+
+/** The computed `transform` property alone. Chromium always serializes it as
+ *  `none`, `matrix(...)` or `matrix3d(...)` — never as the author's function
+ *  list — so those three are the whole grammar to handle. A matrix3d keeps
+ *  only its 2D sub-matrix (m11/m12/m21/m22/m41/m42); a real perspective
+ *  transform has no flat equivalent and is not attempted. */
+export function parseTransformMatrix(transform: string): Matrix2D {
+  const s = (transform || '').trim()
+  const m = /^matrix(3d)?\(([^)]+)\)$/.exec(s)
+  if (!m) return IDENTITY_2D
+  const n = m[2].split(',').map((v) => parseFloat(v.trim()))
+  const pick = m[1] ? [n[0], n[1], n[4], n[5], n[12], n[13]] : [n[0], n[1], n[2], n[3], n[4], n[5]]
+  if (pick.some((v) => !Number.isFinite(v))) return IDENTITY_2D
+  return { a: pick[0], b: pick[1], c: pick[2], d: pick[3], e: pick[4], f: pick[5] }
+}
+
+/** One CSS `<angle>` in degrees; 0 for anything unitless or unparseable. */
+function parseAngleDeg(token: string): number {
+  const m = /^([+-]?[\d.eE+-]+)(deg|rad|grad|turn)$/.exec((token || '').trim())
+  if (!m) return 0
+  const n = parseFloat(m[1])
+  if (!Number.isFinite(n)) return 0
+  if (m[2] === 'rad') return (n * 180) / Math.PI
+  if (m[2] === 'grad') return n * 0.9
+  if (m[2] === 'turn') return n * 360
+  return n
+}
+
+/**
+ * The INDIVIDUAL `rotate` property, in degrees about z. This is the property
+ * the badge section-heading chip actually uses (`rotate: 45deg` in
+ * templates.css) — measured on a real export chip, its computed `transform`
+ * is a pure `matrix(1,0,0,1,0,-10.49)` translate and the whole 45° lives
+ * here, which is why the painter used to lose it and square the diamond off.
+ *
+ * Chromium serializes this as `none`, `<angle>`, `<axis-name> <angle>` or
+ * `<x> <y> <z> <angle>`. Only rotation about z stays in the page plane; a
+ * rotation about x or y foreshortens the box into something a flat painter
+ * has no honest answer for, so those report 0 (the box paints unrotated)
+ * rather than a wrong angle.
+ */
+export function parseRotateProp(rotate: string): number {
+  const t = (rotate || '').trim().split(/\s+/).filter(Boolean)
+  if (!t.length || t[0] === 'none') return 0
+  const deg = parseAngleDeg(t[t.length - 1])
+  if (t.length === 1) return deg
+  if (t.length === 2) return t[0] === 'z' ? deg : 0
+  if (t.length === 4) {
+    const [x, y, z] = t.slice(0, 3).map(Number)
+    return x === 0 && y === 0 && z !== 0 ? (z > 0 ? deg : -deg) : 0
+  }
+  return 0
+}
+
+/** The individual `scale` property: `none`, one value (both axes), or two/
+ *  three (the z factor is dropped — it changes nothing on a flat page). */
+export function parseScaleProp(scale: string): { x: number; y: number } {
+  const t = (scale || '').trim().split(/\s+/).filter(Boolean)
+  if (!t.length || t[0] === 'none') return { x: 1, y: 1 }
+  const num = (s: string): number => {
+    const n = s.endsWith('%') ? parseFloat(s) / 100 : parseFloat(s)
+    return Number.isFinite(n) ? n : 1
+  }
+  const x = num(t[0])
+  return { x, y: t.length > 1 ? num(t[1]) : x }
+}
+
+/** The individual `translate` property. Percentages are kept as percentages
+ *  by the computed value (verified against Chromium) and resolve against the
+ *  element's OWN border box — width for x, height for y, per the spec. */
+export function parseTranslateProp(translate: string, wPx: number, hPx: number): { x: number; y: number } {
+  const t = (translate || '').trim().split(/\s+/).filter(Boolean)
+  if (!t.length || t[0] === 'none') return { x: 0, y: 0 }
+  const len = (s: string, basisPx: number): number => {
+    const n = parseFloat(s)
+    if (!Number.isFinite(n)) return 0
+    return s.endsWith('%') ? (n / 100) * basisPx : n
+  }
+  return { x: len(t[0], wPx), y: t.length > 1 ? len(t[1], hPx) : 0 }
+}
+
+/**
+ * The element's FULL computed transform: the individual `translate`,
+ * `rotate` and `scale` properties composed with the `transform` property, in
+ * the order CSS Transforms Level 2 mandates — translate, then rotate, then
+ * scale, then `transform`, all about the same transform-origin.
+ *
+ * Order matters and is not a guess: measured on Chromium with a 40×20 box at
+ * `transform: translateY(-10px); rotate: 45deg; scale: 0.5`, the painted box
+ * centre moved by (+3.54, −3.54), which is `rotate·scale` applied to the
+ * transform's own (0, −10) — NOT (0, −10) itself. Reading `transform` alone
+ * (as this module used to) therefore gets both the angle AND the offset
+ * wrong the moment an individual property is in play.
+ */
+export function composedTransform(cs: CSSStyleDeclaration, wPx: number, hPx: number): Matrix2D {
+  const t = parseTranslateProp(cs.translate, wPx, hPx)
+  const deg = parseRotateProp(cs.rotate)
+  const s = parseScaleProp(cs.scale)
+  const rad = (deg * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  const T: Matrix2D = { ...IDENTITY_2D, e: t.x, f: t.y }
+  const R: Matrix2D = { a: cos, b: sin, c: -sin, d: cos, e: 0, f: 0 }
+  const S: Matrix2D = { ...IDENTITY_2D, a: s.x, d: s.y }
+  return mul2D(mul2D(mul2D(T, R), S), parseTransformMatrix(cs.transform))
+}
+
+/** True when the map leaves the box's edges parallel to the page's — the only
+ *  case in which an element's measured client rect IS the shape it paints,
+ *  and so the only case a plain `rect` op can express. */
+export function isAxisAligned(m: Matrix2D): boolean {
+  return Math.abs(m.b) < 1e-4 && Math.abs(m.c) < 1e-4
+}
+
+/** The uniform scale factor of a map that is a rotation times a scale and
+ *  nothing else, or null when it also skews or scales the two axes apart.
+ *  Circular corner arcs survive such a map unchanged except for that one
+ *  factor; under anything else they become ellipse arcs this module does not
+ *  attempt, and the corners are painted sharp instead. */
+function similarityScale(m: Matrix2D): number | null {
+  if (Math.abs(m.a - m.d) > 1e-4 || Math.abs(m.b + m.c) > 1e-4) return null
+  const k = Math.hypot(m.a, m.b)
+  return k > 0 ? k : null
+}
+
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4
+
+/** CSS's own overlapping-radii rule: if two radii on one edge together exceed
+ *  it, every radius shrinks by the same factor until none does. */
+function clampRadii(radii: CornerRadii, wPx: number, hPx: number): CornerRadii {
+  const f = Math.min(
+    1,
+    wPx / (radii.tl + radii.tr) || 1,
+    wPx / (radii.bl + radii.br) || 1,
+    hPx / (radii.tl + radii.bl) || 1,
+    hPx / (radii.tr + radii.br) || 1
+  )
+  const s = Number.isFinite(f) ? Math.max(0, Math.min(1, f)) : 1
+  return { tl: radii.tl * s, tr: radii.tr * s, br: radii.br * s, bl: radii.bl * s }
+}
+
+/**
+ * The path a `wPx × hPx` rounded box paints once `m`'s linear part has turned
+ * it — a diamond for the 45° badge chip, a parallelogram for a skew, the box
+ * itself for a plain scale. Returned in the coordinate space of the shape's
+ * own axis-aligned bounding box (origin at its top-left), together with where
+ * that bounding box sits relative to the shape's CENTRE, so a caller that
+ * knows the centre (a real element reads it off its client rect; a pseudo
+ * computes it) can place the op without repeating the geometry.
+ *
+ * Corner radii ride along whenever `m` is a rotation-and-uniform-scale, which
+ * keeps a circular arc circular: same sweep (a rotation never mirrors), only
+ * the radius scaled. Under a skew or an uneven scale they would become
+ * ellipse arcs of a different tilt, so the corners go sharp rather than
+ * wrong.
+ */
+export function transformedBoxPath(
+  wPx: number,
+  hPx: number,
+  radii: CornerRadii,
+  m: Matrix2D
+): { d: string; offsetXPx: number; offsetYPx: number; wPx: number; hPx: number } | null {
+  if (!(wPx > 0) || !(hPx > 0)) return null
+  const k = similarityScale(m)
+  const r = k === null ? { tl: 0, tr: 0, br: 0, bl: 0 } : clampRadii(radii, wPx, hPx)
+  const halfW = wPx / 2
+  const halfH = hPx / 2
+  // Local coordinates, origin at the box centre, y down (CSS px and svg user
+  // units agree on that, so the path needs no flip).
+  const p = (x: number, y: number): [number, number] => [m.a * x + m.c * y, m.b * x + m.d * y]
+  const corners: Array<[number, number]> = [
+    p(-halfW, -halfH),
+    p(halfW, -halfH),
+    p(halfW, halfH),
+    p(-halfW, halfH),
+  ]
+  // Rounding only ever cuts INTO the sharp box, so the four transformed
+  // corners still bound the rounded shape.
+  const minX = Math.min(...corners.map((c) => c[0]))
+  const minY = Math.min(...corners.map((c) => c[1]))
+  const maxX = Math.max(...corners.map((c) => c[0]))
+  const maxY = Math.max(...corners.map((c) => c[1]))
+  const at = (x: number, y: number): string => {
+    const [tx, ty] = p(x, y)
+    return `${round4(tx - minX)} ${round4(ty - minY)}`
+  }
+  const arc = (radiusPx: number, x: number, y: number): string =>
+    `A ${round4(radiusPx * (k ?? 1))} ${round4(radiusPx * (k ?? 1))} 0 0 1 ${at(x, y)}`
+
+  const d =
+    `M ${at(-halfW + r.tl, -halfH)} L ${at(halfW - r.tr, -halfH)} ` +
+    (r.tr > 0 ? `${arc(r.tr, halfW, -halfH + r.tr)} ` : '') +
+    `L ${at(halfW, halfH - r.br)} ` +
+    (r.br > 0 ? `${arc(r.br, halfW - r.br, halfH)} ` : '') +
+    `L ${at(-halfW + r.bl, halfH)} ` +
+    (r.bl > 0 ? `${arc(r.bl, -halfW, halfH - r.bl)} ` : '') +
+    `L ${at(-halfW, -halfH + r.tl)} ` +
+    (r.tl > 0 ? `${arc(r.tl, -halfW + r.tl, -halfH)} ` : '') +
+    'Z'
+  return { d, offsetXPx: minX, offsetYPx: minY, wPx: maxX - minX, hPx: maxY - minY }
+}
+
+/**
+ * Background and border for a box the page's transforms have ROTATED or
+ * SKEWED, painted as the shape it actually is. Everything else in this module
+ * draws boxes as axis-aligned `rect` ops, which is exactly right until a
+ * transform tilts one: the badge heading chip (`rotate: 45deg`) and the
+ * diamond monogram (`transform: rotate(45deg)`) are squares on their side,
+ * and a `rect` op squares them back up — bigger than the real chip by its
+ * diagonal, and over the heading's first letter (measured: a 20.98px chip
+ * painted as a 25.52px square sitting on the "S" of "Summary").
+ *
+ * `centreXPx/centreYPx` is where the SHAPE's centre lands on the page,
+ * `wPx/hPx` its UNtransformed border-box size. A single stroked-and-filled
+ * path carries both fill and border, so the border follows the tilt too;
+ * mixed per-edge borders have no one centreline to trace and are dropped with
+ * a dev warning rather than painted as four unrotated lines.
+ */
+function transformedBoxOps(
+  el: Element,
+  cs: CSSStyleDeclaration,
+  centreXPx: number,
+  centreYPx: number,
+  wPx: number,
+  hPx: number,
+  radii: CornerRadii,
+  m: Matrix2D,
+  fill: Rgba | null,
+  opacityMul: number,
+  ops: DrawOp[]
+): void {
+  const edges = BORDER_EDGES.map((edge) => readBorderEdge(cs, edge.side.toLowerCase()))
+  const first = edges[0]
+  const uniformBorder =
+    first &&
+    edges.every(
+      (e) =>
+        e &&
+        e.width === first.width &&
+        e.style === first.style &&
+        e.color.r === first.color.r &&
+        e.color.g === first.color.g &&
+        e.color.b === first.color.b &&
+        e.color.a === first.color.a
+    )
+      ? first
+      : null
+  if (!uniformBorder && edges.some(Boolean) && import.meta.env.DEV) {
+    console.warn('[pdf] rotated box has mixed per-edge borders, dropping them', el)
+  }
+
+  if (fill) {
+    const path = transformedBoxPath(wPx, hPx, radii, m)
+    if (path) {
+      ops.push({
+        kind: 'svg',
+        xPx: centreXPx + path.offsetXPx,
+        yPx: centreYPx + path.offsetYPx,
+        wPx: path.wPx,
+        hPx: path.hPx,
+        viewBox: [0, 0, path.wPx, path.hPx],
+        d: path.d,
+        fill,
+        stroke: undefined,
+        strokeWidthPx: 0,
+      })
+    }
+  }
+
+  if (!uniformBorder) return
+  // CSS paints a border INSIDE the box, pdf-lib strokes centred — so the
+  // stroked path is the box shrunk by one border width, exactly the width/2
+  // inset the straight-line border path uses (BORDER_EDGES).
+  const bw = uniformBorder.width
+  const k = similarityScale(m) ?? 1
+  const inset = bw / 2
+  const path = transformedBoxPath(
+    wPx - bw,
+    hPx - bw,
+    {
+      tl: Math.max(0, radii.tl - inset),
+      tr: Math.max(0, radii.tr - inset),
+      br: Math.max(0, radii.br - inset),
+      bl: Math.max(0, radii.bl - inset),
+    },
+    m
+  )
+  if (!path) return
+  ops.push({
+    kind: 'svg',
+    xPx: centreXPx + path.offsetXPx,
+    yPx: centreYPx + path.offsetYPx,
+    wPx: path.wPx,
+    hPx: path.hPx,
+    viewBox: [0, 0, path.wPx, path.hPx],
+    d: path.d,
+    fill: undefined,
+    // The path's own coordinates already carry `m`'s scale, so the stroke
+    // has to be scaled by hand to match what the browser draws.
+    stroke: { ...uniformBorder.color, a: uniformBorder.color.a * opacityMul },
+    strokeWidthPx: bw * k,
+  })
+}
+
+/** Whether ANY of the four transform properties is set — the cheap gate that
+ *  keeps every untransformed element on exactly the arithmetic it had before
+ *  individual `rotate`/`scale`/`translate` were honoured at all. */
+function hasTransform(cs: CSSStyleDeclaration): boolean {
+  const set = (v: string): boolean => !!v && v !== 'none'
+  return set(cs.transform) || set(cs.rotate) || set(cs.scale) || set(cs.translate)
+}
+
+/** The composed map and the element's own border-box size, but ONLY when the
+ *  map tilts the box off the page's axes — the one case an axis-aligned
+ *  `rect` op cannot express. Null otherwise, so the caller keeps its old
+ *  measured-rect path. */
+function tiltOf(el: Element, cs: CSSStyleDeclaration): { m: Matrix2D; size: { wPx: number; hPx: number } } | null {
+  const size = borderBoxSize(el, cs)
+  if (!(size.wPx > 0) || !(size.hPx > 0)) return null
+  const m = composedTransform(cs, size.wPx, size.hPx)
+  return isAxisAligned(m) ? null : { m, size }
+}
+
+/**
+ * The element's UNtransformed border-box size — what `getBoundingClientRect`
+ * would have reported with no transform on it. Needed because a rotated
+ * element's client rect is the bounding box of the TILTED shape (a 20.98px
+ * square at 45° measures 25.52px), so the rect alone cannot say how big the
+ * box itself is. Chromium resolves computed `width`/`height` to the border
+ * box under `box-sizing: border-box` and to the content box otherwise —
+ * verified against a real element both ways, not assumed. `auto` (an inline
+ * box, which CSS transforms do not apply to anyway) falls back to
+ * offsetWidth/offsetHeight.
+ */
+function borderBoxSize(el: Element, cs: CSSStyleDeclaration): { wPx: number; hPx: number } {
+  const declared = (v: string): number | null => {
+    const n = parseFloat(v)
+    return Number.isFinite(n) ? n : null
+  }
+  let w = declared(cs.width)
+  let h = declared(cs.height)
+  if (w === null || h === null) {
+    const he = el as HTMLElement
+    return { wPx: he.offsetWidth ?? 0, hPx: he.offsetHeight ?? 0 }
+  }
+  if (cs.boxSizing !== 'border-box') {
+    w += parsePx(cs.paddingLeft) + parsePx(cs.paddingRight) + parsePx(cs.borderLeftWidth) + parsePx(cs.borderRightWidth)
+    h += parsePx(cs.paddingTop) + parsePx(cs.paddingBottom) + parsePx(cs.borderTopWidth) + parsePx(cs.borderBottomWidth)
+  }
+  return { wPx: w, hPx: h }
+}
+
+/**
+ * The box of the last thing a flex row lays out before its ::after: the last
+ * element child, or the last run of text when that comes after it. A row
+ * whose only child is text (a headline with a rule on either side of its
+ * words) has no element child at all, and the ::after was placed at the
+ * row's own left edge - on top of the ::before (Schematic, 2026-09-27).
+ */
+function lastFlowChildBox(el: HTMLElement, root: HTMLElement): Box | null {
+  for (let n = el.lastChild; n; n = n.previousSibling) {
+    if (n.nodeType === Node.ELEMENT_NODE) return boxOf(n as Element, root)
+    if (n.nodeType === Node.TEXT_NODE && (n.textContent ?? '').trim()) {
+      const range = document.createRange()
+      range.selectNodeContents(n)
+      const r = range.getBoundingClientRect()
+      const rootRect = root.getBoundingClientRect()
+      return { xPx: r.left - rootRect.left, yPx: r.top - rootRect.top, wPx: r.width, hPx: r.height }
+    }
+  }
+  return null
+}
+
+function pseudoOps(el: HTMLElement, root: HTMLElement, ops: DrawOp[], which: '::before' | '::after'): void {
+  const cs = getComputedStyle(el, which)
+  if (cs.content === 'none' || cs.display === 'none') return
+
+  const opacityMul = elementOpacity(cs)
+  const hostCs = getComputedStyle(el)
+  // Only fetched when it could actually matter (flex host, ::after) — an
+  // extra getBoundingClientRect for every plain static pseudo (the
+  // overwhelming common case) would be wasted work.
+  const isFlex = hostCs.display === 'flex' || hostCs.display === 'inline-flex'
+  const lastChildBox = isFlex && which === '::after' ? lastFlowChildBox(el, root) : null
+  const box = pseudoBox(cs, boxOf(el, root), which, hostCs, lastChildBox)
+
+  // Row-flex `align-items: baseline` with a TEXTLESS pseudo (2026-08-17
+  // user report — the Grid skills diamond rendered at the chip's TOP in
+  // the PDF while the canvas centers it): a no-text flex item aligns its
+  // BOTTOM edge to the host's text baseline. Approximate the baseline as
+  // line-height − 0.435em of the HOST font — calibrated by pixel
+  // measurement against the live canvas (probe-diamond: DOM marker center
+  // 7.64px, this model 7.6px; the first guess of 0.32em sat 1.4px low).
+  const isRowFlex = isFlex && (!hostCs.flexDirection || hostCs.flexDirection === 'row')
+  if (isRowFlex && hostCs.alignItems === 'baseline' && !pseudoContentText(cs.content) && box.hPx > 0) {
+    const hostFontPx = parsePx(hostCs.fontSize)
+    const hostLineH = parsePx(hostCs.lineHeight) || hostFontPx * 1.2
+    const baselineY = boxOf(el, root).yPx + hostLineH - hostFontPx * 0.435
+    box.yPx = baselineY - box.hPx
+  }
+  // A pseudo's box is SYNTHESIZED, never measured, so unlike a real element's
+  // client rect it carries NONE of the transform yet: the whole map applies
+  // here. The centre shift is the map's translation column (transform-origin
+  // defaults to the centre, and nothing a linear map does moves its own
+  // origin) — for the grid diamond's `rotate(45deg) translateY(-1px)` that is
+  // the rotated (0.71, −0.71), not the authored (0, −1).
+  const radii = cornerRadii(cs)
+  const m = hasTransform(cs) ? composedTransform(cs, box.wPx, box.hPx) : IDENTITY_2D
+  box.xPx += m.e
+  box.yPx += m.f
+  const bg = parseColor(cs.backgroundColor)
+  const fill = bg && bg.a > 0 ? { ...bg, a: bg.a * opacityMul } : null
+
+  if (!isAxisAligned(m) && box.wPx > 0 && box.hPx > 0) {
+    // Tilted: background and border both trace the real shape (a diamond for
+    // the badge heading's plain ::before, for the Grid skills marker, …).
+    const cx = box.xPx + box.wPx / 2
+    const cy = box.yPx + box.hPx / 2
+    transformedBoxOps(el, cs, cx, cy, box.wPx, box.hPx, radii, m, fill, opacityMul, ops)
+  } else {
+    // Axis-aligned: the map can still SCALE a synthesized box about its own
+    // centre, which a real element's measured rect would already carry. Left
+    // strictly untouched at scale 1 so every pseudo that has no scale keeps
+    // the exact same arithmetic — and the same last-bit rounding — as before.
+    const sx = Math.abs(m.a)
+    const sy = Math.abs(m.d)
+    if (sx !== 1 || sy !== 1) {
+      box.xPx += (box.wPx * (1 - sx)) / 2
+      box.yPx += (box.hPx * (1 - sy)) / 2
+      box.wPx *= sx
+      box.hPx *= sy
+    }
+    if (fill && box.wPx > 0 && box.hPx > 0) {
+      ops.push({ kind: 'rect', xPx: box.xPx, yPx: box.yPx, wPx: box.wPx, hPx: box.hPx, fill, radii })
+    }
+    // Pseudo-elements previously got NO border handling at all (task 22) — a
+    // `::before`/`::after` with a `border` (e.g. .tpl-timeline's circular
+    // marker: `border-radius: 50%`, `border: 2px solid`) silently vanished
+    // from the export. Same box-size guard as the background rect above: a
+    // pseudo's box is SYNTHESIZED (pseudoBox), not measured, and can come out
+    // zero/negative for a degenerate host, unlike boxOps's real elements.
+    if (box.wPx > 0 && box.hPx > 0) borderOps(el, cs, box, radii, opacityMul, ops)
+  }
+
+  const text = pseudoContentText(cs.content)
+  if (!text) return
+  const run = styledTextRun(cs, text, box.xPx, box.yPx)
+  if (run)
+    ops.push({
+      kind: 'text',
+      run: opacityMul === 1 ? run : { ...run, color: { ...run.color, a: run.color.a * opacityMul } },
+    })
+}
+
+/** Bullet glyph implied by `list-style-type`: every one of our seven bullet
+ *  styles is declared as a CSS STRING (`list-style-type: "›  "` —
+ *  Artboard.tsx's BULLET_TYPE), so unwrapping it reuses the same quoted-string
+ *  parsing as ::before/::after content. A `list-style-type` KEYWORD
+ *  (disc/circle/square/decimal/…) unwraps to '' and paints nothing — see
+ *  markerOps. */
+function listStyleGlyph(listStyleType: string): string {
+  return pseudoContentText(listStyleType)
+}
+
+/**
+ * Where the browser puts an `outside` marker's text origin, in the same
+ * root-relative px the rest of the draw list is in.
+ *
+ * `list-style-position: outside` puts the marker in its own box OUTSIDE the
+ * li's principal box, RIGHT-ALIGNED against the li's CONTENT-box left edge —
+ * so the marker string's pen starts exactly one string width left of that
+ * edge, and nothing else is added. The gap between the mark and the first
+ * word is not layout: it is the marker string's own two TRAILING SPACES
+ * (Artboard.tsx's BULLET_TYPE), so `measuredWidthPx` has to be measured WITH
+ * them — which is why `markerWidthPx` below measures under `white-space: pre`
+ * (text.ts) rather than letting normal white-space processing eat them.
+ *
+ * This used to add another `0.35em` on top, from the days when a marker had
+ * no string to supply its own gap. Measured on the /print page against the
+ * exported file, that put every mark 0.34-0.43 em left of where the canvas
+ * draws it - about 3 pt at body size, on both marquee and harvard and on all
+ * seven bullet styles - far enough that marquee's disc hung outside the body
+ * margin in the file while the canvas kept it inside.
+ *
+ * Exported so the arithmetic can be pinned without a DOM (markerOps itself
+ * needs real getComputedStyle/::marker access).
+ */
+export function markerOriginX(box: Box, cs: CSSStyleDeclaration, measuredWidthPx: number): number {
+  return contentBoxOf(box, cs).xPx - measuredWidthPx
+}
+
+/**
+ * The marker string's width, measured the way the browser lays it out.
+ *
+ * A canvas context carries only a font shorthand, so it misses `font-variant`
+ * — and Chromium's UA stylesheet puts `font-variant-numeric: tabular-nums` on
+ * every `::marker`, so an ordered list's numbers line up. In Work Sans `tnum`
+ * re-cuts the SPACE, and a "•  " marker measures 1.1124 em without it against
+ * 1.0350 em with it: 0.077 em of the marker box, enough to put every marquee
+ * bullet visibly left of the one on the page. The layout probe (text.ts)
+ * reproduces the marker's own typography; the canvas measurement stays as the
+ * fallback for a document with no usable DOM behind it.
+ */
+function markerWidthPx(text: string, markerCs: CSSStyleDeclaration, cssFont: string): number {
+  return measureLaidOutWidthPx(text, markerCs) || measureTextWidthPx(text, cssFont)
+}
+
+/**
+ * Native `<li>::marker` bullets (used by every template's achievement/detail
+ * lists). `getComputedStyle(el, '::marker').content` is only ever something
+ * other than `normal` when a stylesheet explicitly sets `::marker { content:
+ * ... }` — ours never do; the bullet is driven by `list-style-type` instead,
+ * which every one of our seven bullet styles sets to a quoted STRING.
+ *
+ * The mark is REAL content, not decoration: it is drawn once, visibly, as
+ * text, and it is the only thing telling a reader where one item ends and the
+ * next begins. (A marker painted as a vector outline used to be
+ * `isDecorative`, with an invisible twin beside it carrying the text.)
+ */
+/** The baseline of `el`'s first laid-out line of text, measured, or null
+ *  when it holds none (a nested list's own items are theirs, not its). */
+function firstLineBaselinePx(el: HTMLElement, root: HTMLElement): number | null {
+  const walker = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (!n.textContent?.trim()) continue
+    const nested = n.parentElement?.closest('li')
+    if (nested && nested !== el) continue
+    const runs = extractRuns(n as Text, root)
+    if (runs.length) return runs[0].baselinePx
+  }
+  return null
+}
+
+function markerOps(el: HTMLElement, root: HTMLElement, ops: DrawOp[]): void {
+  const cs = getComputedStyle(el)
+  if (cs.display !== 'list-item') return
+
+  const markerCs = getComputedStyle(el, '::marker')
+  const explicitText = pseudoContentText(markerCs.content)
+  const kind = (cs.listStyleType || '').trim()
+
+  const box = boxOf(el, root)
+  const color = parseColor(markerCs.color)
+  if (!color || color.a === 0) return
+  const sizePx = parsePx(markerCs.fontSize)
+  if (sizePx <= 0) return
+  const font = `${markerCs.fontStyle} ${markerCs.fontWeight} ${markerCs.fontSize} ${markerCs.fontFamily}`
+
+  // Every bullet style reaches here as a STRING marker. Chromium still draws
+  // disc/circle/square as UA shapes if a stylesheet asks for those keywords,
+  // and this deliberately does not reproduce them any more: a shape carries no
+  // text, and a marker the file can only show by hiding text under it is the
+  // thing this whole path exists to stop being. Ours ask for characters
+  // instead (Artboard.tsx), so the branch below is the only one there is.
+  // The drawn string and the extracted string are one string — the mark a
+  // reader sees is the mark an extractor reads.
+  const text = explicitText || listStyleGlyph(kind)
+  if (!text) return
+  const run = styledTextRun(markerCs, text, 0, box.yPx)
+  if (!run) return
+  // The browser sets an outside marker on the BASELINE OF THE ITEM'S FIRST
+  // LINE. The top-plus-ascent guess above ignores that line's half-leading
+  // and the marker's own size, so a marker set larger than its text
+  // (Keystone's diamond at 1.35em) rode 2.25pt high and one set smaller sat
+  // low (Harvard, 0.75pt) - measured on the exports, 2026-09-27. The first
+  // run of the item's own text carries the real baseline.
+  const first = firstLineBaselinePx(el, root)
+  if (first !== null) run.baselinePx = first
+  const widthPx = markerWidthPx(text, markerCs, font)
+  run.xPx = markerOriginX(box, cs, widthPx)
+  // A REAL measured width, unlike every other synthesized run's (see
+  // types.ts's TextRun.widthPx): the marker box is one laid-out string, and
+  // handing paint.ts the browser's own width for it lets the same Tz fit that
+  // every DOM run gets absorb the difference between the embedded face's
+  // advances and the ones the features on the page produced — so the word
+  // after the mark starts exactly where the canvas starts it.
+  run.widthPx = widthPx
+  run.isDecorative = false
+  ops.push({ kind: 'text', run })
+}
+
+/**
+ * Converts one SVG shape child's geometry to path `d` commands, in the
+ * child's own (viewBox) coordinate space — verbatim for `path` (its `d` IS
+ * already path syntax), translated to M/L(/Z) for the primitive shapes
+ * lucide's icon set actually uses (line, polyline/polygon, circle as a
+ * two-arc path, a plain non-rounded rect — `rx`/`ry` rounding isn't
+ * attempted: lucide barely uses `rect`, and the one case that does
+ * (Briefcase, `rx="2"` on a 20x14 box) is invisible at print resolution).
+ * Returns null for a shape kind this doesn't convert, or for missing/
+ * non-finite geometry — the caller dev-warns and skips it. Pure and DOM-free
+ * (`attr` is a plain getter, not an Element) so it's directly unit-testable.
+ */
+export function svgShapeToPathD(tag: string, attr: (name: string) => string | null): string | null {
+  const num = (name: string): number => {
+    const v = attr(name)
+    const n = v === null ? NaN : parseFloat(v)
+    return Number.isFinite(n) ? n : 0
+  }
+  switch (tag) {
+    case 'path':
+      return attr('d') || null
+    case 'line':
+      return `M ${num('x1')} ${num('y1')} L ${num('x2')} ${num('y2')}`
+    case 'polyline':
+    case 'polygon': {
+      const pts = (attr('points') || '')
+        .trim()
+        .split(/[\s,]+/)
+        .filter(Boolean)
+        .map(Number)
+      if (pts.length < 4 || pts.length % 2 !== 0 || pts.some((n) => !Number.isFinite(n))) return null
+      const cmds = [`M ${pts[0]} ${pts[1]}`]
+      for (let i = 2; i < pts.length; i += 2) cmds.push(`L ${pts[i]} ${pts[i + 1]}`)
+      if (tag === 'polygon') cmds.push('Z')
+      return cmds.join(' ')
+    }
+    case 'circle': {
+      const cx = num('cx'),
+        cy = num('cy'),
+        r = num('r')
+      if (r <= 0) return null
+      // Two 180deg arcs trace the full circumference — same "two-arc circle"
+      // shape as roundedRectPath's stadium collapse in paint.ts, just via
+      // SVG arc commands instead of a radius clamp.
+      return `M ${cx - r} ${cy} A ${r} ${r} 0 1 0 ${cx + r} ${cy} A ${r} ${r} 0 1 0 ${cx - r} ${cy} Z`
+    }
+    case 'ellipse': {
+      // Same two-arc trace as `circle`, with the two radii kept apart. The
+      // library's drawn portraits build every head out of one of these
+      // (avatar.ts), and an unconverted ellipse used to leave the face with
+      // no head under the hair and eyes in every exported example résumé.
+      // SVG 2's `auto` (one radius standing in for the other) is honoured
+      // because a missing attribute is what `auto` means.
+      const cx = num('cx'),
+        cy = num('cy')
+      const rxAttr = attr('rx'),
+        ryAttr = attr('ry')
+      const rx = rxAttr !== null ? num('rx') : num('ry')
+      const ry = ryAttr !== null ? num('ry') : num('rx')
+      if (rx <= 0 || ry <= 0) return null
+      return `M ${cx - rx} ${cy} A ${rx} ${ry} 0 1 0 ${cx + rx} ${cy} A ${rx} ${ry} 0 1 0 ${cx - rx} ${cy} Z`
+    }
+    case 'rect': {
+      const x = num('x'),
+        y = num('y'),
+        w = num('width'),
+        h = num('height')
+      if (w <= 0 || h <= 0) return null
+      // rx/ry per SVG: either sets both, clamped to half the box (lucide's
+      // Briefcase body is rx=2 — flattening it to sharp corners visibly
+      // diverged from the browser at icon scale, user-reported 2026-08-16)
+      const rxAttr = attr('rx'),
+        ryAttr = attr('ry')
+      let rx = rxAttr !== null ? Number(rxAttr) : ryAttr !== null ? Number(ryAttr) : 0
+      let ry = ryAttr !== null ? Number(ryAttr) : rx
+      if (!Number.isFinite(rx) || rx < 0) rx = 0
+      if (!Number.isFinite(ry) || ry < 0) ry = 0
+      rx = Math.min(rx, w / 2)
+      ry = Math.min(ry, h / 2)
+      if (rx <= 0 || ry <= 0) return `M ${x} ${y} L ${x + w} ${y} L ${x + w} ${y + h} L ${x} ${y + h} Z`
+      return (
+        `M ${x + rx} ${y} L ${x + w - rx} ${y} A ${rx} ${ry} 0 0 1 ${x + w} ${y + ry} ` +
+        `L ${x + w} ${y + h - ry} A ${rx} ${ry} 0 0 1 ${x + w - rx} ${y + h} ` +
+        `L ${x + rx} ${y + h} A ${rx} ${ry} 0 0 1 ${x} ${y + h - ry} ` +
+        `L ${x} ${y + ry} A ${rx} ${ry} 0 0 1 ${x + rx} ${y} Z`
+      )
+    }
+    default:
+      return null
+  }
+}
+
+/**
+ * Makes one shape child's `d` safe for concatenation into a combined path
+ * (user-reported icon corruption, 2026-08-16). Per the SVG spec, a path
+ * whose `d` STARTS with a lowercase `m x y` is an ABSOLUTE moveto (there is
+ * no previous point to be relative to) — but `svgIconOps` below joins every
+ * child's `d` into one string, and in that combined path the same `m`
+ * becomes RELATIVE to the previous child's endpoint, displacing the whole
+ * shape (the languages icon scrambled; badge-check's check stroke drifted
+ * off its seal). The rewrite: leading `m x y` -> `M x y`, and — the trap a
+ * naive case-flip falls into — any bare coordinate pairs that FOLLOW the
+ * leading pair (implicit linetos, which stay RELATIVE after a moveto of
+ * either case) become an explicit `l` run so their meaning survives the `M`.
+ * Uppercase-M paths and every other command are returned verbatim; a
+ * malformed leading run (fewer than 2 numbers) is returned verbatim rather
+ * than guessed at. Exported for direct unit testing.
+ */
+export function absolutizeLeadingMoveto(d: string): string {
+  const lead = /^\s*m[\s,]*/.exec(d)
+  if (!lead) return d
+  let i = lead[0].length
+  const numRe = /[+-]?(?:\d*\.\d+|\d+\.?)(?:[eE][+-]?\d+)?/y
+  const nums: string[] = []
+  for (;;) {
+    while (i < d.length && /[\s,]/.test(d[i])) i++
+    numRe.lastIndex = i
+    const t = numRe.exec(d)
+    if (!t) break
+    nums.push(t[0])
+    i = numRe.lastIndex
+  }
+  if (nums.length < 2) return d
+  const rest = d.slice(i).trim()
+  const tailPairs = nums.slice(2)
+  const tail = tailPairs.length ? ` l ${tailPairs.map((n) => String(Number(n))).join(' ')}` : ''
+  const head = `M ${Number(nums[0])} ${Number(nums[1])}`
+  return rest ? `${head}${tail} ${rest}` : `${head}${tail}`
+}
+
+/**
+ * Re-emits every arc (a/A) argument group in `d` with explicit separators
+ * (user-reported icon corruption, 2026-08-16). SVG's grammar allows the two
+ * single-digit arc FLAGS to pack against the next number with no separator
+ * (`a18.15 18.15 0 0 1-20 0` = large-arc 0, sweep 1, x -20) — briefcase-
+ * business's lid swoop ships exactly that form, and pdf-lib's drawSvgPath
+ * lexer mis-reads it (generic number parsing consumes `1-20`-adjacent
+ * digits wrong) and drops the arc. Flag positions are lexed as what they
+ * ARE — one mandatory 0/1 digit each — and each 7-value group re-emitted
+ * space-separated; everything outside a/A argument runs is copied verbatim.
+ * Exported for direct unit testing.
+ */
+export function expandArcFlags(d: string): string {
+  const numRe = /[+-]?(?:\d*\.\d+|\d+\.?)(?:[eE][+-]?\d+)?/y
+  let out = ''
+  let i = 0
+  const skipSep = () => {
+    while (i < d.length && /[\s,]/.test(d[i])) i++
+  }
+  const readNum = (): string | null => {
+    skipSep()
+    numRe.lastIndex = i
+    const t = numRe.exec(d)
+    if (!t) return null
+    i = numRe.lastIndex
+    return t[0]
+  }
+  const readFlag = (): string | null => {
+    skipSep()
+    if (d[i] === '0' || d[i] === '1') {
+      const f = d[i]
+      i++
+      return f
+    }
+    return null
+  }
+  while (i < d.length) {
+    const c = d[i]
+    if (c === 'a' || c === 'A') {
+      out += c
+      i++
+      for (;;) {
+        const save = i
+        const rx = readNum()
+        if (rx === null) break
+        const ry = readNum()
+        const rot = readNum()
+        const f1 = readFlag()
+        const f2 = readFlag()
+        const x = readNum()
+        const y = readNum()
+        if (ry === null || rot === null || f1 === null || f2 === null || x === null || y === null) {
+          // malformed group: emit the rest verbatim rather than guessing
+          i = save
+          break
+        }
+        out += ` ${rx} ${ry} ${rot} ${f1} ${f2} ${Number(x)} ${Number(y)}`
+      }
+    } else {
+      out += c
+      i++
+    }
+  }
+  return out
+}
+
+const SVG_SHAPE_TAGS = new Set(['path', 'line', 'polyline', 'polygon', 'circle', 'ellipse', 'rect'])
+// Purely structural SVG wrappers our own icon sets never emit shapes inside
+// of directly but that legitimately appear (querySelectorAll('*') walks
+// through them) without themselves being a shape to warn about.
+const SVG_STRUCTURAL_TAGS = new Set(['g', 'defs', 'title', 'desc', 'metadata', 'clippath', 'style'])
+
+/**
+ * Inline lucide-style `<svg>` icons (section-heading chips via
+ * sectionIcons.tsx, contact-row marks via ContactIcons) never went through
+ * the walker at all before this task — only `<img src="data:image/svg+xml">`
+ * "logo" marks did (svgLogoOps above), so every section-icon chip painted as
+ * an empty tinted square. Emits ONE 'svg' op combining every shape child
+ * into a single `d`: lucide icons share one stroke/fill across all their
+ * children (verified against every icon in sectionIcons.tsx/ContactIcons —
+ * `fill="none" stroke="currentColor"` on the `<svg>`, never overridden on a
+ * child), so one `drawSvgPath` call paints the whole icon. Coordinates stay
+ * VERBATIM in the svg's own viewBox/user-unit space — see types.ts's `svg`
+ * DrawOp doc comment for why paint.ts doesn't need this module to pre-scale
+ * them (or the stroke width) itself.
+ */
+function svgIconOps(svg: Element, root: HTMLElement, ops: DrawOp[]): void {
+  const box = boxOf(svg, root)
+  if (box.wPx <= 0 || box.hPx <= 0) return
+
+  const vb = (svg.getAttribute('viewBox') || '')
+    .trim()
+    .split(/[\s,]+/)
+    .map(Number)
+  if (vb.length !== 4 || vb.some((n) => !Number.isFinite(n)) || vb[2] <= 0 || vb[3] <= 0) {
+    if (import.meta.env.DEV) console.warn('[pdf] inline <svg> has no usable viewBox, skipping icon', svg)
+    return
+  }
+  const [vbX, vbY, vbW, vbH] = vb
+  if (vbX !== 0 || vbY !== 0) {
+    if (import.meta.env.DEV) console.warn('[pdf] inline <svg> has a non-zero viewBox origin, skipping icon', svg)
+    return
+  }
+
+  const dParts: string[] = []
+  for (const child of Array.from(svg.querySelectorAll('*'))) {
+    const tag = child.tagName.toLowerCase()
+    if (SVG_SHAPE_TAGS.has(tag)) {
+      const d = svgShapeToPathD(tag, (name) => child.getAttribute(name))
+      if (d) dParts.push(absolutizeLeadingMoveto(expandArcFlags(d)))
+      else if (import.meta.env.DEV)
+        console.warn(`[pdf] inline <svg> <${tag}> has no usable geometry, skipping shape`, child)
+    } else if (!SVG_STRUCTURAL_TAGS.has(tag)) {
+      if (import.meta.env.DEV)
+        console.warn(`[pdf] inline <svg> has an unsupported child <${tag}>, skipping shape`, child)
+    }
+  }
+  if (!dParts.length) return
+
+  const cs = getComputedStyle(svg)
+  const opacityMul = elementOpacity(cs)
+  const strokeColor = parseColor(cs.stroke) ?? parseColor(cs.color)
+  const fillColor = cs.fill === 'none' ? null : (parseColor(cs.fill) ?? parseColor(cs.color))
+  // RAW (un-scaled) stroke-width, in the svg's own viewBox/user-unit space —
+  // see types.ts's `svg` DrawOp doc comment for why paint.ts wants it this way.
+  const strokeWidthPx = parsePx(cs.strokeWidth)
+
+  const stroke =
+    strokeColor && strokeColor.a > 0 && strokeWidthPx > 0
+      ? { ...strokeColor, a: strokeColor.a * opacityMul }
+      : undefined
+  const fill = fillColor && fillColor.a > 0 ? { ...fillColor, a: fillColor.a * opacityMul } : undefined
+  if (!stroke && !fill) return
+
+  ops.push({
+    kind: 'svg',
+    xPx: box.xPx,
+    yPx: box.yPx,
+    wPx: box.wPx,
+    hPx: box.hPx,
+    d: dParts.join(' '),
+    viewBox: [vbX, vbY, vbW, vbH],
+    stroke,
+    fill,
+    strokeWidthPx,
+  })
+}
+
+/**
+ * Walk the rendered print DOM and produce an ordered draw list. Document
+ * order matters: later ops paint on top, exactly like CSS paints backgrounds
+ * before the text that sits on them.
+ */
+export function buildDrawList(root: HTMLElement, opts?: { clickableLinks?: boolean }): DrawOp[] {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => {
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        const el = n as Element
+        // `el.className` is an `SVGAnimatedString` (not a plain string) on
+        // SVG elements, so the old `className.toString()` regex silently
+        // never matched `no-print` there — `classList` works uniformly for
+        // both HTML and SVG elements.
+        if (el.classList.contains('no-print')) return NodeFilter.FILTER_REJECT
+        // Inline SVG shape children (path/line/circle/...) are consumed
+        // directly off the <svg> root by svgIconOps below — never walked as
+        // separate elements. `ownerSVGElement` is set on every DESCENDANT of
+        // an <svg> and null on the <svg> root itself, so this rejects
+        // exactly (and only) the subtree svgIconOps already owns.
+        if ((el as SVGElement).ownerSVGElement) return NodeFilter.FILTER_REJECT
+        const cs = getComputedStyle(el as HTMLElement)
+        if (cs.display === 'none' || cs.visibility === 'hidden') return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+
+  const ops: DrawOp[] = []
+  // Elements whose ::after is still pending. CSS paints ::after AFTER all of
+  // an element's normal-flow children, but this flat pre-order walk visits
+  // the element itself before any of them (defect 3 — the walker used to
+  // paint ::before AND ::after back-to-back right there, so ::after landed
+  // BEFORE every child, the wrong side of CSS's own stacking order). Every
+  // element is pushed here when first visited and stays "open" until a later
+  // node turns out NOT to be its descendant (`Node.contains`, which reflects
+  // the real DOM regardless of what the walker's own filter skipped), at
+  // which point every open ancestor the walk has now exited gets its
+  // ::after flushed, innermost (most recently opened) first — exactly the
+  // order CSS closes nested elements in.
+  const openForAfter: HTMLElement[] = []
+  // Ink from the RUNNING layer (the page foot and whatever else a design
+  // draws on every page, Artboard's `data-running`) is tagged as it is
+  // emitted: paint.ts repeats it on every page instead of giving it to one.
+  const tagRunning = (from: number, el: Element | null | undefined) => {
+    if (!el?.closest?.('[data-running]')) return
+    for (let i = from; i < ops.length; i++) ops[i].running = true
+  }
+  const closeUpTo = (n: Node | null) => {
+    while (openForAfter.length && !(n && openForAfter[openForAfter.length - 1].contains(n))) {
+      const el = openForAfter.pop()!
+      const from = ops.length
+      pseudoOps(el, root, ops, '::after')
+      tagRunning(from, el)
+    }
+  }
+
+  // Paint the ROOT's own box (background + borders, plus its own ::before —
+  // rm-root never puts generated content directly on itself, so this is a
+  // no-op in practice, kept only for parity with every other element's
+  // treatment) FIRST, explicitly — dark templates set the page color via
+  // `background: var(--rm-bg)` on `.rm-root` itself (artboard.css), and an
+  // inner column container then covers most, but not necessarily all, of the
+  // page, so root's own fill has to land before any descendant, exactly like
+  // every other element's own box paints before its children's.
+  //
+  // This is deliberately NOT left to fall out implicitly of starting the walk
+  // from `walker.currentNode` (which happens to equal `root` immediately
+  // after `document.createTreeWalker(root, ...)`, per the DOM spec's own
+  // createTreeWalker steps — `current` is set to `root` UNCONDITIONALLY,
+  // bypassing `acceptNode` entirely). Relying on that spec quirk silently
+  // is a trap for the next reader: the more obviously-idiomatic
+  // `for (let n = walker.nextNode(); n; ...)` looks equivalent and reads
+  // cleaner, but would silently drop root's own background again. boxOf
+  // measures every element relative to `root`'s own rect, so root's own box
+  // falls out as exactly (0,0,rootW,rootH) here too — see walk.test.ts.
+  boxOps(root, root, ops)
+  pseudoOps(root, root, ops, '::before')
+  markerOps(root, root, ops)
+  openForAfter.push(root)
+
+  for (let n: Node | null = walker.nextNode(); n; n = walker.nextNode()) {
+    closeUpTo(n)
+    const opsBefore = ops.length
+    if (n.nodeType === Node.ELEMENT_NODE) {
+      const el = n as HTMLElement
+      if (el.tagName === 'svg') {
+        // DECORATIVE vector icon — see svgIconOps's doc comment. Not
+        // descended into for text/box processing (its shape children were
+        // already rejected by the walker above) and no ::before/::after
+        // handling: no template CSS puts generated content on an <svg>.
+        svgIconOps(el, root, ops)
+      } else {
+        boxOps(el, root, ops)
+        pseudoOps(el, root, ops, '::before')
+        markerOps(el, root, ops)
+        openForAfter.push(el)
+      }
+    } else if (n.nodeType === Node.TEXT_NODE) {
+      // Same-line adjacent-run touching/gap prevention used to live here,
+      // estimated with canvas.measureText as a proxy for our EMBEDDED font's
+      // width (task 10a, defect 5). That estimate turned out to drift in
+      // BOTH directions depending on the specific string (confirmed while
+      // diagnosing task 10c's "Languages :" TEXT_MISMATCH: for one string
+      // canvas underestimated our font's width enough to risk overlap, for
+      // an adjacent one on the same line it overestimated enough to leave a
+      // gap pdf.js's word-boundary heuristic read as a real space), so an
+      // estimate with a safety margin can't get every case right no matter
+      // how the margin is tuned. paint.ts now does this exactly, using the
+      // ACTUAL embedded pdf-lib font's widthOfTextAtSize — the very metric
+      // pdf.js itself measures against — which needs the font object this
+      // module doesn't have. See paint.ts's paintOps.
+      // Structure role for the tagged-PDF tree: derived from the DOM the
+      // run came from, so a heading is whatever the template renders as one
+      // (tagging.ts). Decorative runs are artifacts a reader skips.
+      const role = roleForElement((n as Text).parentElement, root)
+      // Pairing key for the link-text/annotation merge in structure.ts
+      // (0008): the normalized URL of the anchor this text belongs to.
+      // Computed only when the role is Link — roleForElement already
+      // verified the anchor has a real target, so this re-derives it.
+      const linkUrl = role === 'Link' ? linkUrlForElement((n as Text).parentElement, root) ?? undefined : undefined
+      const column: 'main' | 'aside' = (n as Text).parentElement?.closest('.rm-col-aside') ? 'aside' : 'main'
+      const blockId = logicalBlockId((n as Text).parentElement, root)
+      // `aria-hidden` is the document saying this text is decoration, not
+      // content. PDF says the same thing with an Artifact, and an artifact's
+      // glyphs are painted as outlines instead of extractable text. Without
+      // this the entry badge - a single letter echoing the employer's initial
+      // - was extracted in front of the job title, so an ATS read the position
+      // as "T Data Analyst" rather than "Data Analyst".
+      const decorative = isAriaHidden((n as Text).parentElement, root)
+      // The ROW this text was laid out in, so paint.ts can tell two pieces of
+      // one visual line from two pieces that merely sit at the same height in
+      // different columns. See `lineBoxId`.
+      const box = lineBoxId((n as Text).parentElement, root)
+      // A running page number: paint.ts writes its words afresh on every
+      // page (pageWords.ts), so it carries the author's number style with it.
+      const pageEl = (n as Text).parentElement?.closest?.('[data-run-page]') as HTMLElement | null | undefined
+      const runPage = pageEl
+        ? {
+            style: pageEl.dataset.runPage ?? '',
+            ...(pageEl.dataset.runAnchor === 'left' ? { anchor: 'left' as const } : {}),
+            upper: getComputedStyle(pageEl).textTransform === 'uppercase',
+          }
+        : undefined
+      for (const run of extractRuns(n as Text, root)) {
+        const r = decorative ? { ...run, isDecorative: true, lineBoxId: box } : { ...run, lineBoxId: box }
+        ops.push({
+          kind: 'text',
+          run: r,
+          role: r.isDecorative ? 'Artifact' : role,
+          column,
+          blockId,
+          linkUrl: r.isDecorative ? undefined : linkUrl,
+          ...(runPage ? { runPage } : {}),
+        })
+      }
+    }
+    tagRunning(opsBefore, n.nodeType === Node.ELEMENT_NODE ? (n as Element) : (n as Text).parentElement)
+  }
+  closeUpTo(null)
+  tagPageChromeOps(ops, boxOf(root, root).hPx)
+  // Two-column layouts: put the main column's text ahead of the sidebar's in
+  // the TEXT LAYER, which is what an ATS reads (readingOrder.ts). Purely a
+  // reordering of text ops — no glyph moves, and single-column documents get
+  // the identical array back.
+  // Rejoin runs that a print-DOM span split apart, BEFORE the column
+  // reorder - contiguity is a property of paint order (coalesce.ts).
+  // Link annotations are collected in their own pass: a PDF link is not ink,
+  // it is a rectangle carrying a URI action, and its geometry comes from the
+  // anchor's own line boxes rather than from anything the glyph walk saw.
+  // The author can print the address without making it live (metadata.links
+  // .clickable) - a paper submission has no use for a clickable rectangle.
+  if (opts?.clickableLinks !== false) ops.push(...collectLinkOps(root))
+  return mainColumnTextFirst(coalesceTextOps(ops))
+}
+
+/**
+ * Post-pass (native-multipage-pdf plan, task 2): marks every background
+ * `rect` op that spans >= 96% of the document's own total content height as
+ * `pageChrome` — the root's own full-height background (always exactly
+ * 100%, so it always qualifies) plus any other background rect that reads as
+ * a full-column band rather than page-specific content (e.g. a two-column
+ * template's dark sidebar fill). See types.ts's `DrawOpChrome.pageChrome`
+ * doc comment for what task 3's paint.ts does with the tag.
+ *
+ * Runs as a pass over the FINISHED op list rather than tagging inline at
+ * boxOps-time: boxOps only ever sees one element's own box, not the whole
+ * document's total height, and threading that through every caller (boxOps,
+ * pseudoOps, svgLogoOps) would be far more invasive than one pass at the
+ * end. A rect with no fill (a pure `fillGradient`) still counts as
+ * "background" for this heuristic — gradients repeat as chrome too (spec
+ * section 2: "gradients/borders on chrome rects repeat with the rect").
+ */
+function tagPageChromeOps(ops: DrawOp[], contentHeightPx: number): void {
+  if (!(contentHeightPx > 0)) return // guards NaN/0/negative — never tag against a degenerate height
+  const threshold = contentHeightPx * 0.96
+  for (const op of ops) {
+    if (op.kind === 'rect' && (op.fill || op.fillGradient) && op.hPx >= threshold) {
+      op.pageChrome = true
+    }
+  }
+}
+
+/* ------------------------------------------------------- extractPageBlocks */
+
+/**
+ * DOM-derived `PageBlock[]` for the native-multipage-pdf plan's pagination
+ * engine (paginate.ts — READ ITS JSDoc first, its shape is the binding
+ * contract this function fills in). Walks the SAME rendered résumé DOM
+ * `buildDrawList` walks (print-mode for export, the live editable canvas for
+ * the WYSIWYG preview — both share the exact `.rm-section`/`.rm-item`/
+ * `.rm-skill-group`/`.rm-mini`/`.rm-chips` class vocabulary sections.tsx and
+ * Artboard.tsx render), producing ONE FLAT, top-to-bottom-ordered sequence of
+ * blocks: `'section-gap'`/`'entry-gap'` blocks are the ACTUAL empty region
+ * between two sections/entries (their own span IS the gap); `'line'` blocks
+ * are real text-line ink (reusing text.ts's `textNodeLineSegments` — the
+ * same per-line geometry `extractRuns` paints from); `'atomic'` blocks are
+ * indivisible non-text ink (an image, an inline `<svg>` icon, a chip row).
+ * Section titles (`.rm-section-title`) and entry title ROWS carry
+ * `keepWithNext: true` so paginate.ts's widow rule can never strand a
+ * heading alone at the bottom of a page.
+ *
+ * "Title ROW", not just "title text": `.rm-item-head` (badge/logo + title +
+ * date), `.rm-level` (a skill/language name + its rating meter), and the
+ * bare `.rm-skill-group-name`/`.rm-mini-title` spans (Interests/References,
+ * which have no wrapping row) are each collapsed to ONE block from their OWN
+ * `getBoundingClientRect()` rather than decomposed into their child text
+ * nodes. Two reasons: (1) these are `display:flex` ROWS laying out sibling
+ * elements SIDE BY SIDE on one visual line (badge, title, date) — decomposing
+ * per child would put those siblings at roughly the same y (not stacked),
+ * producing overlapping blocks, which is exactly what this module's own
+ * sanity check below flags; (2) it's also the semantically right answer for
+ * keepWithNext — the WHOLE title+date row (or name+meter row) is what must
+ * stay with the entry's first content line, not just the title text alone.
+ * `.rm-item-sub` (org + location + GPA — also a wrapping flex row, see
+ * artboard.css) gets the same single-block collapse for the SAME
+ * same-line-siblings reason, but is NOT a title (no keepWithNext).
+ *
+ * KNOWN IMPRECISION (documented, not fixed here — see the task-2 report):
+ * sibling TEXT NODES sharing one visual line via inline rich-text formatting
+ * (e.g. a bold `<strong>` run mid-sentence in a bullet) are measured
+ * independently per text node (same as extractRuns always did) and are NOT
+ * merged into one shared-line block, so they can produce partially
+ * overlapping 'line' blocks. paginate.ts tolerates this (candidates are only
+ * ever built at gap midpoints; `fallsInsideInk` defensively drops any that
+ * still land inside a block) and this module's sanity check dev-warns rather
+ * than throws, so the worst case is a slightly worse (not wrong) page break.
+ *
+ * The header (`.rm-header`) is deliberately NOT walked — paginate.ts never
+ * needs a candidate break inside it (nothing here proposes a cut in a region
+ * with no blocks at all), and section/entry gap semantics don't apply to it.
+ *
+ * TWO-COLUMN layouts (task 2b, native-multipage-pdf plan): Artboard.tsx
+ * always wraps the main column's sections in a `<main class="rm-col-main">`
+ * (single-column docs too — `.rm-col-main` alone carries no column meaning
+ * by itself), and additionally renders a sidebar `<aside class="rm-col-
+ * aside">` next to it whenever the template is configured for 2 columns AND
+ * has any aside sections at all. Its presence is exactly the two-column
+ * signal: when it exists, main's and aside's sections sit SIDE BY SIDE at
+ * overlapping y-ranges (task 2's own flat root-wide walk used to concatenate
+ * aside's blocks then main's — or vice versa — as if they were sequential,
+ * which produced a nonsensical, non-monotonic combined list the moment the
+ * second column's y-range restarted near the top; this module's own dev-only
+ * sanity check used to fire on every real two-column template as a result).
+ * Each column is walked independently, in its own local top-to-bottom order,
+ * and `combineColumns` (paginate.ts) merges them into one legal sequence
+ * where a cut candidate exists only where EVERY column is clear at that y
+ * (spec 1: "both columns cut at the same y").
+ *
+ * KEEPING ENTRIES WHOLE: a section the renderer marks `.rm-keep-entries`
+ * (the author asked for it, document-wide or for that section alone) has
+ * `keepWithNext` set on every block of each entry but its last, so no cut can
+ * land inside an entry while the gap that follows one stays the best break
+ * there is. `usablePageHeightPx` is what bounds the rule - an entry taller
+ * than a fraction of the page is left breakable (sectionKeep.ts) - so a
+ * caller that omits it gets today's breaks whatever the DOM says.
+ *
+ * Single-column docs (no `.rm-col-aside` present) skip `combineColumns`
+ * entirely rather than routing a single column through it — same walk,
+ * same result, byte-identical to task 2's own output (see the task-2b
+ * brief's explicit byte-stability requirement; `combineColumns` itself
+ * relabels 'atomic' ink as 'line' when reconstructing merged blocks, which
+ * would NOT be byte-identical for a column containing any image/svg/chip
+ * block even though it's semantically equivalent to paginate.ts).
+ */
+export function extractPageBlocks(root: HTMLElement, usablePageHeightPx?: number): PageBlock[] {
+  const rootTop = root.getBoundingClientRect().top
+  const aside = findByClass(root, ['rm-col-aside'])[0]
+
+  if (!aside) {
+    const blocks = extractBlocksFromScope(root, rootTop, usablePageHeightPx ?? 0)
+    if (import.meta.env.DEV) sanityCheckPageBlocks(blocks)
+    return blocks
+  }
+
+  const main = findByClass(root, ['rm-col-main'])[0] ?? root
+  // Only the MAIN column is held together. A sidebar section split by a break
+  // is rejoined in the reading order (readingOrder.ts); a main-column one
+  // cannot be, so not splitting it is the only remedy - see sectionKeep.ts.
+  // Whole ENTRIES are held in BOTH columns: that rule is the author's own
+  // request, and a sidebar entry torn in half reads no better than a main one.
+  const mainBlocks = keepShortSectionsWhole(
+    extractBlocksFromScope(main, rootTop, usablePageHeightPx ?? 0),
+    usablePageHeightPx ?? 0
+  )
+  const asideBlocks = extractBlocksFromScope(aside, rootTop, usablePageHeightPx ?? 0)
+  if (import.meta.env.DEV && typeof window !== 'undefined') {
+    // Diagnosis only: a stranded heading needs the PRE-combine blocks to tell
+    // a flag that combineColumns lost from one that was never set. Guarded on
+    // `window` because the unit suite runs this extractor under node.
+    ;(window as unknown as { __cvaLastColumnBlocks?: unknown }).__cvaLastColumnBlocks = {
+      main: mainBlocks.map((b) => ({ ...b })),
+      aside: asideBlocks.map((b) => ({ ...b })),
+    }
+  }
+  const combined = combineColumns([mainBlocks, asideBlocks])
+  // The footer strip sits AFTER the body, outside both columns, so neither
+  // column walk reaches it. It comes off the root once the columns are
+  // combined: its own blocks, held together (the strip is its own scope,
+  // so extractBlocksFromScope holds every section it finds), joined to the
+  // columns by the real gap before it - the one place a cut may fall
+  // between the body and the strip. Without it the page height counted
+  // the strip while the paginator could cut only inside the columns.
+  const strip = findByClass(root, KEEP_WHOLE_CLASSES)[0]
+  if (strip) {
+    const stripBlocks = extractBlocksFromScope(strip, rootTop, usablePageHeightPx ?? 0)
+    if (stripBlocks.length) {
+      const last = combined[combined.length - 1]
+      if (last) combined.push({ kind: 'section-gap', topPx: last.bottomPx, bottomPx: stripBlocks[0].topPx })
+      combined.push(...stripBlocks)
+    }
+  }
+  if (import.meta.env.DEV) sanityCheckPageBlocks(combined)
+  return combined
+}
+
+/**
+ * The MAIN column's own block list, BEFORE `combineColumns` merges it with
+ * the aside — native-multipage-pdf plan, task 5 fix round 2: the editor
+ * preview's two-column separator mapping needs to attribute a print-space
+ * cut back to ONE real section/entry so it can find that element's edit-
+ * canvas counterpart (the same section-key + entry-index scheme
+ * `pageChromeMap.ts` uses for single-column docs), which the COMBINED list
+ * alone cannot support — a combined gap can straddle two DIFFERENT columns'
+ * content, so counting its section-gap/entry-gap blocks doesn't name a
+ * single section. The main column is the correct structural anchor: every
+ * cut is a full-width line, and the main column is the one column every
+ * template always renders (the aside is optional — see Artboard.tsx).
+ *
+ * Uses the SAME `rootTop` reference `extractPageBlocks` does (relative to
+ * `root`, not to the main column's own top), so its `topPx`/`bottomPx`
+ * values live in the SAME coordinate space `paginate()`'s cuts do —
+ * `cutY` from the combined result can be compared directly against this
+ * list's blocks with no translation.
+ *
+ * Returns `null` for single-column docs (no `.rm-col-aside`) — callers
+ * should use `extractPageBlocks` directly there, since its output already
+ * IS the (single) column's own list.
+ */
+export function extractMainColumnBlocks(root: HTMLElement): PageBlock[] | null {
+  const rootTop = root.getBoundingClientRect().top
+  const aside = findByClass(root, ['rm-col-aside'])[0]
+  if (!aside) return null
+  const main = findByClass(root, ['rm-col-main'])[0] ?? root
+  // No page height, so no keep flags: this list exists to ATTRIBUTE a cut to
+  // a section, and the flags change no block's kind or extent.
+  return extractBlocksFromScope(main, rootTop)
+}
+
+/** One column's own blocks: every `.rm-section` found within `scope`, each
+ *  section's own blocks (`extractSectionBlocks`) joined by a `'section-gap'`
+ *  block measuring the real empty span between consecutive sections — the
+ *  body `extractPageBlocks` used to run directly against `root` before task
+ *  2b, unchanged for the single-column (no-aside) case. */
+function extractBlocksFromScope(scope: Element, rootTop: number, usablePageHeightPx = 0): PageBlock[] {
+  const sections = findByClass(scope, ['rm-section'])
+  // The sections a keep-whole wrapper (the footer strip) holds: the strip is
+  // one block to the paginator, so every block of it but the last is held
+  // to the next - the gaps inside it included - and a cut can fall in the
+  // gap before the strip and nowhere inside it. Height buys no exception:
+  // a strip that does not fit the page's tail moves whole to the next page.
+  const whole = new Set<Element>()
+  // The scope may BE the wrapper (the strip walked on its own, two-column
+  // pages): findByClass returns descendants only, so ask the scope itself.
+  if (hasAnyClass(scope, KEEP_WHOLE_CLASSES)) for (const s of sections) whole.add(s)
+  for (const wrap of findByClass(scope, KEEP_WHOLE_CLASSES)) {
+    for (const s of findByClass(wrap, ['rm-section'])) whole.add(s)
+  }
+
+  const blocks: PageBlock[] = []
+  let prevEnd: PageBlock | null = null
+  // The span of blocks the wrapper's sections produced, gaps between them
+  // included, never the gap before the first of them.
+  let wholeStart = -1
+  let wholeEnd = -1
+  for (const section of sections) {
+    const sectionBlocks = extractSectionBlocks(section, rootTop, usablePageHeightPx)
+    if (!sectionBlocks.length) continue
+    // Only where there is a real empty span to measure. Two sections stack in
+    // a column, so the next one's first block normally starts at or below the
+    // previous one's end - but a section that overlaps its neighbour (a
+    // decorative rule drawn past its own box, a float) would otherwise get a
+    // gap block running BACKWARDS, whose midpoint is a break candidate inside
+    // real ink. See `appendEntryBlocks` for the same rule inside a section.
+    if (prevEnd && sectionBlocks[0].topPx >= prevEnd.bottomPx) {
+      blocks.push({ kind: 'section-gap', topPx: prevEnd.bottomPx, bottomPx: sectionBlocks[0].topPx })
+    }
+    if (whole.has(section)) {
+      if (wholeStart < 0) wholeStart = blocks.length
+      wholeEnd = blocks.length + sectionBlocks.length
+    }
+    blocks.push(...sectionBlocks)
+    prevEnd = sectionBlocks[sectionBlocks.length - 1]
+  }
+  if (wholeStart >= 0) {
+    for (let i = wholeStart; i < wholeEnd - 1; i++) {
+      if (blocks[i].keepWithNext !== true) blocks[i] = { ...blocks[i], keepWithNext: true }
+    }
+  }
+  return blocks
+}
+
+/** `.rm-section-title`, and every entry's "title ROW" wrapper (or, absent a
+ *  wrapper, the bare title span itself — Interests/References) — collapsed
+ *  to ONE block from their own box and flagged `keepWithNext`. See
+ *  `extractPageBlocks`'s doc comment for why a whole ROW, not just the title
+ *  text run. */
+/**
+ * True when `el` sits under an `aria-hidden` element.
+ *
+ * The templates already mark their decoration this way - the entry badge, the
+ * monogram, rating dots and stars, section icons - so this needs no list of
+ * class names to keep in step with them.
+ */
+const ariaHiddenCache = new WeakMap<Element, boolean>()
+function isAriaHidden(from: Element | null, root: Element): boolean {
+  let el: Element | null = from
+  const seen: Element[] = []
+  let hidden = false
+  while (el) {
+    const cached = ariaHiddenCache.get(el)
+    if (cached !== undefined) {
+      hidden = cached
+      break
+    }
+    seen.push(el)
+    const v = el.getAttribute('aria-hidden')
+    if (v !== null && v !== 'false') {
+      hidden = true
+      break
+    }
+    if (el === root) break
+    el = el.parentElement
+  }
+  for (const e of seen) ariaHiddenCache.set(e, hidden)
+  return hidden
+}
+
+/** A stable id for the nearest BLOCK-level ancestor of a text node - the
+ *  paragraph, bullet or heading a reader thinks of as one unit. Every visual
+ *  line of that block shares the id, which is what lets the structure tree
+ *  group them into ONE element instead of one per line. Inline ancestors
+ *  (<strong>, <em>, a chip's span) are transparent, so a bolded run mid
+ *  sentence stays part of its paragraph. */
+const blockIds = new WeakMap<Element, number>()
+let nextBlockId = 1
+function logicalBlockId(from: Element | null, root: Element): number | undefined {
+  let el: Element | null = from
+  while (el && el !== root.parentElement) {
+    const display = getComputedStyle(el).display
+    if (display !== 'inline' && display !== 'contents') {
+      let id = blockIds.get(el)
+      if (id === undefined) {
+        id = nextBlockId++
+        blockIds.set(el, id)
+      }
+      return id
+    }
+    el = el.parentElement
+  }
+  return undefined
+}
+
+/**
+ * A stable id for the LINE BOX a text node sits in — the row the browser laid
+ * it out in, which is not the same thing as the block it belongs to.
+ *
+ * Start at the nearest block-level ancestor (inline ancestors are transparent,
+ * exactly as in `logicalBlockId`), then climb ONE more level when that
+ * ancestor is a flex or grid ITEM: a flex item does not own the row it sits
+ * on, its container does. Measured against the real DOM — an entry's title is
+ * `div.rm-item-title[block]` and its date `div.rm-item-date[block]`, both flex
+ * items of `div.rm-item-head[flex]`; a contact is `span.rm-contact[flex]`, a
+ * flex item of `div.rm-contacts[flex]`. Those are precisely the two rows that
+ * have to come out as one line.
+ *
+ * The climb is CLAMPED inside the run's own column: the id must be a strict
+ * descendant of `.rm-col-main`/`.rm-col-aside` (or of the artboard root in a
+ * layout with neither). Without that clamp a text node parented directly by a
+ * column could climb to the flex row that holds BOTH columns, and a sidebar
+ * term level with a main-column bullet would share a line box - which is the
+ * one thing paint.ts's bridging must never be allowed to merge.
+ */
+const lineBoxIds = new WeakMap<Element, number>()
+let nextLineBoxId = 1
+function lineBoxId(from: Element | null, root: Element): number | undefined {
+  if (!from) return undefined
+  const column = from.closest('.rm-col-main, .rm-col-aside') ?? root
+  let el: Element | null = from
+  while (el && el !== column && el !== root.parentElement) {
+    const display = getComputedStyle(el).display
+    if (display !== 'inline' && display !== 'contents') break
+    el = el.parentElement
+  }
+  if (!el || el === column || el === root.parentElement) return undefined
+  // Climb while the box is an item of a ROW — a flex container laid out
+  // across, or any grid. `.rm-contact` is a flex item of `.rm-contacts` and is
+  // itself a flex container the link inside it is an item of, so one step is
+  // not enough; four is past anything the templates nest.
+  for (let depth = 0; depth < 4; depth++) {
+    const parent: Element | null = el.parentElement
+    if (!parent || parent === column || !column.contains(parent)) break
+    const pcs = getComputedStyle(parent)
+    const row =
+      ((pcs.display === 'flex' || pcs.display === 'inline-flex') && !pcs.flexDirection.startsWith('column')) ||
+      pcs.display === 'grid' ||
+      pcs.display === 'inline-grid'
+    // A flex COLUMN stacks its items, so each of them is its own row - which
+    // is what `.rm-bullets` is, and why one bullet is never joined to the next.
+    if (!row) break
+    el = parent
+  }
+  let id = lineBoxIds.get(el)
+  if (id === undefined) {
+    id = nextLineBoxId++
+    lineBoxIds.set(el, id)
+  }
+  return id
+}
+
+const TITLE_ROW_CLASSES = ['rm-section-title', 'rm-item-head', 'rm-level', 'rm-skill-group-name', 'rm-mini-title']
+/** Other flex ROWS with same-line siblings that need the same single-block
+ *  collapse but are NOT a title (no keepWithNext) — see the doc comment. */
+const PLAIN_ROW_CLASSES = ['rm-item-sub']
+/** One entry wrapper per section-body child (sections.tsx's real classes —
+ *  Summary/Work/Education/Projects/Volunteer/Custom use `rm-item`, Skills
+ *  uses `rm-skill-group`, Languages/Certificates/Awards/Publications/
+ *  Interests/References use `rm-mini`). Entries never nest. */
+const ENTRY_CLASSES = ['rm-item', 'rm-skill-group', 'rm-mini']
+/** Stamped on a section whose entries must not be torn across a page break
+ *  (the author's own choice - see `extractSectionBlocks`). */
+const KEEP_ENTRIES_CLASSES = ['rm-keep-entries']
+/** Stamped on a wrapper whose sections are one block to the paginator: the
+ *  footer strip, which never breaks across pages (`extractBlocksFromScope`;
+ *  on a two-column page `extractPageBlocks` walks it after the columns). */
+const KEEP_WHOLE_CLASSES = ['rm-keep-whole']
+
+function hasAnyClass(el: Element, classes: string[]): boolean {
+  const cl = (el as HTMLElement).classList
+  return classes.some((c) => cl.contains(c))
+}
+
+/** Same print-DOM filtering `buildDrawList`'s own TreeWalker applies —
+ *  edit-canvas-only chrome (delete buttons, gears, add-entry rows — all
+ *  `no-print`) and anything laid out with zero footprint must never
+ *  contribute a block, in EITHER the offscreen print-mode DOM (export) or
+ *  the live editable canvas (preview) this function also runs against, or
+ *  the two would disagree on cut positions. */
+function isSkippedElement(el: Element): boolean {
+  if ((el as HTMLElement).classList.contains('no-print')) return true
+  const cs = getComputedStyle(el as HTMLElement)
+  return cs.display === 'none' || cs.visibility === 'hidden'
+}
+
+/** Images, inline `<svg>` icons, and chip rows are indivisible ink — never
+ *  decomposed into lines (brief: "images/svg/chips emit atomic"). */
+function isAtomicElement(el: Element): boolean {
+  if (el.tagName === 'IMG' || el.tagName === 'svg') return true
+  return (el as HTMLElement).classList.contains('rm-chips')
+}
+
+/** Depth-first search for every descendant matching one of `classes`,
+ *  document order, skipped/no-print subtrees pruned — does NOT descend past
+ *  a match (sections don't nest inside sections; entries don't nest inside
+ *  entries). Shared by section-finding and entry-finding — the two calls
+ *  just differ in which class list they pass. */
+function findByClass(root: Element, classes: string[]): Element[] {
+  const out: Element[] = []
+  const visit = (el: Element) => {
+    for (const child of Array.from(el.childNodes)) {
+      if (child.nodeType !== Node.ELEMENT_NODE) continue
+      const c = child as Element
+      if (isSkippedElement(c)) continue
+      if (hasAnyClass(c, classes)) {
+        out.push(c)
+        continue
+      }
+      visit(c)
+    }
+  }
+  visit(root)
+  return out
+}
+
+/** Pushes ONE block from `el`'s own `getBoundingClientRect()` — used for
+ *  atomic elements and for the title/plain ROW collapse (see the module doc
+ *  comment) — never for plain per-text-node line blocks, which come from
+ *  `pushTextLineBlocks` below instead. */
+function pushOwnBoxBlock(
+  el: Element,
+  rootTop: number,
+  out: PageBlock[],
+  kind: 'line' | 'atomic',
+  keepWithNext: boolean
+): void {
+  const r = el.getBoundingClientRect()
+  const topPx = r.top - rootTop
+  const bottomPx = r.bottom - rootTop
+  if (bottomPx <= topPx) return // zero/negative-height box — nothing to record
+  out.push(keepWithNext ? { kind, topPx, bottomPx, keepWithNext: true } : { kind, topPx, bottomPx })
+}
+
+/** Pushes one 'line' block per visually-wrapped line of a text node, via
+ *  text.ts's shared `textNodeLineSegments` — the exact geometry
+ *  `extractRuns` paints from. */
+/** Does this element's page carry a sidebar? Memoised per root. */
+const ASIDE_BY_ROOT = new WeakMap<Element, boolean>()
+function hasAside(el: Element): boolean {
+  const root = el.closest('.rm-root')
+  if (!root) return false
+  const cached = ASIDE_BY_ROOT.get(root)
+  if (cached !== undefined) return cached
+  const found = !!root.querySelector('.rm-col-aside')
+  ASIDE_BY_ROOT.set(root, found)
+  return found
+}
+
+function pushTextLineBlocks(node: Text, rootTop: number, out: PageBlock[]): void {
+  if (!node.data || node.data.trim() === '') return
+  const lines: PageBlock[] = []
+  for (const seg of textNodeLineSegments(node)) {
+    const topPx = seg.rect.top - rootTop
+    const bottomPx = seg.rect.bottom - rootTop
+    if (bottomPx <= topPx) continue
+    lines.push({ kind: 'line', topPx, bottomPx })
+  }
+  // A KEYWORD is never split across pages, however many lines it wraps to.
+  // Reported against a real export: page two's sidebar opened with
+  // "& Request Analytics", the tail of "Incident, Change, Problem & Request
+  // Analytics" left behind on page one. Half a term on each side of a page
+  // break is worse than a wrap - neither half is searchable, and the reader
+  // cannot tell they belong together.
+  const inKeyword = !!node.parentElement?.closest('.rm-kw')
+  const el0 = node.parentElement
+  const keepMax0 = el0 && !el0.closest('.rm-col-aside') && hasAside(el0) ? KEEP_WHOLE_MAX_LINES_TWO_COL : KEEP_WHOLE_MAX_LINES
+  const keep = inKeyword
+    ? lines.map((_, i) => i < lines.length - 1)
+    : keepFlagsForParagraph(lines.length, undefined, keepMax0)
+  lines.forEach((line, i) => {
+    if (keep[i]) line.keepWithNext = true
+    out.push(line)
+  })
+}
+
+/** Union `[topPx, bottomPx]` of every real text-line rect within `el`'s own
+ *  subtree (task 6b's geometric stretch test — see `pushRowBlock`), or
+ *  `null` when the element has no text ink at all (an image/icon-only row,
+ *  or an empty placeholder) — callers keep today's box-collapse behavior in
+ *  that case, per the brief ("elements with no text at all keep today's
+ *  behavior"). Reuses `textNodeLineSegments` (text.ts) — the exact
+ *  Range-based line geometry `pushTextLineBlocks`/`extractRuns` already
+ *  measure from, so this is the SAME notion of "a text line" pagination
+ *  already relies on elsewhere, not a new approximation. Recurses through
+ *  every descendant (skipped/no-print subtrees pruned) regardless of
+ *  atomic/title-row nesting — this only ever needs a height comparison, not
+ *  a real block list. */
+function textLineUnion(el: Element, rootTop: number): { topPx: number; bottomPx: number } | null {
+  let topPx = Infinity
+  let bottomPx = -Infinity
+  const visit = (node: Element) => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const text = child as Text
+        if (!text.data || text.data.trim() === '') continue
+        for (const seg of textNodeLineSegments(text)) {
+          const t = seg.rect.top - rootTop
+          const b = seg.rect.bottom - rootTop
+          if (b <= t) continue
+          if (t < topPx) topPx = t
+          if (b > bottomPx) bottomPx = b
+        }
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        const c = child as Element
+        if (isSkippedElement(c)) continue
+        visit(c)
+      }
+    }
+  }
+  visit(el)
+  return topPx <= bottomPx ? { topPx, bottomPx } : null
+}
+
+/** Recurses through `el`'s own child text/element nodes, collecting ink into
+ *  `out` — the ordinary (non-collapsed) half of `collectInk`, factored out so
+ *  `pushRowBlock`'s stretched-box fallback can drive the exact same walk a
+ *  plain (non-row) element already gets. */
+function collectChildInk(el: Element, rootTop: number, out: PageBlock[]): void {
+  for (const child of Array.from(el.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      pushTextLineBlocks(child as Text, rootTop, out)
+    } else if (child.nodeType === Node.ELEMENT_NODE) {
+      const c = child as Element
+      if (isSkippedElement(c)) continue
+      collectInk(c, rootTop, out)
+    }
+  }
+}
+
+/** Tallest `getBoundingClientRect()` height among `el`'s atomic descendants
+ *  (image/svg/chip row — see `isAtomicElement`), or 0 when there are none.
+ *  Task 6b fix-round-1, finding M4: `pushRowBlock`'s decomposition assumes a
+ *  stretched row's real content is explained by its TEXT alone; a row that
+ *  also holds an atomic child taller than that text (e.g. an icon beside a
+ *  short label) decomposes into an atomic ink block sitting at roughly the
+ *  same y as a much-shorter text-line block — the exact overlapping-ink
+ *  shape the row-collapse exists to prevent in the first place (confirmed
+ *  live: `atomic 100..160` then `line 100..120` tripped the blocks-overlap
+ *  dev-warn). Does not descend PAST an atomic element — same one-indivisible-
+ *  unit treatment `collectInk` itself gives it. */
+function maxAtomicHeightPx(el: Element): number {
+  let max = 0
+  const visit = (node: Element) => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType !== Node.ELEMENT_NODE) continue
+      const c = child as Element
+      if (isSkippedElement(c)) continue
+      if (isAtomicElement(c)) {
+        const r = c.getBoundingClientRect()
+        const h = r.bottom - r.top
+        if (h > max) max = h
+        continue
+      }
+      visit(c)
+    }
+  }
+  visit(el)
+  return max
+}
+
+/**
+ * ROW collapse (TITLE_ROW_CLASSES / PLAIN_ROW_CLASSES) for the COMMON case:
+ * one block from the row's own bounding box, exactly as before task 6b. But
+ * when the box height balloons far past the row's own real text-line extent
+ * — a CSS-grid-stretched gutter label cell (atelier's `section: 'side'`
+ * layout: probe `{kind:'line', top:243, h:1627, keepWithNext:true}`, a
+ * 1627px-tall "line" holding one real text line at its top) — the ballooned
+ * box is a lie about where the row's real ink is: paginate.ts reading it as
+ * one giant `line` block finds no legal gap inside it at all, producing an
+ * absurd cut or `PaginationImpossibleError` (task-6b brief, defect 1).
+ *
+ * Purely geometric (box height vs the union of the row's OWN text-line
+ * rects, `textLineUnion` — the same Range-based line segmentation this
+ * module already uses everywhere else): no template id or class name is
+ * ever consulted, so every current and future template's stretched cells
+ * benefit automatically. Thresholds (brief's own recommendation): box height
+ * must exceed 1.6x the text span AND the absolute slack must exceed 24px —
+ * either bound alone is cheap to clear from ordinary padding/line-height;
+ * both together are not, so normal rows never churn. M4 adds one more guard
+ * (`maxAtomicHeightPx`, see its own doc comment): a child atomic TALLER than
+ * the text union skips decomposition entirely, falling back to the box.
+ *
+ * `keepWithNext` (title rows only — PLAIN_ROW_CLASSES always pass `false`):
+ * fix-round-1 finding I1 — a decomposed row emits it on EVERY line, not just
+ * the last, so a cut can never land BETWEEN a wrapped title's own lines (a
+ * grid-stretched heading that ALSO wraps to two real lines by design, e.g.
+ * a narrow "side" gutter label, used to protect only its last line, leaving
+ * the gap between its own two lines as a legal — and disastrous — cut
+ * candidate). The trailing line still carries the exact same semantic role
+ * it always had: for a SECTION title (this function is never told
+ * otherwise) that is unconditional; for an ENTRY title,
+ * `dropTrailingTitleKeepWithNext` (fix 3) strips it back off downstream,
+ * once the full entry's own trailing edge is known.
+ *
+ * M3 adds a safety net: if decomposition resolves to ZERO blocks (e.g. the
+ * row's only ink is a zero-height atomic — real text existed for
+ * `textLineUnion` to find and trigger the stretch check, but
+ * `collectChildInk`'s own atomic-collapse then drops it via
+ * `pushOwnBoxBlock`'s zero-height guard), this falls back to the box rather
+ * than let the row vanish from the block list entirely — `pageChromeMap.
+ * locateStructural` relies on every section/entry contributing at least one
+ * block.
+ */
+function pushRowBlock(el: Element, rootTop: number, out: PageBlock[], keepWithNext: boolean): void {
+  const textSpan = textLineUnion(el, rootTop)
+  if (textSpan) {
+    const r = el.getBoundingClientRect()
+    const boxHeight = r.bottom - r.top
+    const textHeight = textSpan.bottomPx - textSpan.topPx
+    const stretched = boxHeight > 1.6 * textHeight && boxHeight - textHeight > 24
+    if (stretched && maxAtomicHeightPx(el) <= textHeight) {
+      const raw: PageBlock[] = []
+      collectChildInk(el, rootTop, raw)
+      const coalesced = coalesceSameLineBlocks(raw)
+      if (coalesced.length) {
+        out.push(...(keepWithNext ? coalesced.map((b) => ({ ...b, keepWithNext: true as const })) : coalesced))
+        return
+      }
+      // M3: decomposition produced nothing at all -- fall through to the
+      // plain box below instead of emitting zero blocks for this row.
+    }
+  }
+  pushOwnBoxBlock(el, rootTop, out, 'line', keepWithNext)
+}
+
+/**
+ * One atomic block per visual ROW of a wrapped chip list.
+ *
+ * Rows are read from the chips' own boxes rather than assumed: a flex list
+ * wraps where it wraps. Per ROW rather than per CHIP because chips sharing a
+ * row share a top, and as separate blocks they would OVERLAP - the tiling this
+ * feeds degrades silently on overlapping geometry rather than complaining.
+ *
+ * Falls back to the container's own box whenever the rows do not describe it
+ * cleanly - no element children, or any row overlapping the one before it -
+ * so a list this cannot read behaves exactly as it did when it was atomic.
+ */
+function pushChipRowBlocks(el: Element, rootTop: number, out: PageBlock[]): void {
+  const boxes: Array<{ top: number; bottom: number }> = []
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType !== Node.ELEMENT_NODE) continue
+    const child = node as Element
+    if (isSkippedElement(child)) continue
+    const r = child.getBoundingClientRect()
+    if (r.height <= 0) continue
+    boxes.push({ top: r.top - rootTop, bottom: r.bottom - rootTop })
+  }
+  if (!boxes.length) {
+    pushOwnBoxBlock(el, rootTop, out, 'atomic', false)
+    return
+  }
+  boxes.sort((a, b) => a.top - b.top)
+  const rows: Array<{ top: number; bottom: number }> = []
+  for (const box of boxes) {
+    const last = rows[rows.length - 1]
+    // Same row when the boxes overlap vertically at all: a taller chip must
+    // not start a row of its own.
+    if (last && box.top < last.bottom - 0.5) {
+      last.bottom = Math.max(last.bottom, box.bottom)
+      continue
+    }
+    rows.push({ top: box.top, bottom: box.bottom })
+  }
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].top < rows[i - 1].bottom - 0.01) {
+      // Rows that still overlap would corrupt the tiling; keep the old shape.
+      pushOwnBoxBlock(el, rootTop, out, 'atomic', false)
+      return
+    }
+  }
+  for (const row of rows) out.push({ kind: 'atomic', topPx: row.top, bottomPx: row.bottom })
+}
+
+/** Recursively collects every ink block ('line'/'atomic') within `el`'s own
+ *  subtree, in document order — the entry-level (and title-row-level) walk
+ *  `extractSectionBlocks` drives. Atomic elements and title/plain ROWS
+ *  collapse to one block each (see `pushRowBlock` for the ROW case's
+ *  geometric stretch exception) and are never descended into further here;
+ *  anything else recurses through its child text/element nodes. */
+function collectInk(el: Element, rootTop: number, out: PageBlock[]): void {
+  if (isAtomicElement(el)) {
+    // A wrapped chip LIST is atomic per ROW, not as a whole. One block for the
+    // entire container makes it an indivisible slab, and since a cut needs
+    // EVERY column clear at the same y, an atomic sidebar list also swallows
+    // the MAIN column's gaps for its whole height. Measured on a real resume
+    // at line-height 1.54: with chips, page one ended 32% full; with the same
+    // content as an inline list - identical text, no atomic blocks - 85%.
+    // Chips wrap into rows and a break between two rows is as ordinary as one
+    // between two lines of text.
+    if ((el as HTMLElement).classList.contains('rm-chips')) {
+      pushChipRowBlocks(el, rootTop, out)
+      return
+    }
+    pushOwnBoxBlock(el, rootTop, out, 'atomic', false)
+    return
+  }
+  if (hasAnyClass(el, TITLE_ROW_CLASSES)) {
+    pushRowBlock(el, rootTop, out, true)
+    return
+  }
+  if (hasAnyClass(el, PLAIN_ROW_CLASSES)) {
+    pushRowBlock(el, rootTop, out, false)
+    return
+  }
+  // Widow control has to see a PARAGRAPH, not the text nodes it is made of.
+  // A bullet carrying bold runs ("...cutting manual reporting effort by
+  // <b>~40%</b>...") arrives as several text nodes, each flagged on its own
+  // line count, so a four-line bullet could still be cut 2/2 - which on a
+  // two-column page put the ENTIRE sidebar between the halves in the copied
+  // text, since each page emits its main column and then its sidebar.
+  // Coalescing the paragraph's own lines first, then flagging across all of
+  // them, applies the rule to what the reader actually sees as one bullet.
+  // Widow control has to see a PARAGRAPH, not the text nodes it is made of.
+  // A bullet carrying bold runs ("...cutting manual reporting effort by
+  // <b>~40%</b>...") arrives as several text nodes, each flagged on its own
+  // line count, so a four-line bullet could still be cut 2/2 - which on a
+  // two-column page put the ENTIRE sidebar between the halves in the copied
+  // text, since each page emits its main column and then its sidebar.
+  if (el.tagName === 'P' || el.tagName === 'LI') {
+    const own: PageBlock[] = []
+    collectChildInk(el, rootTop, own)
+    const merged = coalesceSameLineBlocks(own)
+    const lineIdx: number[] = []
+    merged.forEach((b, i) => {
+      if (b.kind === 'line') lineIdx.push(i)
+    })
+    const keepMax1 = !el.closest('.rm-col-aside') && hasAside(el) ? KEEP_WHOLE_MAX_LINES_TWO_COL : KEEP_WHOLE_MAX_LINES
+    const keep = keepFlagsForParagraph(lineIdx.length, undefined, keepMax1)
+    lineIdx.forEach((bi, k) => {
+      if (keep[k]) merged[bi].keepWithNext = true
+    })
+    out.push(...merged)
+    return
+  }
+  collectChildInk(el, rootTop, out)
+}
+
+/**
+ * Fix round (native-multipage-pdf plan, task 2 — same-line sibling
+ * coalescing): sibling TEXT NODES sharing one visual line (a bold
+ * `<strong>`/`<em>` run mid-sentence, e.g. "with 8+ years building" inside a
+ * bullet) each get their own `'line'` block from `pushTextLineBlocks` — one
+ * per text node, per this module's existing per-node granularity (see
+ * text.ts's `textNodeLineSegments`). A `Range`'s bounding rect for a same-
+ * line run correctly reports that shared line box's real vertical extent, so
+ * two (or three) side-by-side runs come out with (near-)identical y-spans —
+ * correct geometry, but PageBlock is y-ONLY, so the Y-only pagination model
+ * reads that as overlapping ink. Confirmed live against the running app's
+ * canvas (task-2 review): the unmodified dev sanity-warn fired ~11 times on
+ * one ordinary long-form résumé, once per bolded line — this is not a rare
+ * edge case, it fires on every inline-formatted line.
+ *
+ * Merges ADJACENT `'line'` blocks whose vertical spans overlap or coincide
+ * (within the same 0.5px epsilon `sanityCheckPageBlocks` uses) into ONE block
+ * spanning their union. Blocks are emitted in document order by a depth-first
+ * walk, so same-line siblings are always adjacent in the array; genuinely
+ * different (stacked) lines always have real vertical separation from
+ * line-height leading, well past the epsilon, so they're never merged.
+ * `'atomic'` blocks (images/svg/chips) never participate — they're already
+ * whole units and must never absorb or be absorbed by adjacent text.
+ *
+ * Callers apply this to ONE `collectInk` call's own local output (one entry,
+ * or one title row) — never to the section's combined `blocks` array — so
+ * this can only ever merge siblings within a single flowing text block,
+ * never across entries or sections (those are joined by explicit
+ * `'entry-gap'`/`'section-gap'` blocks afterward, which this never touches).
+ */
+export /** Do these two boxes sit on the SAME visual line? True when they overlap
+ *  vertically by more than half the shorter box - the same test the line-level
+ *  gate uses to fold drawn segments into lines. */
+function sharesLine(a: PageBlock, b: PageBlock): boolean {
+  const overlap = Math.min(a.bottomPx, b.bottomPx) - Math.max(a.topPx, b.topPx)
+  if (overlap <= 0) return false
+  const shorter = Math.min(a.bottomPx - a.topPx, b.bottomPx - b.topPx)
+  return shorter > 0 && overlap > shorter * 0.5
+}
+
+export function coalesceSameLineBlocks(blocks: PageBlock[]): PageBlock[] {
+  const EPS = 0.5
+  const out: PageBlock[] = []
+  for (const b of blocks) {
+    const prev = out[out.length - 1]
+    // Sharing a line means the two boxes genuinely OVERLAP. Stacked lines
+    // TOUCH - a wrapped line's top is the previous line's bottom - and
+    // treating that as sharing a line merged whole paragraphs into one
+    // indivisible block. A cut needs every column clear at the same y, so one
+    // column's merged paragraph then deleted every break the OTHER column
+    // offered for its whole height: measured on a real two-column resume, the
+    // sidebar's skill groups became single blocks up to 194px, the document
+    // had 4 legal breaks in total, and page one ended 14% full with the break
+    // falling right after the header.
+    //
+    // Overlap alone is not enough to tell them apart, either. At a TIGHT
+    // line-height the leading is smaller than the font's natural line box, so
+    // consecutive lines genuinely overlap by a few px - measured at
+    // line-height 1.1, ~5px of a 19px box - and a plain overlap test merges
+    // them again. So the test is PROPORTIONAL: two boxes share a line when
+    // they overlap by more than half the shorter one, which is true for a
+    // label beside its value and false for stacked lines at any leading.
+    if (prev && prev.kind === 'line' && b.kind === 'line' && sharesLine(prev, b)) {
+      out[out.length - 1] = {
+        kind: 'line',
+        topPx: Math.min(prev.topPx, b.topPx),
+        bottomPx: Math.max(prev.bottomPx, b.bottomPx),
+        ...(prev.keepWithNext || b.keepWithNext ? { keepWithNext: true as const } : {}),
+      }
+      continue
+    }
+    out.push(b)
+  }
+  return out
+}
+
+/**
+ * Joins one entry's blocks to whatever the section has already emitted, and
+ * returns the section's new trailing block.
+ *
+ * The ordinary joint is an `'entry-gap'` block measuring the real empty span
+ * between the two - the title row and the first entry, or two consecutive
+ * entries.
+ *
+ * A section that lays its TITLE BESIDE its content has no such span to
+ * measure. `layout.headingPlacement: 'side'` (and the gutter-label section
+ * styles) make the section a grid whose title and body are cells of one ROW,
+ * so the title's box and the entry's first row cover the SAME rows of the
+ * page. Measuring a gap between them ran from the title's BOTTOM back UP to
+ * the entry's TOP: a negative span, out of order, sitting over ink that the
+ * following block also claims. `paginate` validates nothing it is handed
+ * (see `sanityCheckPageBlocks`) - it built a break candidate at that span's
+ * midpoint, and whether `fallsInsideInk` then threw the candidate away came
+ * down to sub-pixel geometry, which the export's own sheet and the preview's
+ * measure portal settle separately. That is a page cut that can differ
+ * between the two, which the whole module exists to prevent.
+ *
+ * So when the two runs OVERLAP they are joined rather than spaced: the whole
+ * overlapping RUN becomes ONE block spanning all of it - the same answer
+ * `coalesceSameLineBlocks` already gives same-line siblings - and the
+ * heading's `keepWithNext` survives the join, so a cut still cannot fall
+ * between a title and the content it labels.
+ *
+ * The RUN, not just the last-emitted/first-incoming pair. A gutter label
+ * wraps by design (the section CSS breaks long words for exactly that, and a
+ * ~160px column is narrow enough to need it), so the title arrives as two
+ * stacked lines whose SECOND one starts level with the body's first line -
+ * two boxes overlapping by exactly 0, which "shares a line" refuses, leaving
+ * the list out of order. And an entry can open with an ATOMIC block (a chip
+ * row, an image) rather than a line. So the join walks both ways from the
+ * joint: already-emitted trailing ink that reaches past the incoming block's
+ * top is absorbed, then any further incoming block the merged span still
+ * covers, whatever kind either side is. Atomic wins the union - a chip row
+ * stays indivisible - and `keepWithNext` is OR-ed.
+ *
+ * One `'entry-gap'` is emitted either way, because it is more than a break
+ * candidate: `pageChromeMap.locateStructural` names the entry a cut falls in
+ * by COUNTING gap blocks, so an entry with no gap of its own makes every
+ * later entry answer one entry too early - the canvas would open its page
+ * gap above the wrong entry while the export cut where it always did. A join
+ * has no empty span to measure, so that marker is ZERO-HEIGHT, sitting at
+ * the merged block's bottom. It adds no illegal cut: `buildCandidates` skips
+ * a gap whose predecessor is `keepWithNext`, which the merged block carries
+ * whenever the title did (a section title always does), and where it does
+ * not, the candidate y is the boundary between two adjacent ink blocks that
+ * `buildCandidates` would have offered anyway - only the tier changes, from
+ * 'line' to 'entry-gap'.
+ */
+function appendEntryBlocks(blocks: PageBlock[], entryBlocks: PageBlock[], prevEnd: PageBlock | null): PageBlock {
+  const EPS = 0.5 // sub-pixel float noise - the tolerance the sanity check uses
+  const first = entryBlocks[0]
+  if (!prevEnd || first.topPx >= prevEnd.bottomPx) {
+    if (prevEnd) blocks.push({ kind: 'entry-gap', topPx: prevEnd.bottomPx, bottomPx: first.topPx })
+    blocks.push(...entryBlocks)
+    return entryBlocks[entryBlocks.length - 1]
+  }
+
+  let merged: PageBlock = { ...first }
+  const absorb = (b: PageBlock): PageBlock => ({
+    kind: merged.kind === 'atomic' || b.kind === 'atomic' ? 'atomic' : 'line',
+    topPx: Math.min(merged.topPx, b.topPx),
+    bottomPx: Math.max(merged.bottomPx, b.bottomPx),
+    ...(merged.keepWithNext || b.keepWithNext ? { keepWithNext: true as const } : {}),
+  })
+  // Backwards: every trailing ink block still hanging over the incoming
+  // one's top. A gap block ends the walk - rewriting past one would reorder
+  // the list this exists to keep in order.
+  while (blocks.length) {
+    const tail = blocks[blocks.length - 1]
+    if (tail.kind !== 'line' && tail.kind !== 'atomic') break
+    if (tail.bottomPx <= merged.topPx + EPS) break
+    merged = absorb(tail)
+    blocks.pop()
+  }
+  // Forwards: every further block of this entry the merged span now covers.
+  let i = 1
+  while (i < entryBlocks.length && entryBlocks[i].topPx < merged.bottomPx - EPS) {
+    merged = absorb(entryBlocks[i])
+    i++
+  }
+
+  blocks.push(merged)
+  blocks.push({ kind: 'entry-gap', topPx: merged.bottomPx, bottomPx: merged.bottomPx })
+  const rest = entryBlocks.slice(i)
+  blocks.push(...rest)
+  // Never the marker itself: the NEXT entry measures its own gap from the
+  // last real ink, so its (real) gap block follows this zero-height one
+  // rather than starting inside it, and each entry still counts exactly one.
+  return rest.length ? rest[rest.length - 1] : merged
+}
+
+/** One section's own blocks: its title row, then each entry with an
+ *  `'entry-gap'` block (the measured empty span) between consecutive ones —
+ *  including between the title row and the first entry, so paginate.ts's
+ *  widow rule (which only inspects `keepWithNext` on the block immediately
+ *  BEFORE a gap) has a gap candidate to reject there too. Each `collectInk`
+ *  call's own output is coalesced (see `coalesceSameLineBlocks`) before it's
+ *  ever appended to the section-wide `blocks` list. */
+function extractSectionBlocks(section: Element, rootTop: number, usablePageHeightPx = 0): PageBlock[] {
+  const blocks: PageBlock[] = []
+  let prevEnd: PageBlock | null = null
+  // The renderer stamps this class on a section whose entries the author
+  // wants whole (Artboard.tsx, from page.keepEntriesWhole and the section's
+  // own keepTogether), so the export and the live preview read one policy off
+  // the same DOM instead of each deriving it from metadata on its own.
+  const keepEntries = hasAnyClass(section, KEEP_ENTRIES_CLASSES)
+
+  const titles = findByClass(section, ['rm-section-title'])
+  if (titles.length) {
+    const rawTitleBlocks: PageBlock[] = []
+    collectInk(titles[0], rootTop, rawTitleBlocks)
+    const titleBlocks = coalesceSameLineBlocks(rawTitleBlocks)
+    blocks.push(...titleBlocks)
+    prevEnd = titleBlocks[titleBlocks.length - 1] ?? prevEnd
+  }
+
+  const entries = findByClass(section, ENTRY_CLASSES)
+  for (const entry of entries) {
+    const rawEntryBlocks: PageBlock[] = []
+    collectInk(entry, rootTop, rawEntryBlocks)
+    const collapsed = dropTrailingTitleKeepWithNext(coalesceSameLineBlocks(rawEntryBlocks))
+    const entryBlocks = keepEntries ? keepEntryWhole(collapsed, usablePageHeightPx) : collapsed
+    if (!entryBlocks.length) continue
+    prevEnd = appendEntryBlocks(blocks, entryBlocks, prevEnd)
+  }
+
+  return blocks
+}
+
+/**
+ * Fix round (task 6b, fix 3): an ENTRY title row (rm-item-head/rm-level/
+ * rm-skill-group-name/rm-mini-title, collapsed by `pushRowBlock`) always
+ * pushed its own block with `keepWithNext: true`, on the theory that a cut
+ * must never separate a title from the entry's first body line. That theory
+ * only holds when the entry actually HAS a body line below its title — a
+ * single-line entry (a bare certification/award/language/interest row,
+ * which IS its own title row and nothing else) has no such line to protect,
+ * so the flag instead banned the ENTRY-GAP that follows it, chaining every
+ * consecutive single-line entry into one unbreakable `keepWithNext` run
+ * (live repro, task-6b fix-3 brief: verdant -> sienna template-switch merge,
+ * a rich long doc, autoFit off — the languages/certifications/awards/
+ * interests tail, ~2840-3089px, became one solid chain with zero legal cut
+ * candidates near the ideal third-page boundary, and `renderResumePdf`
+ * threw `PdfMultiPageUnsupportedError` for a document that paginates fine
+ * once the flag is scoped correctly).
+ *
+ * An entry has exactly one title row (the four TITLE_ROW_CLASSES entry
+ * variants are mutually exclusive within one entry), always first in
+ * document order, so `keepWithNext: true` can only ever land on the LAST
+ * block of `entryBlocks` when nothing else in the entry follows it — that is
+ * precisely the "single-line entry" case. SECTION title rows never pass
+ * through this function (handled separately above, left untouched): the ban
+ * between a section heading and its first entry is genuine widow protection
+ * no matter how long that first entry turns out to be.
+ */
+function dropTrailingTitleKeepWithNext(entryBlocks: PageBlock[]): PageBlock[] {
+  if (!entryBlocks.length) return entryBlocks
+  const last = entryBlocks[entryBlocks.length - 1]
+  if (!last.keepWithNext) return entryBlocks
+  return [...entryBlocks.slice(0, -1), { kind: last.kind, topPx: last.topPx, bottomPx: last.bottomPx }]
+}
+
+/**
+ * Cheap dev-only guard (native-multipage-pdf plan, task 2 brief): paginate.ts
+ * does NO runtime validation of the block list it's given — malformed
+ * geometry (overlaps, negative heights, out-of-order blocks) degrades
+ * silently rather than throwing — so this extractor is on the hook for
+ * emitting a clean, sorted, non-overlapping tiling itself. Dev-warns rather
+ * than throws: a violation here means a WORSE page break somewhere (see this
+ * module's own "KNOWN IMPRECISION" doc comment above for the two documented
+ * sources — same-line title/plain ROWS are already handled, inline rich-text
+ * runs are not), not a broken export — a hard failure would take down the
+ * whole multi-page path over what's usually a fidelity nit.
+ */
+function sanityCheckPageBlocks(blocks: PageBlock[]): void {
+  const EPS = 0.5 // sub-pixel float noise tolerance
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i]
+    if (b.bottomPx < b.topPx) {
+      console.warn('[pdf] extractPageBlocks: block has a negative height', b)
+    }
+    if (i > 0 && blocks[i - 1].topPx > b.topPx + EPS) {
+      console.warn('[pdf] extractPageBlocks: blocks are not sorted by topPx', blocks[i - 1], b)
+    }
+    if (i > 0 && blocks[i - 1].bottomPx > b.topPx + EPS) {
+      console.warn('[pdf] extractPageBlocks: blocks overlap', blocks[i - 1], b)
+    }
+  }
+}

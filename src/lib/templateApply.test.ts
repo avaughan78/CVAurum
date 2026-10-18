@@ -1,0 +1,427 @@
+import { describe, expect, it } from 'vitest'
+import { applyTemplateToMetadata } from './templateApply'
+import { MetadataSchema } from '@/types/metadata'
+import type { TemplateDefaults } from '@/types/template'
+import { createDocument } from '@/data/defaults'
+import { getTemplate } from '@/templates/registry'
+
+/** A template's defaults, shaped exactly like a registry entry's. */
+const defaultsFor = (template: string, columns: 1 | 2): TemplateDefaults => {
+  const m = MetadataSchema.parse({ template, layout: { columns, aside: columns === 2 ? ['skills'] : [] } })
+  return { template, theme: m.theme, typography: m.typography, layout: m.layout }
+}
+
+describe('applyTemplateToMetadata keeps the link settings', () => {
+  // The rebuild went through defaultMetadata(), whose overrides had no `links`
+  // slot, so every template switch quietly put the link display, the
+  // clickable switch, the underline and the link style back on defaults.
+  it('carries display, clickable, underline and style across a switch', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      links: { display: 'full', clickable: false, underline: true, style: 'plain' },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.template).toBe('sapphire')
+    expect(next.links).toEqual({ display: 'full', clickable: false, underline: true, style: 'plain' })
+  })
+
+  it('a document on defaults stays on defaults', () => {
+    const cur = MetadataSchema.parse({})
+    const next = applyTemplateToMetadata(cur, defaultsFor('aurum', 1))
+    expect(next.links).toEqual(cur.links)
+  })
+})
+
+describe('applyTemplateToMetadata keeps the date settings', () => {
+  // How dates read is the author's choice, like the link settings: a switch
+  // adopts the template's look but must not put a hand-set month style,
+  // separator, present word, expected/pursuing word or language back on the
+  // default.
+  it('carries the whole dates block across a switch', () => {
+    const dates = { month: 'long', separator: 'to', present: 'Current', language: 'fr' } as const
+    const cur = MetadataSchema.parse({ template: 'modern', dates })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.dates).toEqual({ ...dates, expected: 'Expected', pursuing: 'Pursuing' })
+  })
+})
+
+describe('applyTemplateToMetadata keeps the bullet geometry', () => {
+  // The indent and the gap are the author's, like the marker style: a
+  // template switch adopts the new fonts and sizes but must not put a
+  // hand-set bullet indent back on the default.
+  it('carries bulletIndent, bulletGap and bulletSize across a switch', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      typography: { bulletIndent: 1.6, bulletGap: 0.45, bulletSize: 1.4 },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.typography.bulletIndent).toBe(1.6)
+    expect(next.typography.bulletGap).toBe(0.45)
+    expect(next.typography.bulletSize).toBe(1.4)
+  })
+})
+
+describe('applyTemplateToMetadata keeps the element colours', () => {
+  // A switch adopts the template's theme - its accent, text and muted colours -
+  // but a colour the author set on the name, the headline, the section
+  // titles, the contacts or the links is theirs and stays. One a template
+  // ships applies only where the author decided nothing.
+  const chosen = { name: '#112233', headline: '#445566', headings: '#778899', contacts: '#aabbcc', links: '#0a0b0c' }
+
+  it('carries all five across a switch', () => {
+    const cur = MetadataSchema.parse({ template: 'modern', theme: chosen })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.theme).toMatchObject(chosen)
+    expect(next.theme.primary).toBe(defaultsFor('sapphire', 2).theme.primary)
+  })
+
+  it("an undecided colour takes the template's own, a decided one does not", () => {
+    const d = defaultsFor('aurum', 1)
+    const shipped = { ...d, theme: { ...d.theme, headings: '#123456', name: '#654321' } }
+    const cur = MetadataSchema.parse({ template: 'modern', theme: { name: '#112233' } })
+    const next = applyTemplateToMetadata(cur, shipped)
+    expect(next.theme.headings).toBe('#123456')
+    expect(next.theme.name).toBe('#112233')
+    expect(next.theme.links).toBeUndefined()
+  })
+
+  it('a colour the previous template shipped stays with that template', () => {
+    // Schematic ships its own navy heading colour. Carried into Punch as
+    // though the author had chosen it, it set the section titles in navy on
+    // Punch's black bars, where they all but vanished.
+    const schematic = getTemplate('schematic').defaults
+    const onSchematic = applyTemplateToMetadata(MetadataSchema.parse({ template: 'modern' }), schematic)
+    expect(onSchematic.theme.headings).toBe(schematic.theme.headings)
+    const onPunch = applyTemplateToMetadata(onSchematic, getTemplate('punch').defaults)
+    expect(onPunch.theme.headings).toBe(getTemplate('punch').defaults.theme.headings)
+    // ...while one the author changed is theirs, even on the way out
+    const own = { ...onSchematic, theme: { ...onSchematic.theme, headings: '#778899' } }
+    expect(applyTemplateToMetadata(own, getTemplate('punch').defaults).theme.headings).toBe('#778899')
+  })
+})
+
+describe('applyTemplateToMetadata keeps the type scale, heading case and weights', () => {
+  // A template ships its own fonts and sizes, but how much larger the section
+  // titles, the headline and the contacts sit, and whether headings are set
+  // in small caps or the name in a light weight, are the author's - a switch
+  // used to put every one of them back on the default.
+  it('carries all six across a switch', () => {
+    const chosen = {
+      sectionTitleScale: 1.3,
+      headlineScale: 1.0,
+      contactScale: 0.85,
+      headingCase: 'smallcaps',
+      nameWeight: 'light',
+      headingWeight: 'regular',
+    } as const
+    const cur = MetadataSchema.parse({ template: 'modern', typography: chosen })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.typography).toMatchObject(chosen)
+  })
+
+  it('an undecided case or weight stays undecided', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    const next = applyTemplateToMetadata(cur, defaultsFor('aurum', 1))
+    expect(next.typography.headingCase).toBeUndefined()
+    expect(next.typography.nameWeight).toBeUndefined()
+    expect(next.typography.headingWeight).toBeUndefined()
+  })
+})
+
+describe('applyTemplateToMetadata keeps the heading spacing and rule width', () => {
+  // The air under a heading and the weight of its rule are the author's,
+  // like the bullet geometry: a switch must not put them back on the default,
+  // and an undecided rule width stays undecided.
+  it('carries headingGap and headingRuleWidth across a switch', () => {
+    const cur = MetadataSchema.parse({ template: 'modern', typography: { headingGap: 1.4, headingRuleWidth: 2 } })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.typography.headingGap).toBe(1.4)
+    expect(next.typography.headingRuleWidth).toBe(2)
+  })
+
+  it('an undecided rule width stays undecided', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    expect(applyTemplateToMetadata(cur, defaultsFor('aurum', 1)).typography.headingRuleWidth).toBeUndefined()
+  })
+})
+
+describe('applyTemplateToMetadata keeps the document-wide heading style', () => {
+  // An author who set every section title to a filled block meant the
+  // résumé, not the design they happened to be on - the same way the heading
+  // case and the weights are theirs across a switch.
+  it('carries the style across a switch', () => {
+    const cur = MetadataSchema.parse({ template: 'modern', typography: { headingStyle: 'boxed' } })
+    expect(applyTemplateToMetadata(cur, defaultsFor('sapphire', 2)).typography.headingStyle).toBe('boxed')
+  })
+
+  it('an undecided style stays undecided, so the new template draws its own', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    expect(applyTemplateToMetadata(cur, defaultsFor('aurum', 1)).typography.headingStyle).toBeUndefined()
+  })
+
+  it('a section that chose for itself still keeps its own choice across the switch', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      typography: { headingStyle: 'boxed' },
+      layout: { sectionSettings: { work: { headingStyle: 'bar' } } },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.typography.headingStyle).toBe('boxed')
+    expect(next.layout.sectionSettings.work.headingStyle).toBe('bar')
+  })
+})
+
+describe('applyTemplateToMetadata keeps the entry order and emphasis', () => {
+  // Which field leads an entry and which is bold are per-section choices of
+  // the author, carried with the rest of the section settings: a switch
+  // adopts the template's look and leaves them where they were.
+  it('carries both across a switch, per section', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      layout: { sectionSettings: { work: { entryOrder: 'org-first', entryEmphasis: 'org' }, education: { entryEmphasis: 'org' } } },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.layout.sectionSettings.work).toEqual({ entryOrder: 'org-first', entryEmphasis: 'org' })
+    expect(next.layout.sectionSettings.education).toEqual({ entryEmphasis: 'org' })
+  })
+
+  it('an undecided pair stays undecided', () => {
+    const cur = MetadataSchema.parse({ template: 'modern', layout: { sectionSettings: { work: { showDates: false } } } })
+    const next = applyTemplateToMetadata(cur, defaultsFor('aurum', 1))
+    expect(next.layout.sectionSettings.work.entryOrder).toBeUndefined()
+    expect(next.layout.sectionSettings.work.entryEmphasis).toBeUndefined()
+  })
+})
+
+describe('applyTemplateToMetadata keeps the location placement and the date side', () => {
+  // Both are per-section choices of the author, carried with the rest of the
+  // section settings: a switch adopts the template's look and leaves them.
+  it('carries both across a switch, per section', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      layout: { sectionSettings: { work: { locationPlacement: 'with-date', dateAlign: 'left' }, education: { dateAlign: 'left' } } },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.layout.sectionSettings.work).toEqual({ locationPlacement: 'with-date', dateAlign: 'left' })
+    expect(next.layout.sectionSettings.education).toEqual({ dateAlign: 'left' })
+  })
+
+  it('an undecided pair stays undecided', () => {
+    const cur = MetadataSchema.parse({ template: 'modern', layout: { sectionSettings: { work: { showDates: false } } } })
+    const next = applyTemplateToMetadata(cur, defaultsFor('aurum', 1))
+    expect(next.layout.sectionSettings.work.locationPlacement).toBeUndefined()
+    expect(next.layout.sectionSettings.work.dateAlign).toBeUndefined()
+  })
+})
+
+describe('applyTemplateToMetadata keeps the whole-entry page-break policy', () => {
+  // How the document breaks pages is the author's, not the template's: the
+  // page block rides across whole, and the per-section override rides with
+  // the rest of the section settings.
+  it('carries the document switch and the per-section override across a switch', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      page: { keepEntriesWhole: true },
+      layout: { sectionSettings: { work: { keepTogether: false }, education: { keepTogether: true } } },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.page.keepEntriesWhole).toBe(true)
+    expect(next.layout.sectionSettings.work.keepTogether).toBe(false)
+    expect(next.layout.sectionSettings.education.keepTogether).toBe(true)
+  })
+
+  it('a document that never decided still breaks pages as it always did', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    const next = applyTemplateToMetadata(cur, defaultsFor('aurum', 1))
+    expect(next.page.keepEntriesWhole).toBe(false)
+  })
+})
+
+describe('applyTemplateToMetadata keeps the signature layout choices', () => {
+  // The structural axes the author chose stay when the template changes,
+  // like the column split and the header composition do.
+  it('keeps the signature layout choices across a template switch', () => {
+    const doc = createDocument({ sample: true })
+    doc.metadata.layout.metaColumn = 'margin'
+    doc.metadata.layout.headingPlacement = 'side'
+    doc.metadata.layout.sectionFrame = 'tile'
+    doc.metadata.layout.footer = ['languages']
+    doc.metadata.layout.stats = true
+    doc.metadata.layout.sectionNumbers = true
+    doc.metadata.layout.sectionNumberStyle = 'roman'
+    doc.metadata.theme.artBand = 'emerald'
+    const next = applyTemplateToMetadata(doc.metadata, getTemplate('clarity').defaults)
+    expect(next.layout.metaColumn).toBe('margin')
+    expect(next.layout.headingPlacement).toBe('side')
+    expect(next.layout.sectionFrame).toBe('tile')
+    expect(next.layout.footer).toEqual(['languages'])
+    expect(next.layout.stats).toBe(true)
+    expect(next.layout.sectionNumbers).toBe(true)
+    expect(next.theme.artBand).toBe('emerald')
+  })
+
+  // Whether to number at all is the template's to offer; what the numeral
+  // LOOKS like is nobody's but the author's. No design ships a style of its
+  // own, so there is nothing for a switch to overwrite it with - it simply
+  // travels, the way the date format and the link style do.
+  it('keeps the numeral style across a template switch, in both directions', () => {
+    const cur = MetadataSchema.parse({ template: 'broadsheet', layout: { sectionNumberStyle: 'roman' } })
+    expect(applyTemplateToMetadata(cur, getTemplate('modern').defaults).layout.sectionNumberStyle).toBe('roman')
+    expect(applyTemplateToMetadata(cur, getTemplate('marquee').defaults).layout.sectionNumberStyle).toBe('roman')
+    // An author who never chose still lands on the figures every numbered
+    // design has always drawn.
+    const plain = MetadataSchema.parse({ template: 'modern' })
+    expect(applyTemplateToMetadata(plain, getTemplate('broadsheet').defaults).layout.sectionNumberStyle).toBe('padded')
+  })
+
+  it('lets a template that ships its own art band light it up when the author chose none', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    const defaults = defaultsFor('folio-noir', 1)
+    defaults.theme.artBand = 'navy-gold'
+    const next = applyTemplateToMetadata(cur, defaults)
+    expect(next.theme.artBand).toBe('navy-gold')
+  })
+
+  it('never lists a footer section in the body again after a switch to two columns', () => {
+    const cur = MetadataSchema.parse({
+      template: 'modern',
+      layout: { main: ['summary', 'work', 'education'], footer: ['skills'] },
+    })
+    const next = applyTemplateToMetadata(cur, defaultsFor('sapphire', 2))
+    expect(next.layout.footer).toEqual(['skills'])
+    expect(next.layout.main).not.toContain('skills')
+    expect(next.layout.aside).not.toContain('skills')
+  })
+})
+
+describe("a template's own structure lights up where the author chose none", () => {
+  // The strip, the stats band, the running numbers and a per-section style a
+  // template ships are what make a Signature template itself; picking one
+  // must show them. An author's own choice still beats the template's, the
+  // way the art band and the photo already work.
+  it('seeds the footer strip from the template and keeps its keys out of the body', () => {
+    const cur = createDocument({ sample: true }).metadata
+    expect(cur.layout.main).toContain('skills')
+    const next = applyTemplateToMetadata(cur, getTemplate('marquee').defaults)
+    expect(next.layout.footer).toEqual(['skills', 'languages'])
+    expect(next.layout.main).not.toContain('skills')
+    expect(next.layout.main).not.toContain('languages')
+  })
+
+  it('turns on the stats band and the running numbers the template ships', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    expect(applyTemplateToMetadata(cur, getTemplate('atlas').defaults).layout.stats).toBe(true)
+    expect(applyTemplateToMetadata(cur, getTemplate('broadsheet').defaults).layout.sectionNumbers).toBe(true)
+  })
+
+  it('applies a per-section style the template ships only where the author set none', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    const fresh = applyTemplateToMetadata(cur, getTemplate('atlas').defaults)
+    expect(fresh.layout.sectionSettings?.skills?.skillsStyle).toBe('rings')
+    const chosen = MetadataSchema.parse({
+      template: 'modern',
+      layout: { sectionSettings: { skills: { skillsStyle: 'chips', headingAlign: 'center' } } },
+    })
+    const kept = applyTemplateToMetadata(chosen, getTemplate('atlas').defaults)
+    expect(kept.layout.sectionSettings?.skills?.skillsStyle).toBe('chips')
+    expect(kept.layout.sectionSettings?.skills?.headingAlign).toBe('center')
+  })
+
+  it("an author's own strip beats the template's", () => {
+    const cur = createDocument({ sample: true }).metadata
+    cur.layout.footer = ['languages']
+    const next = applyTemplateToMetadata(cur, getTemplate('marquee').defaults)
+    expect(next.layout.footer).toEqual(['languages'])
+    expect(next.layout.main).toContain('skills')
+  })
+})
+
+describe('a template can apply its own structure', () => {
+  const fresh = () => createDocument({ sample: true }).metadata
+
+  it('gives a new document the template it picked, gutter and all', () => {
+    const m = applyTemplateToMetadata(fresh(), getTemplate('chronicle').defaults)
+    expect(m.layout.metaColumn).toBe('gutter')
+    const t = applyTemplateToMetadata(fresh(), getTemplate('terrace').defaults)
+    expect(t.layout.headingPlacement).toBe('side')
+    const f = applyTemplateToMetadata(fresh(), getTemplate('folio-noir').defaults)
+    expect(f.layout.metaColumn).toBe('margin')
+  })
+
+  it('does not carry one template structure into the next', () => {
+    const viaChronicle = applyTemplateToMetadata(fresh(), getTemplate('chronicle').defaults)
+    expect(viaChronicle.layout.metaColumn).toBe('gutter')
+    const thenFolio = applyTemplateToMetadata(viaChronicle, getTemplate('folio-noir').defaults)
+    expect(thenFolio.layout.metaColumn).toBe('margin')
+    const thenPlain = applyTemplateToMetadata(thenFolio, getTemplate('aurum').defaults)
+    expect(thenPlain.layout.metaColumn).toBe('none')
+    const viaAtlas = applyTemplateToMetadata(fresh(), getTemplate('atlas').defaults)
+    expect(viaAtlas.layout.stats).toBe(true)
+    expect(applyTemplateToMetadata(viaAtlas, getTemplate('aurum').defaults).layout.stats).toBe(false)
+  })
+
+  it('does not carry the poster footer strip into the next template', () => {
+    const viaMarquee = applyTemplateToMetadata(fresh(), getTemplate('marquee').defaults)
+    expect(viaMarquee.layout.footer).toEqual(['skills', 'languages'])
+    const thenSapphire = applyTemplateToMetadata(viaMarquee, getTemplate('sapphire').defaults)
+    expect(thenSapphire.layout.footer).toEqual([])
+    // the sections went back into the body, once
+    const all = [...thenSapphire.layout.main, ...thenSapphire.layout.aside]
+    expect(all.filter((k) => k === 'skills')).toHaveLength(1)
+    // a strip the author composed survives a switch
+    const authored = applyTemplateToMetadata(fresh(), getTemplate('marquee').defaults)
+    authored.layout.footer = ['languages']
+    expect(applyTemplateToMetadata(authored, getTemplate('sapphire').defaults).layout.footer).toEqual(['languages'])
+  })
+
+  it('does not carry one template art into the next, but keeps art the author chose', () => {
+    const viaNoir = applyTemplateToMetadata(fresh(), getTemplate('folio-noir').defaults)
+    expect(viaNoir.theme.artBand).toBe('navy-gold')
+    expect(applyTemplateToMetadata(viaNoir, getTemplate('chronicle').defaults).theme.artBand).toBe('none')
+    expect(applyTemplateToMetadata(viaNoir, getTemplate('aurum').defaults).theme.artBand).toBe('none')
+    const chosen = applyTemplateToMetadata(fresh(), getTemplate('aurum').defaults)
+    chosen.theme.artBand = 'cobalt'
+    expect(applyTemplateToMetadata(chosen, getTemplate('chronicle').defaults).theme.artBand).toBe('cobalt')
+    // a template that ships art still lights it up where nothing was chosen
+    expect(applyTemplateToMetadata(applyTemplateToMetadata(fresh(), getTemplate('aurum').defaults), getTemplate('folio-noir').defaults).theme.artBand).toBe('navy-gold')
+  })
+
+  it('still keeps a choice the author actually made', () => {
+    const chosen = fresh()
+    chosen.layout.metaColumn = 'margin'
+    chosen.layout.headingPlacement = 'side'
+    const m = applyTemplateToMetadata(chosen, getTemplate('aurum').defaults)
+    expect(m.layout.metaColumn).toBe('margin')
+    expect(m.layout.headingPlacement).toBe('side')
+  })
+})
+
+describe('a design that ships a bullet mark or a page foot', () => {
+  // No design stated a bullet mark before Flare and Dossier, so the mark was
+  // simply carried across every switch. It follows the same rule as the
+  // other structural choices now: the author's own mark stays, and a mark
+  // that only came with the previous design gives way to the next design's.
+  it('takes the design mark when the author never chose one', () => {
+    const cur = MetadataSchema.parse({ template: 'modern' })
+    const next = applyTemplateToMetadata(cur, getTemplate('flare').defaults)
+    expect(next.typography.bulletStyle).toBe('square')
+    expect(next.layout.pageFoot).toBe(true)
+  })
+  it('keeps a mark the author chose', () => {
+    const cur = MetadataSchema.parse({ template: 'modern', typography: { bulletStyle: 'check' } })
+    expect(applyTemplateToMetadata(cur, getTemplate('dossier').defaults).typography.bulletStyle).toBe('check')
+  })
+  it('takes a frame or a grid from the design, and leaves it behind with it', () => {
+    const onKeystone = applyTemplateToMetadata(MetadataSchema.parse({ template: 'modern' }), getTemplate('keystone').defaults)
+    expect(onKeystone.layout.pageFrame).toBe(true)
+    const onSchematic = applyTemplateToMetadata(onKeystone, getTemplate('schematic').defaults)
+    expect(onSchematic.layout.pageFrame).toBe(false)
+    expect(onSchematic.layout.pageGrid).toBe(true)
+  })
+  it('drops the previous design mark and foot on the way out', () => {
+    const onFlare = applyTemplateToMetadata(MetadataSchema.parse({ template: 'modern' }), getTemplate('flare').defaults)
+    const next = applyTemplateToMetadata(onFlare, getTemplate('modern').defaults)
+    expect(next.typography.bulletStyle).toBe(getTemplate('modern').defaults.typography.bulletStyle)
+    expect(next.layout.pageFoot).toBe(false)
+  })
+})

@@ -1,42 +1,23 @@
 import { useEffect, useState } from 'react'
 import { useStore } from 'zustand'
-import {
-  Undo2,
-  Redo2,
-  ZoomIn,
-  ZoomOut,
-  Maximize,
-  Download,
-  FileJson,
-  FileDown,
-  FileText,
-  Check,
-  Cloud,
-  ChevronDown,
-  HelpCircle,
-  ScanText,
-  Eye,
-  PencilLine,
-  Command,
-  Share2,
-  MoreVertical,
-  Moon,
-  Sun,
-} from 'lucide-react'
+import { Check, ChevronDown, ClipboardCopy, Cloud, Command, Download, Eye, FileDown, FileJson, FileText, HelpCircle, Maximize, Moon, MoreVertical, PencilLine, Redo2, ScanText, Share2, Sun, Undo2, ZoomIn, ZoomOut } from 'lucide-react'
 import type { ResumeDocument } from '@/types/document'
+import { isPhoneLayout } from '@/lib/layoutMode'
 import { useResumeStore } from '@/store/useResumeStore'
 import { useEditorStore } from '@/store/useEditorStore'
 import { useAppStore } from '@/store/useAppStore'
-import { saveDoc } from '@/lib/storage'
-import { openPrintWindow } from '@/lib/pdf'
+// Loaded on the export click: pdf-lib + fontkit are ~1.2MB the editor
+// never needs until the moment a file is actually produced.
 import { ExportDialog, type ExportFormat } from './ExportDialog'
+import { runPdfExport } from '@/lib/pdf/exportFlow'
 import { Logo } from '@/components/ui/Logo'
 import { ThemeToggle } from '@/components/ui/ThemeToggle'
 
 export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
   const setTitle = useResumeStore((s) => s.setTitle)
   const dirty = useResumeStore((s) => s.dirty)
-  const { zoom, autoFit, zoomIn, zoomOut, setAutoFit, atsView, setAtsView, previewExact, setPreviewExact } = useEditorStore()
+  const { zoom, autoFit, zoomIn, zoomOut, setAutoFit, atsView, setAtsView, previewExact, setPreviewExact, pdfExporting } =
+    useEditorStore()
 
   const past = useStore(useResumeStore.temporal, (s) => s.pastStates.length)
   const future = useStore(useResumeStore.temporal, (s) => s.futureStates.length)
@@ -54,30 +35,72 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
   const [moreOpen, setMoreOpen] = useState(false)
   const theme = useAppStore((s) => s.settings.theme)
   const updateSettings = useAppStore((s) => s.updateSettings)
+  const toast = useAppStore((s) => s.toast)
   const isDark = theme === 'dark' || (theme === 'system' && typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches)
 
   const chooseExport = (fmt: ExportFormat) => {
     setExportOpen(false)
     setExportFmt(fmt)
   }
-  // PDF is the browser's vector Save-as-PDF (crisp, selectable, identical to the
-  // preview). No in-app filename popup needed — the save dialog names it.
-  const exportPdf = async () => {
+
+  /**
+   * The résumé as running text, on the clipboard.
+   *
+   * Copying from the PDF gives a line per line of the PAGE, because that is
+   * what a page is - paste it into an application form and every sentence
+   * arrives broken. The same document reflowed into paragraphs is something
+   * this app already computes for the ATS panel, and which now matches the
+   * exported file word for word, so it is the same résumé either way.
+   *
+   * Falls back to a hidden textarea and execCommand where the async clipboard
+   * is refused: a permission prompt is not worth a copy button.
+   */
+  const copyPlainText = async () => {
     setExportOpen(false)
-    await saveDoc(useResumeStore.getState().doc ?? doc)
-    openPrintWindow(doc.id)
+    const d = useResumeStore.getState().doc ?? doc
+    const { resumeToAtsText } = await import('@/lib/atsText')
+    const text = resumeToAtsText(d)
+    try {
+      await navigator.clipboard.writeText(text)
+      toast('Résumé copied as plain text')
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.setAttribute('readonly', '')
+      ta.style.cssText = 'position:fixed;top:0;left:-9999px'
+      document.body.appendChild(ta)
+      ta.select()
+      const ok = document.execCommand('copy')
+      ta.remove()
+      toast(ok ? 'Résumé copied as plain text' : 'Could not reach the clipboard')
+    }
+  }
+  // PDF is generated in-app by the native renderer (crisp, selectable, exact -
+  // same DOM/CSS as the preview), multi-page included. It is the ONLY engine:
+  // there is no print fallback behind it, so a failure is reported as one.
+  // runPdfExport owns the in-flight guard, the visible generating state
+  // (PdfExportStatus) and the outcome toast, shared with the command palette.
+  const exportPdf = () => {
+    setExportOpen(false)
+    void runPdfExport(useResumeStore.getState().doc ?? doc)
   }
 
   return (
-    <header className="flex h-14 shrink-0 items-center gap-1.5 border-b border-border bg-surface px-2 sm:gap-3 sm:px-3">
+    // Its own stacking level, above the canvas: the Export and More menus sat
+    // at z-20 against the whole page, and the Preview banner - also z-20 and
+    // later in the page - covered "Download PDF", so a click on it went to
+    // "Back to editing" instead (usability test, 2026-09-26).
+    <header className="relative z-30 flex h-14 shrink-0 items-center gap-1.5 border-b border-border bg-surface px-2 sm:gap-3 sm:px-3">
       <Logo compact />
       <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
 
-      {/* On phones the title yields space — Export must NEVER leave the screen. */}
+      {/* The title yields space so Export never leaves the screen, but it
+          keeps a readable minimum: in a 768px bar it used to shrink to 20px,
+          a slit that could not be read or edited (2026-09-08). */}
       <input
         value={doc.title}
         onChange={(e) => setTitle(e.target.value)}
-        className="w-24 min-w-0 max-w-[20vw] rounded-md border border-transparent bg-transparent px-2 py-1 text-sm font-medium hover:border-border focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/40 sm:w-44 sm:max-w-[40vw]"
+        className="w-24 min-w-[4rem] max-w-[20vw] rounded-md border border-transparent bg-transparent px-2 py-1 text-sm font-medium hover:border-border focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring/40 sm:w-44 sm:max-w-[40vw]"
         aria-label="Resume title"
       />
 
@@ -87,8 +110,10 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
       </span>
 
       <div className="ml-auto flex items-center gap-1">
-        {/* undo / redo + zoom — hidden on phones to keep the bar uncluttered */}
-        <div className="hidden items-center gap-1 md:flex">
+        {/* undo / redo + zoom: needs a desktop layout AND a bar with room.
+            Under 768px there is none (a half-width laptop window is 683px):
+            the More menu carries undo/redo and the canvas its own zoom pill. */}
+        <div className="hidden items-center gap-1 md:desk:flex">
           <button className="btn-icon" onClick={() => undo()} disabled={past === 0} title="Undo (Ctrl+Z)">
             <Undo2 className="h-[18px] w-[18px]" />
           </button>
@@ -103,14 +128,16 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
             <button className="btn-icon h-7 w-7" onClick={zoomOut} title="Zoom out">
               <ZoomOut className="h-4 w-4" />
             </button>
-            <span className="w-12 text-center text-xs tabular-nums text-muted-foreground">
+            {/* the readout and Fit yield between md and lg so the title keeps
+                its width in a 768px bar */}
+            <span className="hidden w-12 text-center text-xs tabular-nums text-muted-foreground lg:inline">
               {autoFit ? 'Fit' : `${Math.round(zoom * 100)}%`}
             </span>
             <button className="btn-icon h-7 w-7" onClick={zoomIn} title="Zoom in">
               <ZoomIn className="h-4 w-4" />
             </button>
             <button
-              className="btn-icon h-7 w-7"
+              className="btn-icon hidden h-7 w-7 lg:flex"
               data-active={autoFit}
               onClick={() => setAutoFit(!autoFit)}
               title="Fit to width"
@@ -145,11 +172,14 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
                   setAtsView(m.key === 'ats')
                   // phones: the edit panel covers the canvas — close it to preview,
                   // and bring it back when the user returns to Edit
-                  if (window.innerWidth < 768) useEditorStore.getState().setLeftOpen(m.key === 'edit')
+                  if (isPhoneLayout()) useEditorStore.getState().setLeftOpen(m.key === 'edit')
                 }}
                 title={m.title}
               >
-                {m.icon} <span className="hidden sm:inline">{m.label}</span>
+                {/* Icon-only until lg. The three labels cost about 150px, which
+                    is what pushed Export off the right edge at tablet width;
+                    each button keeps its `title`, so it still has a name. */}
+                {m.icon} <span className="hidden lg:inline">{m.label}</span>
               </button>
             )
           })}
@@ -177,9 +207,12 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
           <Command className="h-[18px] w-[18px]" />
         </button>
 
-        {/* re-open the guided tour — in the ⋮ menu below md */}
+        {/* re-open the guided tour — in the ⋮ menu below lg. It used to appear
+            at md, which is exactly the width where the bar overflowed: the
+            extra controls arrived before there was room for them, and Export
+            was pushed 94px off the right edge. */}
         <button
-          className="btn-icon hidden md:flex"
+          className="btn-icon hidden lg:flex"
           onClick={() => window.dispatchEvent(new Event('cvaurum:open-tour'))}
           title="Show the quick tour"
           aria-label="Show the quick tour"
@@ -196,13 +229,22 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
             <>
               <div className="fixed inset-0 z-10" onClick={() => setExportOpen(false)} />
               <div className="card absolute right-0 z-20 mt-1 w-80 max-w-[calc(100vw-1.5rem)] overflow-hidden p-1.5 shadow-float">
-                <button className="btn-ghost h-auto w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left" onClick={exportPdf}>
-                  <span className="flex items-center gap-2 font-medium"><FileDown className="h-4 w-4 shrink-0 text-primary" /> Download PDF</span>
-                  <span className="pl-6 text-xs font-normal leading-snug text-muted-foreground whitespace-normal">Crisp &amp; selectable — exact, via Save&nbsp;as&nbsp;PDF</span>
+                <button
+                  className="btn-ghost h-auto w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left"
+                  onClick={exportPdf}
+                  disabled={pdfExporting}
+                  aria-busy={pdfExporting}
+                >
+                  <span className="flex items-center gap-2 font-medium"><FileDown className="h-4 w-4 shrink-0 text-primary" /> {pdfExporting ? 'Generating…' : 'Download PDF'}</span>
+                  <span className="pl-6 text-xs font-normal leading-snug text-muted-foreground whitespace-normal">Crisp, selectable, ATS-exact — generated in-app</span>
                 </button>
                 <button className="btn-ghost h-auto w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left" onClick={() => chooseExport('docx')}>
                   <span className="flex items-center gap-2 font-medium"><FileText className="h-4 w-4 shrink-0 text-primary" /> Download Word (.docx)</span>
                   <span className="pl-6 text-xs font-normal leading-snug text-muted-foreground whitespace-normal">Editable, ATS-friendly text that mirrors your template</span>
+                </button>
+                <button className="btn-ghost h-auto w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left" onClick={copyPlainText}>
+                  <span className="flex items-center gap-2 font-medium"><ClipboardCopy className="h-4 w-4 shrink-0 text-primary" /> Copy as plain text</span>
+                  <span className="pl-6 text-xs font-normal leading-snug text-muted-foreground whitespace-normal">Whole paragraphs, for pasting into an application form</span>
                 </button>
                 <button className="btn-ghost h-auto w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left" onClick={() => chooseExport('json')}>
                   <span className="flex items-center gap-2 font-medium"><FileJson className="h-4 w-4 shrink-0 text-primary" /> Export JSON Resume</span>
@@ -213,12 +255,16 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
           )}
         </div>
 
-        <div className="hidden md:block">
+        <div className="hidden lg:block">
           <ThemeToggle />
         </div>
 
-        {/* phone overflow menu — everything that left the bar stays reachable */}
-        <div className="relative md:hidden">
+        {/* overflow menu — everything that left the bar stays reachable */}
+        {/* Stays until the controls it holds reappear at lg - otherwise there
+            is a band between md and lg where they are hidden from the bar AND
+            from the menu, so the tour and the theme toggle cannot be reached
+            at all. */}
+        <div className="relative lg:hidden">
           <button className="btn-icon" onClick={() => setMoreOpen((o) => !o)} title="More" aria-label="More options" aria-expanded={moreOpen}>
             <MoreVertical className="h-[18px] w-[18px]" />
           </button>
@@ -226,20 +272,55 @@ export function EditorTopBar({ doc }: { doc: ResumeDocument }) {
             <>
               <div className="fixed inset-0 z-10" onClick={() => setMoreOpen(false)} />
               <div className="card absolute right-0 z-20 mt-1 w-56 overflow-hidden p-1.5 shadow-float">
+                {/* Undo / redo. The bar's own pair is hidden below md and a
+                    phone has no Ctrl+Z, so a mis-tapped Remove (section ⋯
+                    menu, entry trash) or a template switch could not be taken
+                    back at all. The menu stays open on these two so several
+                    steps can be undone in a row. Only below md — above it the
+                    bar already carries them. */}
+                <div className="flex items-center gap-1 md:hidden">
+                  <button
+                    className="btn-ghost flex h-10 flex-1 items-center justify-start gap-2 rounded-lg px-2.5 text-sm"
+                    onClick={() => undo()}
+                    disabled={past === 0}
+                    title="Undo"
+                  >
+                    <Undo2 className="h-4 w-4 text-primary" /> Undo
+                  </button>
+                  <button
+                    className="btn-ghost flex h-10 flex-1 items-center justify-start gap-2 rounded-lg px-2.5 text-sm"
+                    onClick={() => redo()}
+                    disabled={future === 0}
+                    title="Redo"
+                  >
+                    <Redo2 className="h-4 w-4 text-primary" /> Redo
+                  </button>
+                </div>
+                <div className="my-1 h-px bg-border md:hidden" />
+                {/* The palette is the ONLY way to reach focus mode, the skim
+                    heatmap and search-by-name for templates / fonts / accents.
+                    Its bar button starts at sm and Ctrl+K needs a keyboard, so
+                    below sm this menu item is the only door in. */}
                 <button
-                  className="btn-ghost flex h-auto w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm sm:hidden"
+                  className="btn-ghost flex h-auto min-h-[40px] w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm sm:hidden"
+                  onClick={() => { setMoreOpen(false); window.dispatchEvent(new Event('cvaurum:open-palette')) }}
+                >
+                  <Command className="h-4 w-4 text-primary" /> Find a command…
+                </button>
+                <button
+                  className="btn-ghost flex h-auto min-h-[40px] w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm sm:hidden"
                   onClick={() => { setMoreOpen(false); window.dispatchEvent(new Event('cvaurum:open-share')) }}
                 >
                   <Share2 className="h-4 w-4 text-primary" /> Share privately
                 </button>
                 <button
-                  className="btn-ghost flex h-auto w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm"
+                  className="btn-ghost flex h-auto min-h-[40px] w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm"
                   onClick={() => { setMoreOpen(false); window.dispatchEvent(new Event('cvaurum:open-tour')) }}
                 >
                   <HelpCircle className="h-4 w-4 text-primary" /> Show the quick tour
                 </button>
                 <button
-                  className="btn-ghost flex h-auto w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm"
+                  className="btn-ghost flex h-auto min-h-[40px] w-full items-center justify-start gap-2 rounded-lg px-2.5 py-2 text-sm"
                   onClick={() => { setMoreOpen(false); updateSettings({ theme: isDark ? 'light' : 'dark' }) }}
                 >
                   {isDark ? <Sun className="h-4 w-4 text-primary" /> : <Moon className="h-4 w-4 text-primary" />}

@@ -34,23 +34,36 @@
     --surface: 0 0% 100%;
     --surface-muted: 220 20% 97%;
     --muted: 220 16% 95%;
-    --muted-foreground: 220 9% 46%;
+    /* Darkened to clear WCAG AA in the light theme (2026-08-25). At 46% the
+       muted foreground scored 4.31:1 on the muted surface, and the 42% primary
+       scored 3.65:1 both as a button background under white text and as accent
+       text on white. Widening the audit to the editor's own panels found the
+       muted foreground again at 4.09:1 on the CANVAS, which is darker than the
+       muted surface, so it moves once more to 41%. All measured by
+       gate-contrast.cjs; the hues are unchanged, only the lightness. */
+    --muted-foreground: 220 9% 41%;
     --border: 220 16% 90%;
     --input: 220 16% 87%;
-    --ring: 36 68% 42%;
-    --primary: 36 68% 42%;
+    --ring: 36 68% 37%;
+    --primary: 36 68% 37%;
     --primary-foreground: 0 0% 100%;
     --accent: 189 94% 43%;
     --accent-foreground: 222 47% 11%;
-    --success: 142 64% 40%;
+    /* 40% put the ATS badge at 3.12:1 on white; 32% clears AA at 10px. */
+    --success: 142 64% 32%;
     --warning: 32 95% 44%;
     --danger: 0 72% 51%;
     --radius: 0.7rem;
     --canvas: 220 18% 90%;
+    /* The wordmark's gold. On white the brand gold (#c8941f) reads at 2.72:1,
+       below AA for 16px text, so the light theme uses a darker gold; on the
+       dark background the brand gold has plenty of contrast and is kept. */
+    --brand-gold: #9a6c10;
     color-scheme: light;
   }
 
   .dark {
+    --brand-gold: #c8941f;
     --background: 225 26% 6%;
     --foreground: 220 20% 93%;
     --surface: 224 22% 9%;
@@ -258,6 +271,29 @@
 
 /* Landing hero: shimmering gold sweep across the key word. */
 /* hero cards: a slow specular sheen sweeping across the paper */
+/* The hero's still backdrop breathes: a 40s scale drift, alternating, so the
+   stage is never frozen even before (or without) the video loop. */
+@keyframes hero-still-drift {
+  from { transform: scale(1); }
+  to { transform: scale(1.07) translate3d(-0.6%, 0.4%, 0); }
+}
+.hero-still-drift {
+  animation: hero-still-drift 40s ease-in-out infinite alternate;
+  transform-origin: 60% 40%;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-still-drift { animation: none; }
+}
+
+/* Under a dialog the stage is behind a translucent, blurred backdrop: a
+   headline still shimmering and a card sheen still sweeping read as the page
+   flickering, and both are repainted every frame for nobody. The React gate
+   stops the framer animations; these two are CSS, so they stop here. */
+.hero-covered .hero-shimmer,
+.hero-covered .hero-sheen::before {
+  animation-play-state: paused;
+}
+
 .hero-sheen {
   position: absolute;
   inset: 0;
@@ -312,6 +348,10 @@
     animation: land-rise both;
     animation-timeline: view();
     animation-range: entry 0% entry 55%;
+    /* Its own layer, so the scroll-driven opacity/transform runs on the
+       compositor instead of restyling a whole section every scroll frame -
+       measured: worst frame 250ms with five unlayered sections revealing. */
+    will-change: opacity, transform;
   }
   @keyframes land-rise {
     from { opacity: 0.12; transform: translateY(30px); }

@@ -11,13 +11,16 @@
  * Rich fields (bullets, summary) also get the same "/" quick-insert menu as
  * the panel editor — type "/" at a word start for verbs, metric templates, etc.
  */
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { FormatBar } from './FormatBar'
 import type { ResumeContent } from '@/types/document'
 import type { Metadata } from '@/types/metadata'
 import { sanitizeHtml } from '@/lib/sanitize'
 import { filterSlash, type Slash } from '@/lib/slashCommands'
 import { RichText } from './atoms'
+import { keywordChunks } from '@/lib/keywordChunks'
+import { splitPastedLines } from '@/lib/pasteLines'
 
 export type EditFn = (recipe: (c: ResumeContent) => void) => void
 /** Mutate document metadata (layout/typography/theme) from the canvas. */
@@ -36,6 +39,12 @@ interface EditableProps {
   as?: Tag
   className?: string
   placeholder?: string
+  /** Off for short tag/keyword fields (skills, tech tags, interests) — the browser's
+   *  spellchecker flags most tech terms and proper nouns, drawing a squiggly underline
+   *  under nearly every chip. On (default) everywhere else, prose benefits from it. */
+  spellCheck?: boolean
+  /** bullet fields: a paste of two or more lines becomes that many bullets (the parent inserts them) */
+  onPasteLines?: (lines: string[]) => void
 }
 
 interface SlashMenu {
@@ -73,7 +82,7 @@ function detectSlash(root: HTMLElement): Omit<SlashMenu, 'items' | 'index'> & { 
   }
 }
 
-function Editable({ value, onChange, rich, multiline, onEnter, as = 'span', className, placeholder }: EditableProps) {
+function Editable({ value, onChange, rich, multiline, onEnter, as = 'span', className, placeholder, spellCheck = true, onPasteLines }: EditableProps) {
   const ref = useRef<HTMLElement | null>(null)
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   // "/" quick-insert menu (rich fields only). Kept in a ref too so the keydown
@@ -162,6 +171,16 @@ function Editable({ value, onChange, rich, multiline, onEnter, as = 'span', clas
     // let a menu click land before the blur tears the menu down
     setTimeout(() => setMenu(null), 120)
   }
+  // A pasted list belongs in one bullet per line, not all of it in this one.
+  // The parent does the inserting; this field only reports the lines.
+  const onPaste = (e: React.ClipboardEvent) => {
+    if (!onPasteLines) return
+    const lines = splitPastedLines(e.clipboardData.getData('text/plain'))
+    if (lines.length < 2) return
+    e.preventDefault()
+    if (timer.current) clearTimeout(timer.current)
+    onPasteLines(lines)
+  }
   const onKeyDown = (e: React.KeyboardEvent) => {
     // While the "/" menu is open it owns the navigation keys.
     const m = menuRef.current
@@ -194,8 +213,10 @@ function Editable({ value, onChange, rich, multiline, onEnter, as = 'span', clas
       timer.current = setTimeout(commit, 300)
       return
     }
-    // Plain single-line fields: Enter commits & blurs.
-    if (!rich) {
+    // Single-line fields - plain or rich - commit and leave on Enter. A rich
+    // one-liner used to fall through to the browser default, which split a
+    // one-line value into two paragraphs.
+    if (!rich || !multiline) {
       e.preventDefault()
       ;(e.target as HTMLElement).blur()
     }
@@ -209,7 +230,7 @@ function Editable({ value, onChange, rich, multiline, onEnter, as = 'span', clas
         ref={ref}
         contentEditable
         suppressContentEditableWarning
-        spellCheck
+        spellCheck={spellCheck}
         role="textbox"
         tabIndex={0}
         aria-label={placeholder || 'Editable field'}
@@ -218,8 +239,16 @@ function Editable({ value, onChange, rich, multiline, onEnter, as = 'span', clas
         onInput={onInput}
         onBlur={onBlur}
         onKeyDown={onKeyDown}
+        onPaste={onPaste}
         className={`rm-editable${rich ? ' rm-rich' : ''}${className ? ' ' + className : ''}`}
       />
+      {/* Rich fields only: a plain field stores text, so formatting applied to
+          one would be dropped on the next commit. */}
+      {/* The REF, not ref.current: current is null during the first render,
+          and a component that renders only when something real changes never
+          re-runs this line - the bar depended on incidental re-renders to
+          learn its host, and died the day those stopped. */}
+      {rich && <FormatBar hostRef={ref} onCommit={scheduleCommit} />}
       {menu &&
         createPortal(
           <div
@@ -260,6 +289,9 @@ export function Ed({
   as,
   className,
   placeholder,
+  spellCheck,
+  chunk,
+  onPasteLines,
 }: {
   edit?: EditFn
   value: string
@@ -270,9 +302,36 @@ export function Ed({
   as?: Tag
   className?: string
   placeholder?: string
+  spellCheck?: boolean
+  /** Render the value in break-safe pieces when not editing (keywordChunks). */
+  chunk?: boolean
+  /** bullet fields: a paste of two or more lines becomes that many bullets */
+  onPasteLines?: (lines: string[]) => void
 }) {
   if (!edit) {
     if (rich) return <RichText html={value} className={className} />
+    // `chunk` splits the value where a line may break, so a lone connector
+    // never holds a line by itself - "BI, Reporting & Visualisation" wrapped
+    // with "&" alone in a narrow sidebar. Only outside edit mode: the editable
+    // branch is a contenteditable and must stay one plain text node.
+    if (chunk && value) {
+      const pieces = keywordChunks(value, '')
+      const inner = pieces.map((piece, i) => (
+        <Fragment key={i}>
+          {i > 0 ? ' ' : null}
+          {piece.includes(' ') ? <span className="rm-kw-tail">{piece}</span> : piece}
+        </Fragment>
+      ))
+      return className ? <span className={className}>{inner}</span> : <>{inner}</>
+    }
+    // The tag the field asked for, as the editable branch renders it. A span
+    // in its place turned two block fields into two inline runs with nothing
+    // between them: a reference printed "Priya MenonEngineering Director" in
+    // the preview and the PDF while the canvas showed two lines.
+    if (as) {
+      const T = as
+      return <T className={className}>{value}</T>
+    }
     return className ? <span className={className}>{value}</span> : <>{value || ''}</>
   }
   return (
@@ -284,7 +343,45 @@ export function Ed({
       multiline={multiline}
       onEnter={onEnter}
       placeholder={placeholder}
+      spellCheck={spellCheck}
+      onPasteLines={onPasteLines}
       onChange={(v) => edit((c) => apply(c, v))}
+    />
+  )
+}
+
+/**
+ * `Ed` for words that live in the document's settings rather than its
+ * content - a section heading's name (layout.headings) - so they are typed
+ * into on the page like every other word. Plain text only; out of edit mode
+ * it renders the value as the given tag, exactly as `Ed` does.
+ */
+export function EdMeta({
+  editMeta,
+  value,
+  apply,
+  as,
+  className,
+  placeholder,
+}: {
+  editMeta?: MetaEditFn
+  value: string
+  apply: (m: Metadata, v: string) => void
+  as?: Tag
+  className?: string
+  placeholder?: string
+}) {
+  if (!editMeta) {
+    const T = as ?? 'span'
+    return <T className={className}>{value}</T>
+  }
+  return (
+    <Editable
+      as={as}
+      className={className}
+      value={value}
+      placeholder={placeholder}
+      onChange={(v) => editMeta((m) => apply(m, v))}
     />
   )
 }

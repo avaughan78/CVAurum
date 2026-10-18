@@ -15,45 +15,203 @@ import {
   AlignmentType,
   BorderStyle,
   Document,
+  ExternalHyperlink,
   ImageRun,
   Packer,
   Paragraph,
   ShadingType,
   Table,
   TableCell,
-  TableLayoutType,
   TableRow,
   TabStopType,
   TextRun,
-  VerticalAlign,
   WidthType,
-  type IBorderOptions,
   type IParagraphOptions,
   type ParagraphChild,
 } from 'docx'
 import type { ResumeDocument } from '@/types/document'
+import type { Metadata, Typography } from '@/types/metadata'
 import { resolveOrder, sectionLabel } from '@/lib/sections'
+import { withoutSeeded } from '@/data/defaults'
 import { sanitizeHtml } from '@/lib/sanitize'
-import { downloadBlob, formatDate, formatDateRange, htmlToText, resumeFilename } from '@/lib/utils'
-import { prettyUrl, cleanEmail } from '@/templates/_shared/atoms'
+import { entryMetaOf, entryOrderOf, keepEntriesOn, linkStyleOf, LOCATION_DATE_SEPARATOR } from '@/templates/_shared/sectionClasses'
+import {
+  currentYearMonth,
+  downloadBlob,
+  entryDateOptions,
+  formatDate,
+  formatDateRange,
+  htmlToText,
+  resumeFilename,
+  safeHref,
+  sectionDateOptions,
+} from '@/lib/utils'
+import { prettyUrl, cleanEmail, linkWords } from '@/templates/_shared/atoms'
+import { artBandSrc } from '@/templates/_shared/headerStyles'
+import { getTemplate } from '@/templates/registry'
+import { lighten, readableOn } from '@/lib/elementColors'
+import { headingCase, STOCK_SCALE, type HeadingCase } from '@/lib/typeStyle'
 
 /* ----------------------------------------------------------------- helpers */
 
 const TWIP = {
   a4: { w: 11906, h: 16838 },
   letter: { w: 12240, h: 15840 },
-  margin: 1080, // 0.75 inch
 }
-const BASE_SIZE = { name: 46, headline: 24, section: 21, title: 21, body: 20, sub: 18, date: 18 }
-// Per-export font sizes (half-points). Reassigned at the top of every export so
-// the .docx can shrink by the same one-page fit the live preview/PDF uses —
-// otherwise a resume the PDF squeezes onto one page spills onto a 2nd Word page.
-// Safe as module state: exports run one at a time and build synchronously.
-let SIZE = BASE_SIZE
+const TWIPS_PER_MM = 1440 / 25.4
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
+
+/** Run sizes in half-points, one per role a line can play. */
+export interface DocxSizes {
+  name: number
+  headline: number
+  section: number
+  title: number
+  body: number
+  sub: number
+  contact: number
+  date: number
+}
+
+/** What the page's own settings become in Word's units. */
+export interface DocxMetrics {
+  /** page margin in twips (page.margin is millimetres) */
+  margin: number
+  /** paragraph line spacing, in 240ths of a single line */
+  line: number
+  sizes: DocxSizes
+  /** the run printed between two inline contacts */
+  separator: string
+  /** how far a bullet paragraph is set in, in twips (typography.bulletIndent is em) */
+  bulletIndent: number
+  /** space after a bullet paragraph, in twips (typography.bulletGap is em) */
+  bulletGap: number
+  /** space after a section heading, in twips (typography.headingGap multiplies the 80 the export always left) */
+  headingGap: number
+  /** the rule under a section heading, in eighths of a point (a pixel is six; unset keeps the six it always drew) */
+  headingRule: number
+}
+
+// Word's single spacing already spans the font's own line box - about 1.22em
+// for the usual body faces - while the canvas line-height is a bare multiple
+// of the type size. Dividing that out keeps the Word leading where the page
+// has it: the export's long-standing 252 is exactly 240 * 1.28 / 1.22.
+const WORD_LINE_EM = 1.22
+
+// The 80 twips this export always left under a section heading, and the
+// border unit of the format: eighths of a point, so a CSS pixel (0.75pt)
+// is six of them.
+const HEADING_AFTER = 80
+const RULE_PER_PX = 6
+
+// The glyph the canvas draws between inline contacts (Artboard.tsx useVars),
+// padded the way the page spaces it. 'none' is spacing alone, never a bullet.
+const CONTACT_SEPARATOR: Record<string, string> = {
+  none: '    ',
+  dot: '   ·   ',
+  pipe: '   |   ',
+  slash: '   /   ',
+  dash: '   –   ',
+  node: '   •   ',
+}
+
+// Half-point sizes from the base size, with the ratios the canvas applies: the
+// name at fs * (1.55 + headingScale * 0.62), section titles, the headline and
+// the contacts at their own scales (1.06, 1.15 and 0.95 stock), entry titles
+// at 1.05, sub-lines at 0.95, dates at 0.92 (Artboard.tsx useVars and
+// artboard.css).
+type ScaleTypography = Pick<Typography, 'headingScale' | 'sectionTitleScale' | 'headlineScale' | 'contactScale'>
+function sizesFor(fontSizePt: number, t: ScaleTypography): DocxSizes {
+  const hp = (ratio: number) => Math.round(fontSizePt * ratio * 2)
+  return {
+    name: hp(1.55 + clamp(t.headingScale, 1, 2.6) * 0.62),
+    headline: hp(t.headlineScale),
+    section: hp(t.sectionTitleScale),
+    title: hp(1.05),
+    body: hp(1),
+    sub: hp(0.95),
+    contact: hp(t.contactScale),
+    date: hp(0.92),
+  }
+}
+
+/**
+ * The document's page margin, base size, line height and contact separator in
+ * Word's units. The export used to hard-code 0.75in margins, a 10pt scale,
+ * 1.05 leading and a bullet between contacts, so a resume set 20mm wide at
+ * 11pt with pipes between its details came out of Word looking like a
+ * different document.
+ *
+ * `fitScale` is the live one-page fit. It scales type only, clamped to the
+ * same floor the on-screen fit uses (never unreadable), so the .docx lands on
+ * the same page count as the PDF - otherwise a resume the PDF squeezes onto
+ * one page spills onto a second Word page.
+ */
+export function docxMetrics(metadata: Metadata, fitScale = 1): DocxMetrics {
+  const scale = clamp(fitScale || 1, 0.66, 1.15)
+  const t = metadata.typography
+  // An em on the page is the scaled base size, so the bullet geometry
+  // follows the fit the way the type does. 20 twips to the point.
+  const em = t.fontSize * scale * 20
+  return {
+    margin: Math.round(metadata.page.margin * TWIPS_PER_MM),
+    line: Math.round((240 * t.lineHeight) / WORD_LINE_EM),
+    sizes: sizesFor(t.fontSize * scale, t),
+    separator: CONTACT_SEPARATOR[metadata.layout.contactSeparator ?? 'none'] ?? CONTACT_SEPARATOR.none,
+    bulletIndent: Math.round(t.bulletIndent * em),
+    bulletGap: Math.round(t.bulletGap * em),
+    headingGap: Math.round(HEADING_AFTER * t.headingGap),
+    headingRule: (t.headingRuleWidth ?? 1) * RULE_PER_PX,
+  }
+}
+
+// Per-export font sizes (half-points). Reassigned at the top of every export
+// from the document's own base size and one-page fit. Safe as module state:
+// exports run one at a time and build synchronously.
+let SIZE: DocxSizes = sizesFor(9.6, {
+  headingScale: 1.5,
+  sectionTitleScale: STOCK_SCALE.sectionTitle,
+  headlineScale: STOCK_SCALE.headline,
+  contactScale: STOCK_SCALE.contact,
+})
+// Per-export bullet geometry (twips), reassigned the same way.
+let BULLET = { indent: 202, gap: 38 }
+// Per-export heading rhythm - the space after a heading (twips) and the
+// width of its rule (eighths of a point) - reassigned the same way.
+let HEADING = { after: HEADING_AFTER, rule: RULE_PER_PX }
+// Whether the section being built puts the date ahead of the title
+// (sectionSettings.dateAlign). Reassigned at the top of every section, like
+// the sizes above: every entry builder feeds the one titleDate, so the
+// alternative is an eighth positional argument on all of them.
+let DATE_LEFT = false
+// The column a left-placed date hands the title, in twips, measured from the
+// widest date the section prints and reassigned with DATE_LEFT. A fixed
+// column was an inch wide whatever the date said: a long month name or a
+// bigger base size ran past the single tab stop, Word fell back to its own
+// default grid, and the titles of one section landed at different offsets
+// down the page.
+const DATE_COL_MIN = 1500
+const DATE_COL_MAX = 4320
+// The air between the date and the title it hands the line to.
+const DATE_COL_GAP = 140
+let DATE_COL = DATE_COL_MIN
+
+/**
+ * How wide a column the longest of these strings needs, in twips. Word does
+ * its own measuring and this export cannot ask it, so estimate the way type
+ * behaves: a proportional face averages about half its point size per
+ * character. The date prints at SIZE.date half-points, so a string of n
+ * characters wants n * (SIZE.date / 2) * 0.5 * 20 twips - that is n * SIZE.date
+ * * 5 - plus the gap. Floored so a short date still clears the title and
+ * capped so a long one cannot eat the page.
+ */
+function dateColumnFor(strings: Array<string | undefined>): number {
+  const longest = strings.reduce((n, s) => Math.max(n, (s || '').length), 0)
+  const need = Math.round(longest * SIZE.date * 5) + DATE_COL_GAP
+  return Math.min(DATE_COL_MAX, Math.max(DATE_COL_MIN, need))
+}
 
 const has = (s?: string) => !!s && htmlToText(s).length > 0
-const NONE: IBorderOptions = { style: BorderStyle.NONE, size: 0, color: 'auto' }
-const NO_BORDERS = { top: NONE, bottom: NONE, left: NONE, right: NONE, insideHorizontal: NONE, insideVertical: NONE }
 
 /** Color context for one column (main vs shaded sidebar). */
 interface Ctx {
@@ -61,32 +219,61 @@ interface Ctx {
   body: string // item text
   muted: string // sub-lines, dates
   headFont: string
-  upper: boolean
+  /** how section titles are cased; unset prints them as typed */
+  headingCase: HeadingCase | undefined
+  /** the name and the section titles in bold (the export's stock weight) */
+  nameBold: boolean
+  headingBold: boolean
   prof: string // proficiency meter style
   bullet: string // bullet marker style
+  /** The five element colours: each the author's own, or the colour this
+   *  export always printed that element in (elementColors.ts). */
+  name: string
+  headline: string
+  heading: string // section titles and their rule
+  contact: string
+  link: string
+  /** A linked contact stays on the contact line's colour when one is set,
+   *  as it does on the page; otherwise the accent, never the link colour. */
+  contactLink: string
 }
 
 function toHex(c: string | undefined, fallback: string): string {
   if (!c) return fallback
   let s = c.trim().replace(/^#/, '')
-  if (/^[0-9a-fA-F]{3}$/.test(s)) s = s.split('').map((x) => x + x).join('')
+  if (/^[0-9a-fA-F]{3}$/.test(s))
+    s = s
+      .split('')
+      .map((x) => x + x)
+      .join('')
   return /^[0-9a-fA-F]{6}$/.test(s) ? s.toUpperCase() : fallback
 }
 
 /** Mix a hex color toward another (0..1) — used to dim sidebar muted text. */
-function mix(hex: string, toward: string, t: number): string {
-  const p = (h: string) => [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16))
-  const a = p(hex)
-  const b = p(toward)
-  return a.map((v, i) => Math.round(v + (b[i] - v) * t).toString(16).padStart(2, '0')).join('').toUpperCase()
-}
+/** Whether this export writes live hyperlinks. Set per export, like SIZE.
+ *  The PDF has always honoured the author's clickable switch - annotations
+ *  are skipped, ink unchanged - and the Word file ignored it, so choosing
+ *  "not clickable" produced a dead-text PDF and a fully live .docx. */
+let LINKS_LIVE = true
+/** The author's link colour for links inside rich text, set per export like
+ *  LINKS_LIVE; unset, an inline link keeps the colour of the text around it,
+ *  as this export always printed it. */
+let LINK_COLOR: string | undefined
+/** Whether the PROSE of this export is set to both edges (typography.align),
+ *  set per export like LINKS_LIVE. Only running text takes it, the same four
+ *  places the page justifies: the summary, an entry's summary, a project
+ *  description and the bullets. Headings and lead lines keep their own. */
+let JUSTIFY = false
+/** The alignment a prose paragraph carries, or nothing at all - so a document
+ *  that never chose writes exactly the paragraph properties it always did. */
+const proseAlign = (): IParagraphOptions => (JUSTIFY ? { alignment: AlignmentType.BOTH } : {})
 
-function inlineRuns(node: Node, color: string, bold = false, italics = false): TextRun[] {
-  const runs: TextRun[] = []
+function inlineRuns(node: Node, color: string, bold = false, italics = false, size: number = SIZE.body): ParagraphChild[] {
+  const runs: ParagraphChild[] = []
   node.childNodes.forEach((child) => {
     if (child.nodeType === 3) {
       const t = child.textContent ?? ''
-      if (t) runs.push(new TextRun({ text: t, bold, italics, color, size: SIZE.body }))
+      if (t) runs.push(new TextRun({ text: t, bold, italics, color, size }))
       return
     }
     if (child.nodeType !== 1) return
@@ -96,17 +283,27 @@ function inlineRuns(node: Node, color: string, bold = false, italics = false): T
       runs.push(new TextRun({ text: '', break: 1 }))
       return
     }
-    runs.push(...inlineRuns(el, color, bold || tag === 'strong' || tag === 'b', italics || tag === 'em' || tag === 'i'))
+    // An inline link made on the canvas is a real hyperlink here too - it
+    // used to flatten to its words alone, so the Word copy lost the address.
+    if (tag === 'a') {
+      const href = LINKS_LIVE ? safeHref(el.getAttribute('href') || '') : undefined
+      const inner = inlineRuns(el, LINK_COLOR ?? color, bold, italics, size)
+      if (href && inner.length) {
+        runs.push(new ExternalHyperlink({ children: inner, link: href }))
+        return
+      }
+    }
+    runs.push(...inlineRuns(el, color, bold || tag === 'strong' || tag === 'b', italics || tag === 'em' || tag === 'i', size))
   })
   return runs
 }
-function richToRuns(html: string, color: string): TextRun[] {
+function richToRuns(html: string, color: string, size: number = SIZE.body): ParagraphChild[] {
   const tmp = document.createElement('div')
   tmp.innerHTML = sanitizeHtml(html)
-  const runs = inlineRuns(tmp, color)
-  return runs.length ? runs : [new TextRun({ text: htmlToText(html), color, size: SIZE.body })]
+  const runs = inlineRuns(tmp, color, false, false, size)
+  return runs.length ? runs : [new TextRun({ text: htmlToText(html), color, size })]
 }
-function richToBlocks(html: string, color: string): TextRun[][] {
+function richToBlocks(html: string, color: string): ParagraphChild[][] {
   const tmp = document.createElement('div')
   tmp.innerHTML = sanitizeHtml(html)
   const blockTags = new Set(['P', 'DIV', 'UL', 'OL', 'LI'])
@@ -115,7 +312,7 @@ function richToBlocks(html: string, color: string): TextRun[][] {
     const runs = inlineRuns(tmp, color)
     return runs.length ? [runs] : []
   }
-  const blocks: TextRun[][] = []
+  const blocks: ParagraphChild[][] = []
   const collect = (el: Element) => {
     if (el.tagName === 'UL' || el.tagName === 'OL') Array.from(el.children).forEach(collect)
     else {
@@ -139,25 +336,151 @@ function meterRuns(rating: number, style: string, filled: string, empty: string)
 
 /* ------------------------------------------------------- paragraph builders */
 
-const heading = (label: string, C: Ctx) =>
+const heading = (label: string, C: Ctx, align?: 'left' | 'center') =>
   new Paragraph({
-    spacing: { before: 200, after: 80 },
-    border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: C.accent, space: 3 } },
-    children: [new TextRun({ text: C.upper ? label.toUpperCase() : label, bold: true, color: C.accent, size: SIZE.section, font: C.headFont })],
+    // A centred section centres its heading, as the page does; the air under
+    // it and the weight of its rule are the document's (HEADING).
+    ...(align === 'center' ? { alignment: AlignmentType.CENTER } : {}),
+    spacing: { before: 200, after: HEADING.after },
+    // The rule under a title is drawn in the title's colour, as the page's
+    // currentColor border is.
+    border: { bottom: { style: BorderStyle.SINGLE, size: HEADING.rule, color: C.heading, space: 3 } },
+    children: [
+      // Case is decoration, never text: upper rewrites the run the way the
+      // page's text-transform does, small caps is a run property Word draws
+      // itself, and the words stay as typed for any reader of the file.
+      new TextRun({
+        text: C.headingCase === 'upper' ? label.toUpperCase() : label,
+        ...(C.headingBold ? { bold: true } : {}),
+        ...(C.headingCase === 'smallcaps' ? { smallCaps: true } : {}),
+        color: C.heading,
+        size: SIZE.section,
+        font: C.headFont,
+      }),
+    ],
   })
-const titleDate = (title: string, date: string | undefined, C: Ctx, width: number, opts: IParagraphOptions = {}) => {
-  const kids: ParagraphChild[] = [new TextRun({ text: title, bold: true, color: C.body, size: SIZE.title })]
-  if (date) kids.push(new TextRun({ text: `\t${date}`, color: C.muted, size: SIZE.date }))
-  return new Paragraph({ spacing: { before: 110, after: 8 }, tabStops: date ? [{ type: TabStopType.RIGHT, position: width }] : undefined, children: kids, ...opts })
+// The lead line of an entry, bold unless the section stresses the line
+// under it instead (entryEmphasis): then this one prints plain and the
+// sub-line takes the bold, as the page swaps the two weights.
+const titleDate = (
+  title: string,
+  date: string | undefined,
+  C: Ctx,
+  width: number,
+  opts: IParagraphOptions = {},
+  url?: string,
+  bold = true
+) => {
+  const titleRun = new TextRun({ text: title, ...(bold ? { bold: true } : {}), color: C.body, size: SIZE.title })
+  // A linked title is a hyperlink here for the same reason it is one in the
+  // PDF: the page made its own title the link, so the Word copy does too.
+  const href = url && LINKS_LIVE ? safeHref(url) : undefined
+  const titleChild: ParagraphChild = href ? new ExternalHyperlink({ children: [titleRun], link: href }) : titleRun
+  // The date takes the side the section gives it (dateAlign): the right edge
+  // on a right tab, as this export always set it, or its own column ahead of
+  // the title on a left one, which is where the page puts it.
+  const dateFirst = DATE_LEFT && !!date
+  const kids: ParagraphChild[] = dateFirst
+    ? [new TextRun({ text: `${date}\t`, color: C.muted, size: SIZE.date }), titleChild]
+    : [titleChild, ...(date ? [new TextRun({ text: `\t${date}`, color: C.muted, size: SIZE.date })] : [])]
+  return new Paragraph({
+    spacing: { before: 110, after: 8 },
+    tabStops: date
+      ? [dateFirst ? { type: TabStopType.LEFT, position: DATE_COL } : { type: TabStopType.RIGHT, position: width }]
+      : undefined,
+    // A hanging indent the width of the column, so a title that wraps keeps
+    // its second line in the title column instead of falling back under the
+    // date - which is what the page's flex row does with it.
+    ...(dateFirst ? { indent: { left: DATE_COL, hanging: DATE_COL } } : {}),
+    children: kids,
+    ...opts,
+  })
 }
-const sub = (s: string, C: Ctx) => new Paragraph({ spacing: { after: 16 }, children: [new TextRun({ text: s, italics: true, color: C.muted, size: SIZE.sub })] })
-const para = (runs: TextRun[]) => new Paragraph({ spacing: { after: 36 }, children: runs })
+/**
+ * A link, the way the page prints it: the author's own words, and a real
+ * hyperlink behind them when there is an address.
+ *
+ * The Word file used to print URLs as coloured text that nothing could click,
+ * and it ignored the display name entirely - a site named Portfolio came out
+ * as myportfolio.com/work, and a project's further links and a credential's
+ * Verify were not there at all.
+ */
+const linkRun = (
+  url: string | undefined,
+  words: string,
+  C: Ctx,
+  size: number = SIZE.sub,
+  color: string = C.link
+): ParagraphChild => {
+  const run = new TextRun({ text: words, color, size, underline: {} })
+  // With links off the words keep their look and lose only the liveness -
+  // the same deal the PDF gives them.
+  const href = LINKS_LIVE ? safeHref(url) : undefined
+  return href ? new ExternalHyperlink({ children: [run], link: href }) : run
+}
+
+/** The short Verify a credential line ends with, when it has one. */
+const verifyPara = (url: string | undefined, urlLabel: string | undefined, C: Ctx): Paragraph[] => {
+  const words = (urlLabel || '').trim()
+  if (!words || !safeHref(url)) return []
+  return [new Paragraph({ spacing: { after: 16 }, children: [linkRun(url, words, C)] })]
+}
+
+/**
+ * What "keep entries whole" (page.keepEntriesWhole, or a section's own
+ * keepTogether) can say in Word.
+ *
+ * Word holds paragraphs together one link at a time - keepNext binds a
+ * paragraph to the one BELOW it, and there is no "hold this group" - so a
+ * whole entry could only be held by flagging every paragraph in it, and the
+ * flag on its last line would bind it to the NEXT entry and chain a section
+ * into one unbreakable block. So the flag goes where the split shows: an
+ * entry's head lines hold the body under them, and a page break can never
+ * leave a title, or a title and its sub-line, alone at the foot of a page.
+ * keepLines comes with it, so a head line that wraps is not split either.
+ * The page's own engine holds the whole entry (walk.ts).
+ */
+const KEEP_HEAD: IParagraphOptions = { keepNext: true, keepLines: true }
+const keepHead = (on: boolean): IParagraphOptions => (on ? KEEP_HEAD : {})
+
+const sub = (s: string, C: Ctx, bold = false, keep = false) =>
+  new Paragraph({
+    spacing: { after: 16 },
+    ...keepHead(keep),
+    children: [new TextRun({ text: s, italics: true, ...(bold ? { bold: true } : {}), color: C.muted, size: SIZE.sub })],
+  })
+const para = (runs: ParagraphChild[]) => new Paragraph({ spacing: { after: 36 }, ...proseAlign(), children: runs })
 const summaryParas = (html: string, C: Ctx) => richToBlocks(html, C.body).map(para)
-const bulletPara = (html: string, C: Ctx) =>
-  C.bullet === 'none'
-    ? new Paragraph({ indent: { left: 180 }, spacing: { after: 16 }, children: richToRuns(html, C.body) })
-    : new Paragraph({ bullet: { level: 0 }, spacing: { after: 16 }, children: richToRuns(html, C.body) })
-const bulletsOf = (items: string[], C: Ctx) => items.filter((h) => htmlToText(h).length > 0).map((h) => bulletPara(h, C))
+// The page hangs an outside marker in the list's indent and sets the text at
+// the indent; Word gets the same distance as a hanging indent. With no marker
+// the text still sits at the indent, as it does on the page.
+// The bullet gap sits BETWEEN bullets, as it does on the page: the list's own
+// air, not air after the list. Given to every bullet it also spaced the LAST
+// one, so a list set with a roomy gap pushed the next entry down by that much
+// again - a distance nothing on the canvas showed. The last bullet of a list
+// takes the small trailing value a bullet always took instead.
+const BULLET_TRAILING = 16
+const bulletPara = (html: string, C: Ctx, last: boolean) => {
+  const after = last ? BULLET_TRAILING : BULLET.gap
+  return C.bullet === 'none'
+    ? new Paragraph({
+        indent: { left: BULLET.indent },
+        spacing: { after },
+        ...proseAlign(),
+        children: richToRuns(html, C.body),
+      })
+    : new Paragraph({
+        bullet: { level: 0 },
+        indent: { left: BULLET.indent, hanging: BULLET.indent },
+        spacing: { after },
+        ...proseAlign(),
+        children: richToRuns(html, C.body),
+      })
+}
+const bulletsOf = (items: string[], C: Ctx) => {
+  const shown = items.filter((h) => htmlToText(h).length > 0)
+  return shown.map((h, i) => bulletPara(h, C, i === shown.length - 1))
+}
 
 /* ------------------------------------------------------------------ photo */
 
@@ -177,14 +500,76 @@ function decodePhoto(dataUrl?: string): { data: Uint8Array; type: 'jpg' | 'png' 
     return null
   }
 }
-function photoParagraph(doc: ResumeDocument, sizePx: number, align: (typeof AlignmentType)[keyof typeof AlignmentType]): Paragraph | null {
+function photoParagraph(
+  doc: ResumeDocument,
+  sizePx: number,
+  align: (typeof AlignmentType)[keyof typeof AlignmentType]
+): Paragraph | null {
   if (!doc.metadata.layout.showPhoto) return null
   const decoded = decodePhoto(doc.content.basics.image)
   if (!decoded) return null
   return new Paragraph({
     alignment: align,
     spacing: { after: 120 },
-    children: [new ImageRun({ data: decoded.data, type: decoded.type, transformation: { width: sizePx, height: sizePx } })],
+    children: [
+      new ImageRun({ data: decoded.data, type: decoded.type, transformation: { width: sizePx, height: sizePx } }),
+    ],
+  })
+}
+
+/* --------------------------------------------------------------- art band */
+
+/** The art band's pixels, decoded once per export and read by the header
+ *  builder. Word embeds no webp and the builder itself is synchronous, so
+ *  the decoding happens outside it - the same shape the other export-wide
+ *  settings take (SIZE, LINKS_LIVE). */
+let ART: { data: Uint8Array; type: 'png' } | null = null
+
+/** Hands the builder a decoded band, or clears it. */
+export function setArtBandImage(img: { data: Uint8Array; type: 'png' } | null) {
+  ART = img
+}
+
+/** Decodes the chosen band into PNG bytes Word can embed: webp is not an
+ *  OOXML image format, so the browser's own decoder re-encodes it, exactly
+ *  the way the PDF painter transcodes a webp mark. Null wherever there is
+ *  no image decoder (a test) and on any failure - a header without its art
+ *  still exports. */
+export async function loadArtBandImage(band: string | undefined): Promise<{ data: Uint8Array; type: 'png' } | null> {
+  if (!band || band === 'none' || typeof document === 'undefined') return null
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const i = new Image()
+      i.onload = () => resolve(i)
+      i.onerror = () => reject(new Error('band decode failed'))
+      i.src = artBandSrc(band)
+    })
+    const canvas = document.createElement('canvas')
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx || !canvas.width || !canvas.height) return null
+    ctx.drawImage(img, 0, 0)
+    const decoded = decodePhoto(canvas.toDataURL('image/png'))
+    return decoded && decoded.type === 'png' ? { data: decoded.data, type: 'png' } : null
+  } catch {
+    return null
+  }
+}
+
+/** The band as Word can print it: a full-width strip above the header. Word
+ *  lays no text over an image, so the art leads the header instead of
+ *  sitting behind it. The art is 1200x300, so the strip is a quarter of its
+ *  width tall; `width` arrives in twips, and an image is measured in pixels
+ *  (15 twips to the pixel at 96 dots to the inch). */
+function artParagraph(doc: ResumeDocument, width: number): Paragraph | null {
+  if ((doc.metadata.theme.artBand ?? 'none') === 'none' || !ART) return null
+  const w = Math.max(1, Math.round(width / 15))
+  return new Paragraph({
+    spacing: { after: 60 },
+    children: [
+      new ImageRun({ data: ART.data, type: ART.type, transformation: { width: w, height: Math.round(w / 4) } }),
+    ],
   })
 }
 
@@ -195,44 +580,196 @@ function buildSections(keys: string[], doc: ResumeDocument, C: Ctx, width: numbe
   const out: Paragraph[] = []
   const b = doc.content.basics
   const meter = C.prof === 'dots' || C.prof === 'bars' || C.prof === 'stars'
+  // Today, once for the whole file, so every open-ended range counts to the
+  // same month the page counted to.
+  const now = currentYearMonth()
 
   for (const key of keys) {
     const label = sectionLabel(key, doc)
+    // How the document's dates read, plus the section's own time-span switch.
+    const settings = doc.metadata.layout.sectionSettings?.[key]
+    const dates = sectionDateOptions(settings, now, doc.metadata.dates)
+    const align = settings?.headingAlign
+    // Which field leads each entry and which is bold, as on the page: the
+    // lead takes the date line, the other the sub-line under it. The lead
+    // falls back to the other field so a half-filled entry still has a
+    // title, and the sub-line never repeats it.
+    const order = entryOrderOf(settings)
+    const orgFirst = order.lead === 'org'
+    const leadBold = order.lead === order.bold
+    // Whether this section's entries must not be torn across a page break -
+    // the document's switch until the section decides for itself, the same
+    // answer the page reads (KEEP_HEAD says what Word can do with it).
+    const keepEntries = keepEntriesOn(doc.metadata.page, settings)
+    // Where the location prints and which side the date sits on. With the
+    // two sharing the head row the location leads the tabbed string, exactly
+    // as it leads the date slot on the page, and it leaves the sub-line.
+    const meta = entryMetaOf(settings, doc.metadata.layout.dateAlign)
+    // A right margin holds the date out at the page's right edge, so the
+    // Word file uses the right tab it has always had for it - the same
+    // reading - whatever side the section would otherwise have picked. A
+    // left gutter adds nothing here: its years are decoration, and the
+    // entry's own date line is already written.
+    DATE_LEFT = meta.dateLeft && doc.metadata.layout.metaColumn !== 'margin'
+    const placed = (loc: string | undefined, date: string) =>
+      meta.locWithDate && loc ? [loc, date].filter(Boolean).join(LOCATION_DATE_SEPARATOR) : date
+    /** The location, when the section leaves it on the sub-line. */
+    const onSub = (loc: string | undefined) => (meta.locWithDate ? '' : loc || '')
+    /** Every string this section hands the tab, gathered before the first
+     *  paragraph is built so one column serves the whole section: a title
+     *  lands at the same offset whether its own date reads "2022" or
+     *  "September 2019 - December 2021". */
+    /** An education entry's dates: the section's options plus the entry's own
+     *  progress, so a course still under way names its finish as expected -
+     *  the same string the page prints, measured into the same column. */
+    const eduRange = (e: (typeof content.education)[number]) =>
+      formatDateRange(e.startDate, e.endDate, entryDateOptions(dates, e.status, now))
+    const tabbedDates = (): string[] => {
+      const range = (a?: string, b?: string) => formatDateRange(a, b, dates)
+      switch (key) {
+        case 'work':
+          return content.work.map((w) => placed(w.location, range(w.startDate, w.endDate)))
+        case 'education':
+          return content.education.map((e) => placed(e.location, eduRange(e)))
+        case 'projects':
+          return content.projects.map((p) => range(p.startDate, p.endDate))
+        case 'volunteer':
+          return content.volunteer.map((v) => range(v.startDate, v.endDate))
+        case 'certificates':
+          return content.certificates.map((c) => formatDate(c.date, dates))
+        case 'awards':
+          return content.awards.map((a) => formatDate(a.date, dates))
+        case 'publications':
+          return content.publications.map((p) => formatDate(p.releaseDate, dates))
+        default:
+          return (content.custom.find((c) => `custom-${c.id}` === key)?.items ?? []).map((it) =>
+            placed(it.location, formatDate(it.date, dates))
+          )
+      }
+    }
+    DATE_COL = DATE_LEFT ? dateColumnFor(tabbedDates()) : DATE_COL_MIN
     if (key === 'summary') {
       if (!has(b.summary)) continue
-      out.push(heading(label, C), ...summaryParas(b.summary!, C))
+      out.push(heading(label, C, align), ...summaryParas(b.summary!, C))
     } else if (key === 'work') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const w of content.work) {
-        out.push(titleDate(w.position || w.name || 'Role', formatDateRange(w.startDate, w.endDate), C, width))
-        const s = [w.name && w.position ? w.name : '', w.location].filter(Boolean).join('  ·  ')
-        if (s) out.push(sub(s, C))
-        if (has(w.summary)) out.push(...summaryParas(w.summary!, C))
-        out.push(...bulletsOf(w.highlights ?? [], C))
+        const [lead, under] = orgFirst ? [w.name, w.position] : [w.position, w.name]
+        const s = [lead && under ? under : '', onSub(w.location)].filter(Boolean).join('  ·  ')
+        const body = [...(has(w.summary) ? summaryParas(w.summary!, C) : []), ...bulletsOf(w.highlights ?? [], C)]
+        out.push(titleDate(lead || under || 'Role', placed(w.location, formatDateRange(w.startDate, w.endDate, dates)), C, width, keepHead(keepEntries && (!!s || body.length > 0)), w.url, leadBold))
+        if (s) out.push(sub(s, C, !leadBold, keepEntries && body.length > 0))
+        out.push(...body)
       }
     } else if (key === 'education') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const e of content.education) {
-        out.push(titleDate(e.institution || 'Institution', formatDateRange(e.startDate, e.endDate), C, width))
-        const line = [[e.studyType, e.area].filter(Boolean).join(', '), e.score].filter(Boolean).join('  ·  ')
-        if (line) out.push(sub(line, C))
-        if (has(e.summary)) out.push(...summaryParas(e.summary!, C))
+        // The degree leads by default, as it does on the page (this export
+        // used to lead with the institution whatever the page showed).
+        const degree = [e.studyType, e.area].filter(Boolean).join(', ')
+        const [lead, under] = orgFirst ? [e.institution, degree] : [degree, e.institution]
+        // The location joins the sub-line here as it does on the page; this
+        // export used to print it in neither slot.
+        const line = [lead && under ? under : '', onSub(e.location), e.score].filter(Boolean).join('  ·  ')
+        const body: Paragraph[] = []
+        if (e.courses?.length)
+          body.push(
+            new Paragraph({
+              spacing: { after: 24 },
+              children: [new TextRun({ text: e.courses.join('  ·  '), color: C.muted, size: SIZE.sub })],
+            })
+          )
+        if (has(e.summary)) body.push(...summaryParas(e.summary!, C))
+        out.push(titleDate(lead || under || 'Institution', placed(e.location, eduRange(e)), C, width, keepHead(keepEntries && (!!line || body.length > 0)), e.url, leadBold))
+        if (line) out.push(sub(line, C, !leadBold, keepEntries && body.length > 0))
+        out.push(...body)
       }
     } else if (key === 'projects') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
+      // The section's own link style, as the page reads it. Three of the four
+      // are ink and print the address; 'none' says the line is not drawn at
+      // all, and this file reads the DOCUMENT, so it has to drop the address
+      // itself rather than print one the page does not show. The title keeps
+      // its hyperlink either way, exactly as it does on the page.
+      const showUrl = linkStyleOf(settings) !== 'none'
       for (const p of content.projects) {
-        out.push(titleDate(p.name || 'Project', formatDateRange(p.startDate, p.endDate), C, width))
-        if (p.url) out.push(new Paragraph({ spacing: { after: 24 }, children: [new TextRun({ text: prettyUrl(p.url), color: C.accent, size: SIZE.sub })] }))
-        if (p.description) out.push(sub(p.description, C))
+        // Anything at all under the title is body enough to hold it to.
+        const hasBody =
+          (showUrl && !!p.url) ||
+          has(p.description) ||
+          (p.links ?? []).some((l) => (l.url || '').trim() || (l.label || '').trim()) ||
+          (p.highlights ?? []).some((h) => htmlToText(h).length > 0) ||
+          !!p.keywords?.length
+        out.push(titleDate(p.name || 'Project', formatDateRange(p.startDate, p.endDate, dates), C, width, keepHead(keepEntries && hasBody), p.url))
+        if (showUrl && p.url)
+          out.push(
+            new Paragraph({
+              spacing: { after: 24 },
+              children: [linkRun(p.url, prettyUrl(p.url, doc.metadata.links?.display), C)],
+            })
+          )
+        if (has(p.description))
+          out.push(
+            new Paragraph({
+              spacing: { after: 16 },
+              ...proseAlign(),
+              children: richToRuns(p.description, C.muted, SIZE.sub),
+            })
+          )
+        {
+          const named = (p.links ?? []).filter((l) => (l.url || '').trim() || (l.label || '').trim())
+          if (named.length)
+            out.push(
+              new Paragraph({
+                spacing: { after: 24 },
+                children: named.flatMap((l, li) => [
+                  ...(li > 0 ? [new TextRun({ text: '  ·  ', color: C.muted, size: SIZE.sub })] : []),
+                  linkRun(l.url, linkWords(l.url, l.label, 'short') || prettyUrl(l.url), C),
+                ]),
+              })
+            )
+        }
         out.push(...bulletsOf(p.highlights ?? [], C))
-        if (p.keywords?.length) out.push(new Paragraph({ spacing: { after: 30 }, children: [new TextRun({ text: p.keywords.join('  ·  '), color: C.muted, size: SIZE.sub })] }))
+        if (p.keywords?.length)
+          out.push(
+            new Paragraph({
+              spacing: { after: 30 },
+              children: [new TextRun({ text: p.keywords.join('  ·  '), color: C.muted, size: SIZE.sub })],
+            })
+          )
       }
     } else if (key === 'skills') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
+      // Rings on the page are "Label - 92%" lines here, and first, as the
+      // rings come first. A ringed category still lists its keywords below;
+      // a ringed skill that is only a name and a level is its ring line.
+      const rings = settings?.skillsStyle === 'rings'
+      if (rings)
+        for (const g of content.skills) {
+          if (typeof g.rating !== 'number') continue
+          const pct = Math.round((g.rating / 5) * 100)
+          out.push(
+            new Paragraph({
+              spacing: { after: 30 },
+              children: [new TextRun({ text: `${g.name} - ${pct}%`, bold: true, color: C.body, size: SIZE.body })],
+            })
+          )
+        }
       for (const g of content.skills) {
         const hasKw = !!g.keywords?.length
+        const ringed = rings && typeof g.rating === 'number'
+        if (ringed && !hasKw) continue
         if (!hasKw && typeof g.rating === 'number' && meter) {
-          out.push(new Paragraph({ spacing: { after: 30 }, children: [new TextRun({ text: `${g.name}\t`, bold: true, color: C.body, size: SIZE.body }), ...meterRuns(g.rating, C.prof, C.accent, C.muted)], tabStops: [{ type: TabStopType.RIGHT, position: width }] }))
+          out.push(
+            new Paragraph({
+              spacing: { after: 30 },
+              children: [
+                new TextRun({ text: `${g.name}\t`, bold: true, color: C.body, size: SIZE.body }),
+                ...meterRuns(g.rating, C.prof, C.accent, C.muted),
+              ],
+              tabStops: [{ type: TabStopType.RIGHT, position: width }],
+            })
+          )
         } else {
           const kids: ParagraphChild[] = []
           if (g.name) kids.push(new TextRun({ text: `${g.name}:  `, bold: true, color: C.body, size: SIZE.body }))
@@ -241,179 +778,386 @@ function buildSections(keys: string[], doc: ResumeDocument, C: Ctx, width: numbe
         }
       }
     } else if (key === 'languages') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const l of content.languages) {
         if (typeof l.rating === 'number' && meter) {
-          out.push(new Paragraph({ spacing: { after: 28 }, children: [new TextRun({ text: `${l.language}\t`, bold: true, color: C.body, size: SIZE.body }), ...meterRuns(l.rating, C.prof, C.accent, C.muted)], tabStops: [{ type: TabStopType.RIGHT, position: width }] }))
+          out.push(
+            new Paragraph({
+              spacing: { after: 28 },
+              children: [
+                new TextRun({ text: `${l.language}\t`, bold: true, color: C.body, size: SIZE.body }),
+                ...meterRuns(l.rating, C.prof, C.accent, C.muted),
+              ],
+              tabStops: [{ type: TabStopType.RIGHT, position: width }],
+            })
+          )
         } else {
-          const kids: ParagraphChild[] = [new TextRun({ text: l.language || '', bold: true, color: C.body, size: SIZE.body })]
-          if (l.fluency && C.prof !== 'none') kids.push(new TextRun({ text: `  —  ${l.fluency}`, color: C.muted, size: SIZE.sub }))
+          const kids: ParagraphChild[] = [
+            new TextRun({ text: l.language || '', bold: true, color: C.body, size: SIZE.body }),
+          ]
+          if (l.fluency && C.prof !== 'none')
+            kids.push(new TextRun({ text: `  —  ${l.fluency}`, color: C.muted, size: SIZE.sub }))
           out.push(new Paragraph({ spacing: { after: 28 }, children: kids }))
         }
       }
     } else if (key === 'certificates') {
-      out.push(heading(label, C))
-      for (const c of content.certificates) out.push(titleDate([c.name, c.issuer].filter(Boolean).join('  —  '), formatDate(c.date), C, width))
+      out.push(heading(label, C, align))
+      for (const c of content.certificates) {
+        const verify = verifyPara(c.url, c.urlLabel, C)
+        out.push(titleDate([c.name, c.issuer].filter(Boolean).join('  —  '), formatDate(c.date, dates), C, width, keepHead(keepEntries && verify.length > 0), (c.urlLabel || '').trim() ? undefined : c.url))
+        out.push(...verify)
+      }
     } else if (key === 'awards') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const a of content.awards) {
-        out.push(titleDate([a.title, a.awarder].filter(Boolean).join('  —  '), formatDate(a.date), C, width))
-        if (has(a.summary)) out.push(...summaryParas(a.summary, C))
+        const body = [...verifyPara(a.url, a.urlLabel, C), ...(has(a.summary) ? summaryParas(a.summary, C) : [])]
+        out.push(titleDate([a.title, a.awarder].filter(Boolean).join('  —  '), formatDate(a.date, dates), C, width, keepHead(keepEntries && body.length > 0), (a.urlLabel || '').trim() ? undefined : a.url))
+        out.push(...body)
       }
     } else if (key === 'publications') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const p of content.publications) {
-        out.push(titleDate([p.name, p.publisher].filter(Boolean).join('  —  '), formatDate(p.releaseDate), C, width))
-        if (has(p.summary)) out.push(...summaryParas(p.summary, C))
+        const body = has(p.summary) ? summaryParas(p.summary, C) : []
+        out.push(titleDate([p.name, p.publisher].filter(Boolean).join('  —  '), formatDate(p.releaseDate, dates), C, width, keepHead(keepEntries && body.length > 0), p.url))
+        out.push(...body)
       }
     } else if (key === 'volunteer') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const v of content.volunteer) {
-        out.push(titleDate(v.position || v.organization || 'Role', formatDateRange(v.startDate, v.endDate), C, width))
-        if (v.position && v.organization) out.push(sub(v.organization, C))
-        if (has(v.summary)) out.push(...summaryParas(v.summary, C))
-        out.push(...bulletsOf(v.highlights ?? [], C))
+        const [lead, under] = orgFirst ? [v.organization, v.position] : [v.position, v.organization]
+        const body = [...(has(v.summary) ? summaryParas(v.summary, C) : []), ...bulletsOf(v.highlights ?? [], C)]
+        const subLine = lead && under ? under : ''
+        out.push(titleDate(lead || under || 'Role', formatDateRange(v.startDate, v.endDate, dates), C, width, keepHead(keepEntries && (!!subLine || body.length > 0)), v.url, leadBold))
+        if (subLine) out.push(sub(subLine, C, !leadBold, keepEntries && body.length > 0))
+        out.push(...body)
       }
     } else if (key === 'interests') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const it of content.interests) {
-        const kids: ParagraphChild[] = [new TextRun({ text: it.name || '', bold: true, color: C.body, size: SIZE.body })]
-        if (it.keywords?.length) kids.push(new TextRun({ text: `:  ${it.keywords.join(', ')}`, color: C.muted, size: SIZE.sub }))
+        const kids: ParagraphChild[] = [
+          new TextRun({ text: it.name || '', bold: true, color: C.body, size: SIZE.body }),
+        ]
+        if (it.keywords?.length)
+          kids.push(new TextRun({ text: `:  ${it.keywords.join(', ')}`, color: C.muted, size: SIZE.sub }))
         out.push(new Paragraph({ spacing: { after: 28 }, children: kids }))
       }
     } else if (key === 'references') {
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const r of content.references) {
-        if (r.name) out.push(new Paragraph({ spacing: { after: 4 }, children: [new TextRun({ text: r.name, bold: true, color: C.body, size: SIZE.body })] }))
+        if (r.name)
+          out.push(
+            new Paragraph({
+              spacing: { after: 4 },
+              ...keepHead(keepEntries && !!r.reference),
+              children: [new TextRun({ text: r.name, bold: true, color: C.body, size: SIZE.body })],
+            })
+          )
         if (r.reference) out.push(sub(r.reference, C))
       }
     } else if (key.startsWith('custom-')) {
       const id = key.slice('custom-'.length)
       const section = content.custom.find((c) => c.id === id)
       if (!section || !section.items.length) continue
-      out.push(heading(label, C))
+      out.push(heading(label, C, align))
       for (const it of section.items) {
-        out.push(titleDate(it.name || '', formatDate(it.date), C, width))
-        const s = [it.subtitle, it.location].filter(Boolean).join('  ·  ')
-        if (s) out.push(sub(s, C))
-        if (has(it.summary)) out.push(...summaryParas(it.summary, C))
-        out.push(...bulletsOf(it.highlights ?? [], C))
+        // The subtitle stands in for the organisation; neither falls back to
+        // the other, as neither does on the page.
+        const [lead, under] = orgFirst ? [it.subtitle, it.name] : [it.name, it.subtitle]
+        const s = [under, onSub(it.location)].filter(Boolean).join('  ·  ')
+        const body = [...(has(it.summary) ? summaryParas(it.summary, C) : []), ...bulletsOf(it.highlights ?? [], C)]
+        out.push(titleDate(lead || '', placed(it.location, formatDate(it.date, dates)), C, width, keepHead(keepEntries && (!!s || body.length > 0)), it.url, leadBold))
+        if (s) out.push(sub(s, C, !leadBold, keepEntries && body.length > 0))
+        out.push(...body)
       }
     }
   }
   return out
 }
 
-function buildHeader(doc: ResumeDocument, C: Ctx): Paragraph[] {
+// A table that draws no line of its own: the shaded cell a block or band
+// header sits in is the colour, not a frame.
+const NO_LINE = { style: BorderStyle.NONE, size: 0, color: 'auto' }
+const NO_BORDERS = {
+  top: NO_LINE,
+  bottom: NO_LINE,
+  left: NO_LINE,
+  right: NO_LINE,
+  insideHorizontal: NO_LINE,
+  insideVertical: NO_LINE,
+}
+
+/** The header, composed the way the page composes it where Word can follow:
+ *  a display masthead centres the name at twice its size and rules the
+ *  contact line above and below; a block or a band puts the whole header in
+ *  one cell shaded with the accent (Word draws no gradient, so a band takes
+ *  the accent alone), its text in white or the text colour, whichever reads
+ *  better on the accent - unless the author coloured the element. The other
+ *  compositions print as this export always printed them. The stats band is
+ *  decorative and never reaches the file. */
+function buildHeader(doc: ResumeDocument, C: Ctx, separator: string, width: number): (Paragraph | Table)[] {
   const b = doc.content.basics
-  const out: Paragraph[] = [
-    new Paragraph({ spacing: { after: 20 }, children: [new TextRun({ text: b.name || 'Your Name', bold: true, color: C.accent, size: SIZE.name, font: C.headFont })] }),
-  ]
-  if (b.label) out.push(new Paragraph({ spacing: { after: 40 }, children: [new TextRun({ text: b.label, color: C.accent, size: SIZE.headline, font: C.headFont })] }))
-  const contacts: string[] = []
+  const { theme } = doc.metadata
+  // The composition the page draws: the author's choice, else the template's.
+  const variant = doc.metadata.layout.headerStyle ?? getTemplate(doc.metadata.template).header
+  const display = variant === 'display'
+  const filled = variant === 'block' || variant === 'band'
+  // stepped: three lines of the header on three shaded paragraphs, in the
+  // accent and the accent lightened 14% and 28% - the shades the page
+  // grades its three bands with (Artboard.tsx useVars).
+  const stepped = variant === 'stepped'
+  const step = (amount: number) => toHex(lighten(theme.primary, amount), C.accent)
+  const shaded = (fill: string) => ({ shading: { type: ShadingType.CLEAR, color: 'auto', fill } })
+  const on = filled || stepped ? toHex(readableOn(C.accent, C.body), 'FFFFFF') : undefined
+  const colorOf = (chosen: string | undefined, usual: string) => (on && !chosen ? on : usual)
+  const nameColor = colorOf(theme.name, C.name)
+  const headlineColor = colorOf(theme.headline, C.headline)
+  const contactColor = colorOf(theme.contacts, C.contact)
+  const contactLinkColor = colorOf(theme.contacts, C.contactLink)
+  const centred = display ? { alignment: AlignmentType.CENTER } : {}
+  // The art the page draws BEHIND the header leads it here: Word lays no
+  // text over an image.
+  const art = artParagraph(doc, filled ? width - 480 : width)
+  const out: Paragraph[] = art ? [art] : []
+  out.push(
+    new Paragraph({
+      ...centred,
+      ...(stepped ? { ...shaded(C.accent), spacing: { after: 0 } } : { spacing: { after: 20 } }),
+      children: [
+        new TextRun({
+          text: b.name || 'Your Name',
+          ...(C.nameBold ? { bold: true } : {}),
+          color: nameColor,
+          size: display ? SIZE.name * 2 : stepped ? Math.round(SIZE.name * 1.4) : SIZE.name,
+          font: C.headFont,
+        }),
+      ],
+    })
+  )
+  if (b.label)
+    out.push(
+      new Paragraph({
+        ...centred,
+        ...(stepped ? { ...shaded(step(0.14)), spacing: { after: 0 } } : { spacing: { after: 40 } }),
+        children: [new TextRun({ text: b.label, color: headlineColor, size: SIZE.headline, font: C.headFont })],
+      })
+    )
+  // Each contact carries its own destination, so the reader can click the word
+  // Linkedin in Word the way they can in the PDF. They used to be flattened
+  // into one string, which meant one plain run and nothing to click.
+  const contacts: Array<{ words: string; url?: string }> = []
   const email = cleanEmail(b.email)
-  if (email) contacts.push(email)
-  if (b.phone) contacts.push(b.phone)
+  if (email) contacts.push({ words: email, url: `mailto:${email}` })
+  if (b.phone) contacts.push({ words: b.phone, url: `tel:${b.phone.replace(/[^\d+]/g, '')}` })
   const loc = [b.location?.city, b.location?.region].filter(Boolean).join(', ')
-  if (loc) contacts.push(loc)
-  if (b.url) contacts.push(prettyUrl(b.url))
+  if (loc) contacts.push({ words: loc })
+  // The author's display choice applies wherever a URL is SHOWN, not just in
+  // the PDF - a Word export that ignores it contradicts the document it came
+  // from.
+  const linkDisplay = doc.metadata.links?.display
+  if (b.url) contacts.push({ words: linkWords(b.url, b.urlLabel, linkDisplay), url: b.url })
   for (const p of b.profiles ?? []) {
-    const handle = p.username || prettyUrl(p.url)
-    if (handle && p.network) contacts.push(`${p.network}: ${handle}`)
-    else if (handle || p.network) contacts.push(handle || p.network)
+    const handle = linkWords(p.url, p.label, linkDisplay) || p.username
+    if (handle && p.network) contacts.push({ words: `${p.network}: ${handle}`, url: p.url })
+    else if (handle || p.network) contacts.push({ words: handle || p.network, url: p.url })
   }
-  if (contacts.length) out.push(new Paragraph({ spacing: { after: 100 }, children: [new TextRun({ text: contacts.join('   •   '), color: C.muted, size: SIZE.sub })] }))
-  return out
+  const shown = contacts.filter((c) => c.words)
+  // What sits between two contacts is the author's choice, printed with the
+  // glyph the page draws. A bullet used to be hard-coded here whatever the
+  // canvas showed.
+  if (shown.length)
+    out.push(
+      new Paragraph({
+        ...centred,
+        spacing: { after: 100 },
+        // The stepped header's last band holds the details.
+        ...(stepped ? shaded(step(0.28)) : {}),
+        // The display masthead's dateline sits between a heavy rule above
+        // and a hairline below, both in the text colour, as on the page.
+        ...(display
+          ? {
+              border: {
+                top: { style: BorderStyle.SINGLE, size: 3 * RULE_PER_PX, color: C.body, space: 4 },
+                bottom: { style: BorderStyle.SINGLE, size: RULE_PER_PX, color: C.body, space: 4 },
+              },
+            }
+          : {}),
+        children: shown.flatMap((c, i) => [
+          ...(i > 0 ? [new TextRun({ text: separator, color: contactColor, size: SIZE.contact })] : []),
+          c.url && LINKS_LIVE && safeHref(c.url)
+            ? linkRun(c.url, c.words, C, SIZE.contact, contactLinkColor)
+            : new TextRun({ text: c.words, color: contactColor, size: SIZE.contact }),
+        ]),
+      })
+    )
+  if (!filled) return out
+  // One cell the width of the text, shaded with the accent, holding the
+  // header's paragraphs; a little air inside so the text clears the edge.
+  return [
+    new Table({
+      width: { size: width, type: WidthType.DXA },
+      columnWidths: [width],
+      borders: NO_BORDERS,
+      rows: [
+        new TableRow({
+          children: [
+            new TableCell({
+              width: { size: width, type: WidthType.DXA },
+              shading: { type: ShadingType.CLEAR, color: 'auto', fill: C.accent },
+              margins: { top: 240, bottom: 200, left: 240, right: 240 },
+              children: out,
+            }),
+          ],
+        }),
+      ],
+    }),
+  ]
+}
+
+/* ------------------------------------------------------------ footer strip */
+
+/**
+ * The footer strip: the sections the author moved to layout.footer, after
+ * the body in one cell shaded with the theme's footer colour (the text
+ * colour when none is set), its words in whichever of white and the text
+ * colour reads on that ground - the same answer the page computes for its
+ * strip (Artboard.tsx useVars). The skills and languages builders already
+ * print one paragraph per group, which is the strip's row form; the titles
+ * keep their own colour, as on the page. Nothing at all when the strip is
+ * empty, so a document without one packs exactly as it always did.
+ */
+function buildFooter(keys: string[], doc: ResumeDocument, C: Ctx, width: number): Table[] {
+  if (!keys.length) return []
+  const { theme } = doc.metadata
+  const fill = toHex(theme.footer, C.body)
+  const on = toHex(readableOn(theme.footer || theme.text, theme.text), 'FFFFFF')
+  // The cell's own inner margins come off the width the tab stops read.
+  const inner = width - 480
+  const paras = buildSections(keys, doc, { ...C, body: on, muted: on }, inner)
+  if (!paras.length) return []
+  return [
+    new Table({
+      width: { size: width, type: WidthType.DXA },
+      columnWidths: [width],
+      borders: NO_BORDERS,
+      rows: [
+        new TableRow({
+          children: [
+            new TableCell({
+              width: { size: width, type: WidthType.DXA },
+              shading: { type: ShadingType.CLEAR, color: 'auto', fill },
+              margins: { top: 200, bottom: 220, left: 240, right: 240 },
+              children: paras,
+            }),
+          ],
+        }),
+      ],
+    }),
+  ]
 }
 
 /* --------------------------------------------------------- the export itself */
 
-export async function exportDocumentDocx(doc: ResumeDocument, filename?: string, fitScale = 1) {
+/** The Word document itself, before packing - built from the document's own
+ *  metrics (docxMetrics) so a test can open it and read them back. */
+export function buildDocx(doc: ResumeDocument, fitScale = 1): Document {
+  // The Word file leaves the app the same way the JSON does: a value an
+  // example seeded into a field the page never shows is not the author's, and
+  // here it would reach the reader as a live hyperlink on their job title.
+  doc = withoutSeeded(doc)
   const { metadata } = doc
-  // Apply the live one-page fit so the Word doc lands on the same page count as
-  // the PDF. Clamp to the same floor the on-screen fit uses (never unreadable).
-  const scale = Math.min(1, Math.max(0.66, fitScale || 1))
-  SIZE =
-    scale === 1
-      ? BASE_SIZE
-      : (Object.fromEntries(Object.entries(BASE_SIZE).map(([k, v]) => [k, Math.round(v * scale)])) as typeof BASE_SIZE)
+  LINKS_LIVE = metadata.links?.clickable !== false
+  JUSTIFY = metadata.typography.align === 'justify'
+  const metrics = docxMetrics(metadata, fitScale)
+  SIZE = metrics.sizes
+  BULLET = { indent: metrics.bulletIndent, gap: metrics.bulletGap }
+  HEADING = { after: metrics.headingGap, rule: metrics.headingRule }
+  // Sections set this as they are built; the header is built first and has
+  // no entries, so it starts from the side the page always used.
+  DATE_LEFT = false
   const primary = toHex(metadata.theme.primary, '2563EB')
   const text = toHex(metadata.theme.text, '1A1A1A')
   const muted = toHex(metadata.theme.muted, '5B6472')
-  const sidebarBg = toHex(metadata.theme.sidebar, '0F172A')
-  const sidebarText = toHex(metadata.theme.sidebarText, 'E2E8F0')
   const background = toHex(metadata.theme.background, 'FFFFFF')
+  // Each element's own colour, falling back to the colour this export always
+  // printed it in: the name, the headline, the section titles and the links
+  // in the accent, the contacts in the muted colour. A linked contact is a
+  // contact first, as on the page (`.rm-contacts a { color: inherit }`): it
+  // takes the contact colour when one is set and is never moved by the link
+  // colour, so with links set and contacts unset it stays in the accent.
+  const { theme } = metadata
+  const link = toHex(theme.links, primary)
+  const elementColors = {
+    name: toHex(theme.name, primary),
+    headline: toHex(theme.headline, primary),
+    heading: toHex(theme.headings, primary),
+    contact: toHex(theme.contacts, muted),
+    link,
+    contactLink: toHex(theme.contacts, primary),
+  }
+  // Rich-text links keep the surrounding colour unless the author chose one.
+  LINK_COLOR = theme.links ? link : undefined
   const bodyFont = metadata.typography.fontFamily || 'Calibri'
   const headFont = metadata.typography.headingFamily || bodyFont
-  const upper = metadata.typography.uppercaseHeadings
-  const prof = metadata.typography.proficiency
-  const bulletStyle = metadata.typography.bulletStyle
+  const t = metadata.typography
+  const prof = t.proficiency
+  const bulletStyle = t.bulletStyle
+  // The same answer the canvas draws from (typeStyle.ts). A weight the
+  // author never chose keeps the bold this export always printed.
+  const nameBold = (t.nameWeight ?? 'bold') === 'bold'
+  const headingBold = (t.headingWeight ?? 'bold') === 'bold'
 
   const page = metadata.page.format === 'Letter' ? TWIP.letter : TWIP.a4
   const order = resolveOrder(doc)
-  const twoCol = metadata.layout.columns === 2 && order.aside.length > 0
-  // Two-column bleeds the sidebar to the page edges (zero page margin); single
-  // column keeps normal print margins.
-  const contentW = twoCol ? page.w : page.w - TWIP.margin * 2
+  const contentW = page.w - metrics.margin * 2
 
-  const mainCtx: Ctx = { accent: primary, body: text, muted, headFont, upper, prof, bullet: bulletStyle }
-
-  let body: (Paragraph | Table)[]
-
-  if (twoCol) {
-    const asideW = Math.round(contentW * metadata.layout.sidebarWidth)
-    const mainW = contentW - asideW
-    const sideLeft = metadata.layout.sidebar === 'left'
-    const asideCtx: Ctx = { accent: sidebarText, body: sidebarText, muted: mix(sidebarText, sidebarBg, 0.35), headFont, upper, prof, bullet: bulletStyle }
-
-    const PAGE_PAD = 1000 // outer (page-edge) padding for the main column
-    const COL_GAP = 340 // gap between the two columns
-    const ASIDE_PAD = 430 // sidebar inner padding (text inset from the colored edge)
-    const mainInner = Math.max(1800, mainW - COL_GAP - PAGE_PAD)
-    const asideInner = Math.max(1200, asideW - ASIDE_PAD * 2)
-
-    const mainChildren = [...buildHeader(doc, mainCtx), ...buildSections(order.main, doc, mainCtx, mainInner)]
-    const asidePhoto = photoParagraph(doc, 110, AlignmentType.CENTER)
-    const asideChildren = [...(asidePhoto ? [asidePhoto] : []), ...buildSections(order.aside, doc, asideCtx, asideInner)]
-    if (!asideChildren.length) asideChildren.push(new Paragraph({ children: [] }))
-
-    const mainCell = new TableCell({
-      width: { size: mainW, type: WidthType.DXA },
-      verticalAlign: VerticalAlign.TOP,
-      margins: { top: 240, bottom: 200, left: sideLeft ? COL_GAP : PAGE_PAD, right: sideLeft ? PAGE_PAD : COL_GAP },
-      borders: NO_BORDERS,
-      children: mainChildren,
-    })
-    const asideCell = new TableCell({
-      width: { size: asideW, type: WidthType.DXA },
-      verticalAlign: VerticalAlign.TOP,
-      shading: { type: ShadingType.CLEAR, color: 'auto', fill: sidebarBg },
-      margins: { top: 300, bottom: 220, left: ASIDE_PAD, right: ASIDE_PAD },
-      borders: NO_BORDERS,
-      children: asideChildren,
-    })
-
-    const table = new Table({
-      layout: TableLayoutType.FIXED,
-      width: { size: contentW, type: WidthType.DXA },
-      columnWidths: sideLeft ? [asideW, mainW] : [mainW, asideW],
-      borders: NO_BORDERS,
-      rows: [new TableRow({ cantSplit: false, children: sideLeft ? [asideCell, mainCell] : [mainCell, asideCell] })],
-    })
-    body = [table]
-  } else {
-    const photo = photoParagraph(doc, 120, AlignmentType.LEFT)
-    body = [...(photo ? [photo] : []), ...buildHeader(doc, mainCtx), ...buildSections(order.main, doc, mainCtx, contentW)]
+  const mainCtx: Ctx = {
+    accent: primary,
+    body: text,
+    muted,
+    headFont,
+    headingCase: headingCase(t),
+    nameBold,
+    headingBold,
+    prof,
+    bullet: bulletStyle,
+    ...elementColors,
   }
 
-  const document = new Document({
+  // ALWAYS a single column, whatever the template's on-screen layout
+  // (2026-08-23). The Word export used to mirror a two-column template with a
+  // Word TABLE, which broke the two things this format exists for:
+  //
+  //  - Reading order. A left-sidebar template put the sidebar cell first, so
+  //    the file opened with "SKILLS | Languages: | TypeScript ..." and an ATS
+  //    read a keyword list before the candidate's name. Measured on the real
+  //    export, same defect the PDF text layer had (readingOrder.ts).
+  //  - Parseability. Table layout is the classic ATS failure: parsers walk
+  //    cells in their own order, or drop them. Our own per-ATS simulator warns
+  //    users about exactly this in their resume design.
+  //
+  // The PDF carries the design; the .docx is the safe, linear copy the README
+  // promises ("a clean, single-column, ATS-friendly Word document"). Sidebar
+  // sections keep their content and simply follow the main column, rendered in
+  // the MAIN colour context — sidebar text colours are chosen to sit on a dark
+  // band and would be unreadable on white paper. The footer strip follows both,
+  // as the ATS text reads it, in its own shaded cell (buildFooter).
+  const photo = photoParagraph(doc, 120, AlignmentType.LEFT)
+  const body: (Paragraph | Table)[] = [
+    ...(photo ? [photo] : []),
+    ...buildHeader(doc, mainCtx, metrics.separator, contentW),
+    ...buildSections([...order.main, ...order.aside], doc, mainCtx, contentW),
+    ...buildFooter(order.footer, doc, mainCtx, contentW),
+  ]
+
+  const { margin, line } = metrics
+  return new Document({
     creator: 'CVAurum',
     title: doc.title,
     description: 'Resume exported from CVAurum',
     background: { color: background },
     styles: {
       default: {
-        document: { run: { font: bodyFont, size: SIZE.body, color: text }, paragraph: { spacing: { line: 252 } } },
+        document: { run: { font: bodyFont, size: SIZE.body, color: text }, paragraph: { spacing: { line } } },
       },
     },
     sections: [
@@ -421,18 +1165,19 @@ export async function exportDocumentDocx(doc: ResumeDocument, filename?: string,
         properties: {
           page: {
             size: { width: page.w, height: page.h },
-            // Two-column shading meets the page edge cleanly with zero margins;
-            // single-column keeps comfortable print margins.
-            margin: twoCol
-              ? { top: 0, right: 0, bottom: 0, left: 0 }
-              : { top: TWIP.margin, right: TWIP.margin, bottom: TWIP.margin, left: TWIP.margin },
+            margin: { top: margin, right: margin, bottom: margin, left: margin },
           },
         },
         children: body,
       },
     ],
   })
+}
 
-  const blob = await Packer.toBlob(document)
+export async function exportDocumentDocx(doc: ResumeDocument, filename?: string, fitScale = 1) {
+  // The band is decoded before the (synchronous) builder runs, so the header
+  // can embed it - see loadArtBandImage.
+  setArtBandImage(await loadArtBandImage(doc.metadata.theme.artBand))
+  const blob = await Packer.toBlob(buildDocx(doc, fitScale))
   downloadBlob(blob, filename || resumeFilename(doc.content.basics.name, doc.title, 'docx'))
 }

@@ -1,6 +1,8 @@
-import { useState, type ReactNode } from 'react'
-import { X } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { ChevronLeft, ChevronRight, X } from 'lucide-react'
+import { cn, monthNames } from '@/lib/utils'
+import { parseYM, pickMonthYear } from '@/lib/monthYear'
+import { useResumeStore } from '@/store/useResumeStore'
 
 export function Labeled({ label, hint, children, className }: { label?: string; hint?: string; children: ReactNode; className?: string }) {
   return (
@@ -10,6 +12,61 @@ export function Labeled({ label, hint, children, className }: { label?: string; 
       {hint && <p className="mt-1 text-[11px] text-muted-foreground">{hint}</p>}
     </div>
   )
+}
+
+/* The same 300ms the canvas's own Ed has had all along. Panel inputs wrote
+ * the store on EVERY keystroke, and each write re-renders the panel plus both
+ * artboard trees - measured at 48ms per key against the canvas's 15 (2026-
+ * 08-30), which is the sluggish panel typing the author reported. The field
+ * owns its text while focused and flushes on pause, blur and unmount; while
+ * it is NOT focused, outside changes (undo, import, another field) flow in
+ * untouched. */
+function useDebouncedText(value: string, onChange: (v: string) => void) {
+  const [draft, setDraft] = useState(value)
+  const focused = useRef(false)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const latest = useRef({ value, onChange, draft })
+  latest.current = { value, onChange, draft }
+
+  useEffect(() => {
+    if (!focused.current) setDraft(value)
+  }, [value])
+  useEffect(
+    () => () => {
+      if (timer.current) {
+        clearTimeout(timer.current)
+        const { value: v, onChange: fn, draft: d } = latest.current
+        if (d !== v) fn(d)
+      }
+    },
+    []
+  )
+
+  const flush = () => {
+    if (timer.current) {
+      clearTimeout(timer.current)
+      timer.current = null
+    }
+    const { value: v, onChange: fn, draft: d } = latest.current
+    if (d !== v) fn(d)
+  }
+  const set = (v: string) => {
+    setDraft(v)
+    latest.current.draft = v
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = setTimeout(flush, 300)
+  }
+  return {
+    draft,
+    set,
+    onFocus: () => {
+      focused.current = true
+    },
+    onBlur: () => {
+      focused.current = false
+      flush()
+    },
+  }
 }
 
 export function TextField({
@@ -27,9 +84,18 @@ export function TextField({
   hint?: string
   type?: string
 }) {
+  const t = useDebouncedText(value, onChange)
   return (
     <Labeled label={label} hint={hint}>
-      <input className="input" type={type} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
+      <input
+        className="input"
+        type={type}
+        value={t.draft}
+        placeholder={placeholder}
+        onChange={(e) => t.set(e.target.value)}
+        onFocus={t.onFocus}
+        onBlur={t.onBlur}
+      />
     </Labeled>
   )
 }
@@ -47,23 +113,26 @@ export function TextAreaField({
   placeholder?: string
   rows?: number
 }) {
+  const t = useDebouncedText(value, onChange)
   return (
     <Labeled label={label}>
-      <textarea className="textarea" rows={rows} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
+      <textarea
+        className="textarea"
+        rows={rows}
+        value={t.draft}
+        placeholder={placeholder}
+        onChange={(e) => t.set(e.target.value)}
+        onFocus={t.onFocus}
+        onBlur={t.onBlur}
+      />
     </Labeled>
   )
 }
 
 /** Month-ish date. Accepts "YYYY-MM"/"YYYY"/free text; empty end = Present. */
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const NOW_YEAR = new Date().getFullYear()
 const YEARS = Array.from({ length: 75 }, (_, i) => NOW_YEAR + 2 - i)
 
-function parseYM(v: string): { y: string; m: string } {
-  const match = (v || '').trim().match(/^(\d{4})(?:-(\d{1,2}))?/)
-  if (!match) return { y: '', m: '' }
-  return { y: match[1], m: match[2] ? String(parseInt(match[2], 10)) : '' }
-}
 const isPresent = (v: string) => /^present$/i.test((v || '').trim())
 
 /** Month + year picker. Stores "YYYY-MM" (or "YYYY"); end dates can be "Present". */
@@ -72,47 +141,69 @@ export function DateField({
   value,
   onChange,
   allowPresent,
+  singleWith,
 }: {
   label?: string
   value: string
   onChange: (v: string) => void
   allowPresent?: boolean
+  /** When given (the entry's START date), offers a "single date" toggle that
+   *  collapses the range by storing end === start (issue #7). */
+  singleWith?: string
 }) {
   const [pickMode, setPickMode] = useState(false)
-  const present = !!allowPresent && !pickMode && (!value.trim() || isPresent(value))
+  // The panel's picker names months the way the page prints them, from the
+  // one shared list - the canvas picker reads the same document language,
+  // and a phone has only this field to edit a date with.
+  const language = useResumeStore((s) => s.doc?.metadata.dates?.language)
+  const months = monthNames(language)
+  // "Single date" is a choice, not a coincidence. It used to switch itself
+  // on whenever the two ends matched, so picking 2025 for both ends of a
+  // May-July internship ticked it and hid the end pickers before the months
+  // were in (usability test, 2026-09-26). It starts ticked only for an entry
+  // that already is a single date.
+  const same = singleWith != null && !!singleWith.trim() && singleWith.trim() === (value || '').trim()
+  const [singleChosen, setSingleChosen] = useState(same)
+  const single = singleChosen && same
+  const present = !!allowPresent && !single && !pickMode && (!value.trim() || isPresent(value))
   const { y, m } = parseYM(value)
+  // A month picked before its year is held here until the year arrives
+  // (lib/monthYear.ts); it used to be thrown away.
+  const [pendingMonth, setPendingMonth] = useState('')
 
-  const setYM = (year: string, month: string) => {
+  const pick = (change: { month?: string; year?: string }) => {
     setPickMode(true)
-    if (!year) return onChange('')
-    onChange(month ? `${year}-${month.padStart(2, '0')}` : year)
+    const r = pickMonthYear(value, pendingMonth, change)
+    setPendingMonth(r.pendingMonth)
+    if (r.value !== value) onChange(r.value)
   }
+  const waitingForYear = !!pendingMonth && !y
 
   return (
     <Labeled label={label}>
       {/* month/year always get half the field each — the Present checkbox lives
           on its own line so narrow cells can never crush the selects */}
-      <div className="grid grid-cols-2 gap-1.5">
+      <div className={`grid grid-cols-2 gap-1.5${single ? ' hidden' : ''}`}>
         <select
           className="input h-9 min-w-0 px-2 disabled:opacity-50"
-          value={present ? '' : m}
+          value={present ? '' : m || pendingMonth}
           disabled={present}
-          onChange={(e) => setYM(y, e.target.value)}
+          onChange={(e) => pick({ month: e.target.value })}
           aria-label={`${label ?? 'Date'} month`}
         >
           <option value="">Month</option>
-          {MONTHS.map((name, i) => (
-            <option key={name} value={String(i + 1)}>
+          {months.map((name, i) => (
+            <option key={i} value={String(i + 1)}>
               {name}
             </option>
           ))}
         </select>
         <select
-          className="input h-9 min-w-0 px-2 disabled:opacity-50"
+          className={cn('input h-9 min-w-0 px-2 disabled:opacity-50', waitingForYear && 'ring-2 ring-primary')}
           value={present ? '' : y}
           disabled={present}
-          onChange={(e) => setYM(e.target.value, m)}
-          aria-label={`${label ?? 'Date'} year`}
+          onChange={(e) => pick({ year: e.target.value })}
+          aria-label={waitingForYear ? `${label ?? 'Date'} year — pick it to keep the month` : `${label ?? 'Date'} year`}
         >
           <option value="">Year</option>
           {YEARS.map((yy) => (
@@ -122,7 +213,23 @@ export function DateField({
           ))}
         </select>
       </div>
-      {allowPresent && (
+      {singleWith != null && (
+        <label className="mt-1.5 flex w-fit cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            className="h-3.5 w-3.5 accent-primary"
+            checked={single}
+            onChange={(e) => {
+              setPickMode(true)
+              setSingleChosen(e.target.checked)
+              // end === start collapses the range to one date everywhere
+              onChange(e.target.checked ? singleWith.trim() || String(NOW_YEAR) : '')
+            }}
+          />
+          Single date (no range)
+        </label>
+      )}
+      {allowPresent && !single && (
         <label className="mt-1.5 flex w-fit cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
           <input
             type="checkbox"
@@ -175,6 +282,36 @@ export function TagInput({
         {value.map((t, i) => (
           <span key={`${t}-${i}`} className="chip gap-1 bg-primary/10 text-primary">
             {t}
+            {/* Reorder lives in the panel too. The canvas grip is a desktop
+                affordance - a phone shows the panel, where until now the order
+                could not be changed at all. Buttons rather than drag, exactly
+                like entry reordering: reachable by tap and by keyboard. */}
+            <button
+              type="button"
+              className="disabled:opacity-25"
+              disabled={i === 0}
+              onClick={() => {
+                const next = [...value]
+                ;[next[i - 1], next[i]] = [next[i], next[i - 1]]
+                onChange(next)
+              }}
+              aria-label={`Move ${t} earlier`}
+            >
+              <ChevronLeft className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
+              className="disabled:opacity-25"
+              disabled={i === value.length - 1}
+              onClick={() => {
+                const next = [...value]
+                ;[next[i], next[i + 1]] = [next[i + 1], next[i]]
+                onChange(next)
+              }}
+              aria-label={`Move ${t} later`}
+            >
+              <ChevronRight className="h-3 w-3" />
+            </button>
             <button type="button" onClick={() => onChange(value.filter((_, j) => j !== i))} aria-label={`Remove ${t}`}>
               <X className="h-3 w-3" />
             </button>
@@ -232,6 +369,10 @@ export function RatingField({
   )
 }
 
+/** Two fields side by side — but only where there is room for two. A phone's
+ *  panel is 375px wide, and splitting that in half (and in half again, for a
+ *  date's month and year selects) left the selects too narrow to show what
+ *  they had selected. Below the first breakpoint the pair stacks instead. */
 export function Row({ children }: { children: ReactNode }) {
-  return <div className="grid grid-cols-2 gap-3">{children}</div>
+  return <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">{children}</div>
 }

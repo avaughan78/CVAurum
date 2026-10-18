@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from 'framer-motion'
 import { CheckCircle2, Info, XCircle, X } from 'lucide-react'
 import { useAppStore } from '@/store/useAppStore'
+import { useEditorStore } from '@/store/useEditorStore'
 
 const ICONS = {
   success: CheckCircle2,
@@ -11,12 +12,24 @@ const ICONS = {
 export function Toaster() {
   const toasts = useAppStore((s) => s.toasts)
   const dismiss = useAppStore((s) => s.dismissToast)
+  // A phone has one narrow strip of screen above the bottom tab bar, and the
+  // export's "Generating your PDF…" pill is parked in it too. A toast is wide
+  // enough there to cover the pill completely - so while an export is running,
+  // step the stack up over the pill's height and let both be seen.
+  const exporting = useEditorStore((s) => s.pdfExporting)
   return (
     <div
       role="status"
       aria-live="polite"
       aria-atomic="false"
-      className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-80 flex-col gap-2"
+      // On a phone the editor's bottom tab bar owns the last ~54px of the
+      // screen, and a toast pinned to bottom-4 lands on top of it and eats
+      // its taps (the card is pointer-events-auto). Sit above the bar below
+      // md - the same breakpoint that turns the bar back into the desktop
+      // left rail - and keep the desktop corner unchanged.
+      className={`pointer-events-none fixed right-4 z-[100] flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2 transition-[bottom] duration-200 md:bottom-4 ${
+        exporting ? 'bottom-[8.5rem]' : 'bottom-20'
+      }`}
     >
       <AnimatePresence>
         {toasts.map((t) => {
@@ -41,7 +54,26 @@ export function Toaster() {
                 }
               />
               <p className="flex-1 text-sm leading-snug text-foreground">{t.message}</p>
-              <button className="btn-icon h-6 w-6" onClick={() => dismiss(t.id)} aria-label="Dismiss">
+              {t.action && (
+                <button
+                  type="button"
+                  className="-my-1 shrink-0 rounded-md px-2 py-1 text-sm font-semibold text-primary hover:bg-primary/10 coarse:min-h-10"
+                  onClick={() => {
+                    t.action!.run()
+                    dismiss(t.id)
+                  }}
+                >
+                  {t.action.label}
+                </button>
+              )}
+              {/* 40px of touch target on a phone, without growing the card:
+                  the negative margin gives the button back the 24px box the
+                  layout had. */}
+              <button
+                className="btn-icon -m-2 h-10 w-10 shrink-0 md:m-0 md:h-6 md:w-6"
+                onClick={() => dismiss(t.id)}
+                aria-label="Dismiss"
+              >
                 <X className="h-4 w-4" />
               </button>
             </motion.div>

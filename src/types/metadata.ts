@@ -26,12 +26,69 @@ export type SectionKey = (typeof STANDARD_SECTIONS)[number] | string // custom-*
 export const PageFormatSchema = z.enum(['A4', 'Letter'])
 export type PageFormat = z.infer<typeof PageFormatSchema>
 
+/** One user-pinned page break ("Start on new page", 2026-08-17 spec): the
+ *  break lands immediately BEFORE the named section, or before one entry of
+ *  it when `itemId` (the content item's own stable `id`) is present. Pins
+ *  whose target no longer exists resolve to nothing and are ignored. */
+export const PageBreakPinSchema = z.object({
+  section: z.string(),
+  itemId: z.string().optional(),
+})
+export type PageBreakPin = z.infer<typeof PageBreakPinSchema>
+
 export const PageSchema = z.object({
   format: PageFormatSchema.default('A4'),
   /** millimetres */
   margin: z.number().min(0).max(40).default(13),
   /** auto-shrink type/spacing to fit a single page when it's close */
   autoFit: z.boolean().default(true),
+  /** user-pinned page breaks — only meaningful with autoFit off */
+  breaks: z.array(PageBreakPinSchema).default([]),
+  /** Never let a page break fall inside one entry: the whole entry moves to
+   *  the next page instead. Off is the page as it always broke. A section can
+   *  decide for itself (sectionSettings[key].keepTogether); an entry taller
+   *  than a page has no break that clears it and is left alone. */
+  keepEntriesWhole: z.boolean().default(false),
+  /** Magic fit's rules (src/lib/fitOnePage.ts fitToPages): the page target,
+   *  the body size the fit never goes below, what gives first, and the
+   *  sizes it must leave exactly as set. The defaults ARE the old fit (one
+   *  page, type and spacing together, and no floor of the author's own: the
+   *  search's own 0.66 of the body then). Measured: the engineer example
+   *  reaches one page on a 9.7pt template only at 0.70 of the body (6.8pt),
+   *  so a 7pt default floor spilled it onto two pages, and a saved résumé
+   *  must not re-fit differently after an update. The card opens up the
+   *  rest; a floor the author sets is honoured exactly. */
+  fit: z
+    .object({
+      target: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1),
+      minBody: z.number().min(6).max(12).nullable().default(null),
+      priority: z.enum(['spacing', 'both', 'type']).default('both'),
+      /** 'auto' (new résumés from 2026-09-26): print at the size set, and fit
+       *  only to save a nearly empty last page. 'pages': reach `target`. */
+      mode: z.enum(['auto', 'pages']).default('pages'),
+      /** Who chose `minBody`: the app's own floor, or the author. Only an
+       *  author floor is shown as theirs and may raise text above the size set. */
+      minBodyBy: z.enum(['app', 'author']).default('author'),
+      /** The author accepted this many pages: Auto leaves the page as set while it holds. */
+      keptPages: z.number().int().min(1).max(6).nullable().default(null),
+      /** The author's own floor before they allowed a smaller size for one page. */
+      relaxedFrom: z.number().min(6).max(12).nullable().default(null),
+      /** Started from an example: keeps its fitted picture until its content is first edited. */
+      fromExample: z.boolean().default(false),
+      lock: z
+        .object({
+          name: z.boolean().default(false),
+          headline: z.boolean().default(false),
+          contacts: z.boolean().default(false),
+          sectionGap: z.boolean().default(false),
+          /** Keep the line height exactly as the slider says. Without it the
+           *  fit takes space from between the lines before it takes it out of
+           *  the type, which is the cheaper of the two to a reader. */
+          leading: z.boolean().default(false),
+        })
+        .default({}),
+    })
+    .default({}),
 })
 
 export const ThemeSchema = z.object({
@@ -47,7 +104,47 @@ export const ThemeSchema = z.object({
   sidebar: z.string().default('#0f172a'),
   /** text color on the sidebar */
   sidebarText: z.string().default('#e2e8f0'),
+  /** One colour each for the elements the theme colours used to decide
+   *  together. Unset, each is derived exactly as before: the name from the
+   *  body text, the headline and the section titles from the accent, the
+   *  contact line from the muted colour, links from the text around them.
+   *  A template's own derivation (a muted headline, a gold name) stands until
+   *  a colour is set here; every stylesheet rule reads the colour through the
+   *  same fallback chain (elementColors.ts). */
+  name: z.string().optional(),
+  headline: z.string().optional(),
+  headings: z.string().optional(),
+  contacts: z.string().optional(),
+  links: z.string().optional(),
+  /** Second stop of the band header's gradient; unset derives a lighter hue. */
+  gradientTo: z.string().optional(),
+  /** Optional art behind the header, from the bundled set. */
+  artBand: z.enum(['none', 'navy-gold', 'terracotta', 'cobalt', 'emerald']).default('none'),
+  /** Tile fill under sectionFrame: tile; unset is white. */
+  tile: z.string().optional(),
+  /** Footer strip background; unset is the text colour. */
+  footer: z.string().optional(),
 })
+
+/**
+ * How a section title is decorated. ONE vocabulary for both levels that can
+ * set it - the document's default (typography.headingStyle) and a section's
+ * own (layout.sectionSettings[key].headingStyle) - so the two can never
+ * drift into offering a style the other drops. Widened, never renamed: an
+ * unknown value fails the whole document parse and a stored résumé would
+ * come back on defaults.
+ */
+export const HEADING_STYLES = [
+  'underline',
+  'rule-after',
+  'bar',
+  'boxed',
+  'lead-rule',
+  'badge',
+  'strike',
+  'plain',
+] as const
+export type HeadingStyle = (typeof HEADING_STYLES)[number]
 
 export const TypographySchema = z.object({
   /** body font family name (must exist in the font registry) */
@@ -64,10 +161,55 @@ export const TypographySchema = z.object({
   letterSpacing: z.number().min(-0.05).max(0.2).default(0),
   /** heading size scale relative to body */
   headingScale: z.number().min(1).max(2.4).default(1.5),
+  /** The name as an exact multiple of the body size. Left unset, the name is
+   *  derived from headingScale, which cannot go below 2.17x the body - too
+   *  large for a plain résumé, where the name sits about 1.7x the body. Set,
+   *  it says the size outright. Optional, so no existing document moves. */
+  nameScale: z.number().min(1.1).max(3.2).optional(),
+  /** section title size as a multiple of the body size (1.06 is what the page always drew) */
+  sectionTitleScale: z.number().min(0.8).max(1.6).default(1.06),
+  /** headline size as a multiple of the body size */
+  headlineScale: z.number().min(0.7).max(1.8).default(1.15),
+  /** contact line size as a multiple of the body size */
+  contactScale: z.number().min(0.7).max(1.3).default(0.95),
+  /** How the PROSE of the page is set: ragged right, as it always was, or
+   *  justified to both edges. Justification only ever reaches running text in
+   *  the main column - a summary, an entry's summary, a project description,
+   *  a bullet. A heading, a name, a date, a chip or anything in the narrow
+   *  sidebar stays as it was: justifying a short measure opens rivers of
+   *  white space between the words, which reads worse than a ragged edge. */
+  align: z.enum(['left', 'justify']).default('left'),
   /** uppercase section headings */
   uppercaseHeadings: z.boolean().default(true),
+  /** How section titles are cased. Unset, the uppercase flag decides: on is
+   *  'upper'; off decides nothing and the template's own case stands. */
+  headingCase: z.enum(['upper', 'smallcaps', 'none']).optional(),
+  /** weight of the name; unset keeps the template's own */
+  nameWeight: z.enum(['bold', 'regular', 'light']).optional(),
+  /** weight of section titles; unset keeps the template's own */
+  headingWeight: z.enum(['bold', 'regular']).optional(),
+  /** How every section title is decorated, for the WHOLE document; unset
+   *  keeps the template's own, which is what a section's Auto has always
+   *  meant. This is a DEFAULT, not an override: a section that set its own
+   *  headingStyle still wins. Restyling the headings of a nine-section
+   *  résumé through the gear alone measured 27 clicks and 9 hovers (driven
+   *  on the sample document, 2026-09-14); the only one-gesture route was the
+   *  style painter's "All", which clears all 16 style fields before it
+   *  paints and so takes every other per-section choice down with it. */
+  headingStyle: z.enum(HEADING_STYLES).optional(),
+  /** air between a section title and its body, as a multiple of the gap the template draws (1 is what the page always drew) */
+  headingGap: z.number().min(0.5).max(2).default(1),
+  /** width of the rule under a section title, in px; unset keeps the template's own */
+  headingRuleWidth: z.union([z.literal(1), z.literal(2)]).optional(),
   /** bullet marker style for highlight lists */
-  bulletStyle: z.enum(['disc', 'circle', 'square', 'dash', 'arrow', 'check', 'diamond', 'none']).default('disc'),
+  bulletStyle: z.enum(['disc', 'circle', 'square', 'dash', 'arrow', 'check', 'diamond', 'chevron', 'none']).default('disc'),
+  /** how far a highlight list is set in from the text edge, in em of the base size */
+  bulletIndent: z.number().min(0.5).max(2.5).default(1.05),
+  /** vertical space between two bullets, in em of the base size */
+  bulletGap: z.number().min(0).max(1).default(0.2),
+  /** how big the mark itself is drawn, as a multiple of the body size; 1 is
+   *  the size the browser draws for the text it sits beside */
+  bulletSize: z.number().min(0.6).max(1.8).default(1),
   /** how skill/language proficiency ratings render (dots/bars/stars meter, plain text, or hidden) */
   proficiency: z.enum(['dots', 'bars', 'stars', 'text', 'none']).default('dots'),
 })
@@ -76,7 +218,58 @@ export const LayoutSchema = z.object({
   /** 1 = single column, 2 = main + sidebar */
   columns: z.union([z.literal(1), z.literal(2)]).default(1),
   /** header composition override (unset = the template's own header) */
-  headerStyle: z.enum(['standard', 'centered', 'split', 'banner', 'compact']).optional(),
+  headerStyle: z.enum(['standard', 'centered', 'split', 'banner', 'compact', 'display', 'block', 'cover', 'card', 'stepped', 'band', 'kicker']).optional(),
+  /** Where an entry's meta (date, place) sits: in the entry, in a tinted left
+   *  gutter with a decorative year numeral, or in a right margin column. */
+  metaColumn: z.enum(['none', 'gutter', 'margin']).default('none'),
+  /** Section titles above their content, or beside it in a left cell. */
+  headingPlacement: z.enum(['above', 'side']).default('above'),
+  /** How a heading set beside its content is drawn: against a thin rail
+   *  with a node at each section, as a left-aligned hanging label under a
+   *  hairline, or with a short accent tick under it. Only read while
+   *  headingPlacement is 'side'. */
+  sideHeadingStyle: z.enum(['rail', 'hanging', 'tick']).default('rail'),
+  /** Where every entry's date sits unless a section says otherwise: the
+   *  row's right edge, a leading column, straight after the title, or at
+   *  the end of the company line. Unset is the right edge. */
+  dateAlign: z.enum(['right', 'left', 'title', 'inline']).optional(),
+  /** Where a language's level sits: 'end' is an aligned column just past the
+   *  names (it once meant the far edge of the row), 'inline' right after the
+   *  name, 'tag' a small outlined label beside it, 'line' every language on
+   *  one line with its level in brackets, 'cards' a grid of small cards. */
+  levelPlacement: z.enum(['end', 'inline', 'cards', 'tag', 'line']).default('end'),
+  /** Every section as a rounded tile on a tinted page. */
+  sectionFrame: z.enum(['none', 'tile']).default('none'),
+  /** A band of numbers derived from the content (years, companies, skills,
+   *  a headline number), painted as decoration only. */
+  stats: z.boolean().default(false),
+  /** The numbers band as the author shaped it: which numbers, in which
+   *  order, with any label or value they typed over the derived one. Absent
+   *  means the derived default. No cap here (a longer list must never fail
+   *  the document); the resolver keeps five. */
+  statTiles: z
+    .array(
+      z.object({
+        id: z.string(),
+        kind: z.enum(['years', 'companies', 'projects', 'certifications', 'languages', 'headline', 'skills', 'custom']),
+        label: z.string().optional(),
+        value: z.string().optional(),
+      })
+    )
+    .optional(),
+  /** Decorative running numbers before section titles (01, 02, ...). */
+  sectionNumbers: z.boolean().default(false),
+  /** How that running numeral is SET, once it is drawn. The switch above
+   *  says whether to number the sections at all; this says in what figures.
+   *  'padded' is the two-digit folio every numbered design has always drawn
+   *  (01, 02), and is the default so an existing file is unchanged; 'plain'
+   *  is the bare figure (1, 2); 'dot' is the figure with a full stop after
+   *  it (1., 2.), which reads as a list rather than as a folio; 'roman' is
+   *  upper-case roman (I, II, III), which several designs' capital headings
+   *  were already set for. Decoration in every style - the painter draws it
+   *  as outlines and the Word file and the ATS text never carry it - so the
+   *  choice cannot change a word a parser reads. */
+  sectionNumberStyle: z.enum(['padded', 'plain', 'dot', 'roman']).default('padded'),
   /** which side the sidebar sits on (only used when columns === 2) */
   sidebar: z.enum(['left', 'right']).default('left'),
   /** sidebar width as a fraction of content width (0.28 - 0.42) */
@@ -85,6 +278,41 @@ export const LayoutSchema = z.object({
   main: z.array(z.string()).default([]),
   /** ordered list of section keys in the SIDEBAR (columns === 2) */
   aside: z.array(z.string()).default([]),
+  /** Section keys rendered in a compact strip at the foot of the page,
+   *  after the main flow; the ATS text and the Word file list them last. */
+  footer: z.array(z.string()).default([]),
+  /** A quiet line at the foot of EVERY page - the name, and the page number
+   *  when there is more than one - drawn as decoration only: outlines in the
+   *  PDF, nothing in the text layer, the Word file or the ATS text. The main
+   *  column keeps its band clear on every page (artboard.css .rm-pagefoot). */
+  pageFoot: z.boolean().default(false),
+  /** The words at the left of the page foot; unset is the author's name. */
+  pageFootLabel: z.string().optional(),
+  /** How the foot writes the page number: "1 / 2" (unset), "Page 1 of 2",
+   *  "1", or no number at all (src/lib/pageWords.ts pageFootText). */
+  pageFootNumber: z.enum(['slash', 'of', 'plain', 'none']).optional(),
+  /** Words left and number right (unset), or the two centred together. */
+  pageFootAlign: z.enum(['split', 'center']).optional(),
+  /** The hairline above the foot; unset keeps it. */
+  pageFootRule: z.boolean().optional(),
+  /** The line above the name (the kicker header) in the author's own words:
+   *  unset keeps the defaults ("Curriculum vitae" on the left, the place and
+   *  the year on the right), an empty string leaves that side blank, and
+   *  show: false takes the line away (src/lib/pageWords.ts). Decoration only
+   *  - nothing a parser reads. */
+  kicker: z
+    .object({
+      show: z.boolean().optional(),
+      left: z.string().optional(),
+      right: z.string().optional(),
+    })
+    .optional(),
+  /** A hairline frame inset from the paper's edge on every page, drawn as
+   *  running decoration like the foot (Artboard's `rm-running`). */
+  pageFrame: z.boolean().default(false),
+  /** A whisper-light drafting grid across every page, drawn UNDER the words
+   *  (the running layer paints before the page's own content). */
+  pageGrid: z.boolean().default(false),
   /** hidden section keys */
   hidden: z.array(z.string()).default([]),
   /** custom heading label overrides keyed by section key */
@@ -95,30 +323,87 @@ export const LayoutSchema = z.object({
       z.object({
         showBullets: z.boolean().optional(),
         showDates: z.boolean().optional(),
+        /** Append the length of each date range in parentheses ("2 yrs 3 mos").
+         *  Opt-in. Real text the shared date formatter adds, so the page, the
+         *  Word file and the ATS text all print the same words. */
+        showDuration: z.boolean().optional(),
         showLocation: z.boolean().optional(),
         showSummary: z.boolean().optional(),
         showKeywords: z.boolean().optional(),
-        /** per-section heading treatment (overrides the template's) */
-        headingStyle: z
-          .enum(['underline', 'rule-after', 'bar', 'boxed', 'lead-rule', 'badge', 'strike', 'plain'])
-          .optional(),
+        /** Per-section heading treatment. Beats the document's own default
+         *  (typography.headingStyle) where it is set; unset follows it, and
+         *  follows the template where that is unset too. Same vocabulary as
+         *  the document level (HEADING_STYLES), so neither level can offer a
+         *  style the other drops. */
+        headingStyle: z.enum(HEADING_STYLES).optional(),
         /** how the skills section displays its keywords (skills section only) */
-        skillsStyle: z.enum(['chips', 'tags', 'inline', 'grid']).optional(),
+        // 'stacked' puts the group name on its own line with the keyword
+        // list beneath it, rather than running the list on after the name.
+        skillsStyle: z.enum(['chips', 'tags', 'inline', 'grid', 'stacked', 'mosaic', 'rings']).optional(),
+        /** How an entry's own keyword tags look, for the sections whose
+         *  entries carry keywords (projects). The skills pickers only ever
+         *  reached the skills section, so a project's tech tags had no style
+         *  at all. Unset keeps the chips the template draws.
+         *  The values name the skills styles of the same names, so a tag row
+         *  can be made to read exactly like a skills row. 'rings' is left out
+         *  on purpose: a ring draws a proficiency level, and a project keyword
+         *  has none. Widened, never renamed - an unknown value here fails the
+         *  whole document parse. */
+        tagStyle: z.enum(['chips', 'tags', 'inline', 'stacked', 'grid']).optional(),
+        /** How the section's visible URL line is drawn (projects). The
+         *  document's links.style governs NAMED links and the header
+         *  contacts; the address printed under a project title answered
+         *  nothing at all until this. 'auto' (and unset) follows the
+         *  document, so an existing file is unchanged; 'tag' wears the same
+         *  tag a named link wears; 'plain' is ordinary text; 'none' does not
+         *  print, in the Word file and the ATS text as well. */
+        linkStyle: z.enum(['auto', 'tag', 'plain', 'none']).optional(),
         /** how the section's entries are laid out (overrides the template's flow) */
-        entryLayout: z.enum(['timeline', 'cards', 'grid', 'divided']).optional(),
+        entryLayout: z.enum(['timeline', 'cards', 'grid', 'divided', 'ledger']).optional(),
         /** how the education score (GPA) is placed: inline (default), pushed right, or a pill */
         scoreStyle: z.enum(['inline', 'right', 'pill']).optional(),
         /** show a monogram badge (company/institution initial) beside each entry */
         showBadges: z.boolean().optional(),
         /** per-section bullet marker (overrides the global typography choice) */
-        bulletStyle: z.enum(['disc', 'circle', 'square', 'dash', 'arrow', 'check', 'diamond', 'none']).optional(),
+        bulletStyle: z.enum(['disc', 'circle', 'square', 'dash', 'arrow', 'check', 'diamond', 'chevron', 'none']).optional(),
         /** per-section proficiency meter for skills/languages (overrides typography.proficiency) */
         meterStyle: z.enum(['dots', 'bars', 'stars', 'text', 'none']).optional(),
         /** entry logo / letter-badge size */
         badgeSize: z.enum(['s', 'm', 'l']).optional(),
+        /** How much room a skill pill takes around its text. */
+        chipSize: z.enum(['s', 'm', 'l']).optional(),
         /** entry logo / letter-badge shape */
         badgeShape: z.enum(['rounded', 'circle', 'square']).optional(),
-      }),
+        /** An address for the section's own HEADING. Every other line on the
+         *  page could be linked; a heading could not, so a portfolio or a
+         *  publication list had nowhere to point. */
+        url: z.string().optional(),
+        /** Where the section's heading sits across its column; unset keeps
+         *  the template's own (three templates centre theirs). */
+        headingAlign: z.enum(['left', 'center']).optional(),
+        /** Which field leads an entry: the title (position, degree) or the
+         *  organisation (company, institution; a custom entry's subtitle).
+         *  Unset leads with the title, as the page always did. */
+        entryOrder: z.enum(['title-first', 'org-first']).optional(),
+        /** Which of the two is bold. Unset is the title, whichever leads. */
+        entryEmphasis: z.enum(['title', 'org']).optional(),
+        /** Where an entry's location prints: on the sub-line under the title
+         *  with the rest of the entry's detail, or beside the date on the
+         *  head row. Unset is the sub-line, as the page always drew it. */
+        locationPlacement: z.enum(['subline', 'with-date']).optional(),
+        /** Which edge of the head row the date sits on. Unset is the right,
+         *  as the page always drew it. */
+        dateAlign: z.enum(['right', 'left', 'title', 'inline']).optional(),
+        /** The heading badge's glyph, by name ('none' for no badge on this
+         *  section). Unset takes the glyph the section's kind or title
+         *  suggests. */
+        icon: z.string().max(40).optional(),
+        /** Whether a page break may fall inside one of this section's
+         *  entries. Unset follows the document (page.keepEntriesWhole), so a
+         *  section can hold its entries whole while the rest of the page
+         *  breaks freely, or break freely while the rest holds. */
+        keepTogether: z.boolean().optional(),
+      })
     )
     .default({}),
   /** vertical rhythm between sections in pt */
@@ -127,6 +412,38 @@ export const LayoutSchema = z.object({
   itemGap: z.number().min(2).max(24).default(5),
   /** show small icons next to contact details / section headers */
   icons: z.boolean().default(true),
+  /** How the contact line is arranged. A narrow sidebar reads far better with
+   *  one contact per row than with a wrapping run of them. */
+  contactStyle: z.enum(['inline', 'stacked', 'strip', 'pills']).default('inline'),
+  /** Where the contact line sits in the header: under the name, beside it
+   *  (a right-hand column), above it, or at the top of the sidebar on a
+   *  two-column page. */
+  contactPlacement: z.enum(['below', 'beside', 'above', 'sidebar']).default('below'),
+  /** How the labelled strip holds whole addresses (links shown in full):
+   *  a ledger of links under the short contacts, two wider columns, or three
+   *  columns that wrap an address at its slashes. */
+  contactLinks: z.enum(['ledger', 'columns', 'wrap']).default('ledger'),
+  /** What sits between contacts on an inline row. Templates used to hard-code
+   *  this, so an author who wanted dots between their details - or nothing at
+   *  all - had to change template to get them. */
+  contactSeparator: z.enum(['none', 'dot', 'pipe', 'slash', 'dash', 'node', 'chevron']).default('none'),
+  /**
+   * How a section heading's icon is presented. The badge is one of the
+   * loudest stylistic choices on the page, so it is worth a real control:
+   * 'folio' is a paper-toned chip with a folded corner and a solid glyph,
+   * the default for new documents; 'chip' is the tinted rounded square
+   * templates drew before it; 'none' removes the badge while leaving
+   * CONTACT icons alone (those are the separate `icons` switch). Values are
+   * only ever ADDED here: an unknown value fails the whole metadata parse
+   * and a stored document would come back on defaults.
+   */
+  /** What sits between the keywords of a skill group, a course list or an
+   *  interest: the middot the page always drew, or a comma, which is what a
+   *  plain résumé uses. Defaults to the middot, so no existing file moves. */
+  keywordSeparator: z.enum(['middot', 'comma', 'pipe', 'slash', 'space']).default('middot'),
+  sectionIconStyle: z.enum(['folio', 'chip', 'plain', 'filled', 'circle', 'outline', 'none']).default('folio'),
+  /** How large the section-heading badge is, for every icon style. */
+  sectionIconSize: z.enum(['s', 'm', 'l']).default('m'),
   /** show the photo (if provided) */
   showPhoto: z.boolean().default(false),
   /** show a monogram (initials in a colored badge) instead of a photo */
@@ -135,6 +452,59 @@ export const LayoutSchema = z.object({
   photoShape: z.enum(['circle', 'rounded', 'square', 'diamond']).default('circle'),
   /** photo size */
   photoSize: z.enum(['s', 'm', 'l']).default('m'),
+  /** Where the photo sits across its column. Centred by default: a sidebar
+   *  portrait pinned to the left edge with the heading tight underneath reads
+   *  as a mistake rather than a choice (2026-08-25 report). */
+  photoAlign: z.enum(['left', 'center', 'right']).default('center'),
+})
+
+/**
+ * How URLs are DISPLAYED. The target is always the full, normalised address -
+ * display and destination are separate concerns, and conflating them is why
+ * an author could not choose to show a full URL even when they wanted to.
+ *
+ *   pretty  github.com/someone          (scheme and trailing slash dropped)
+ *   full    https://github.com/someone  (exactly as entered)
+ *   short   someone                     (host dropped too, for a tidy line)
+ */
+export const LinkDisplaySchema = z.enum(['pretty', 'full', 'short'])
+export type LinkDisplay = z.infer<typeof LinkDisplaySchema>
+
+export const LinksSchema = z.object({
+  display: LinkDisplaySchema.default('pretty'),
+  /** Underline links so a reader can SEE which text is clickable. */
+  underline: z.boolean().default(false),
+  /** Whether links are LIVE in the exported PDF. Some readers want the
+   *  address printed but not clickable - for a paper submission, or where a
+   *  live link in a PDF is unwelcome - so this is the author's call. */
+  clickable: z.boolean().default(true),
+  /** How a NAMED link (a project's Portfolio, a credential's Verify) is
+   *  drawn: 'tag' sets the word in a small paper-toned tag with an accent
+   *  bar, 'plain' prints the bare word. Contact and header links are never
+   *  tagged. Purely visual - the text every exporter reads is the same. */
+  style: z.enum(['plain', 'tag']).default('tag'),
+})
+
+/**
+ * How every date on the page reads. One block for the whole document, read
+ * by the shared date formatter, so the canvas, the Word file and the ATS
+ * text spell a date the same way. Each default is what the page always
+ * printed - a short English month, a spaced em dash, the word Present - so
+ * a document saved before the block existed reads exactly as it did.
+ */
+export const DatesSchema = z.object({
+  /** how the month is spelled: Jan 2021, January 2021, 01/2021, or the year alone */
+  month: z.enum(['short', 'long', 'numeric', 'none']).default('short'),
+  /** what sits between the two ends of a range */
+  separator: z.enum(['endash', 'emdash', 'to', 'hyphen']).default('emdash'),
+  /** the word an open-ended range ends with */
+  present: z.string().default('Present'),
+  /** the word before a finish that has not happened yet: "Expected May 2027" */
+  expected: z.string().default('Expected'),
+  /** the word a course still under way reads as when it names no finish */
+  pursuing: z.string().default('Pursuing'),
+  /** BCP-47 tag for month names and time-span words; the PDF declares it as its language too */
+  language: z.string().default('en'),
 })
 
 export const MetadataSchema = z.object({
@@ -143,12 +513,16 @@ export const MetadataSchema = z.object({
   theme: ThemeSchema.default({}),
   typography: TypographySchema.default({}),
   layout: LayoutSchema.default({}),
+  links: LinksSchema.default({}),
+  dates: DatesSchema.default({}),
 })
 
 export type Page = z.infer<typeof PageSchema>
 export type Theme = z.infer<typeof ThemeSchema>
 export type Typography = z.infer<typeof TypographySchema>
 export type Layout = z.infer<typeof LayoutSchema>
+export type Links = z.infer<typeof LinksSchema>
+export type Dates = z.infer<typeof DatesSchema>
 export type Metadata = z.infer<typeof MetadataSchema>
 
 /** Page pixel dimensions at 96dpi (CSS px). 1mm = 96/25.4 px. */

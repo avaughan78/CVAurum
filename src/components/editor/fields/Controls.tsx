@@ -1,4 +1,7 @@
+import { useEffect, useRef, useState } from 'react'
+import { ChevronDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { commitTyped } from '@/lib/designRanges'
 
 export function Slider({
   label,
@@ -17,13 +20,65 @@ export function Slider({
   step?: number
   unit?: string
   onChange: (v: number) => void
+  /** Readout formatter; the typed box shows the bare number and borrows
+   *  whatever this appends after the digits as its unit. */
   format?: (v: number) => string
 }) {
+  // The typed box owns its text while it has focus, and commits nothing until
+  // the value is finished: focus leaving, or Enter saying so. Committing per
+  // keystroke reflowed the whole document on the "1" of "1.5" and the "2" of
+  // "25" - every prefix of the number the author was typing was a document of
+  // its own. The slider beside it still applies live: dragging it IS the
+  // finished value at every step. (commitTyped clamps and rejects.)
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = () => {
+    if (draft === null) return
+    const v = commitTyped(draft, min, max)
+    setDraft(null)
+    if (v !== null) onChange(v)
+  }
+  // The spinner arrows step the value without ever blurring the box, and
+  // React's onChange is really the `input` event, which only fills the draft
+  // - so a click on an arrow moved the number and changed nothing. The
+  // NATIVE `change` event is the one that separates the two gestures: a
+  // number input fires it the moment a step lands, and for typing only when
+  // focus leaves. Committing there makes an arrow apply at once, which is
+  // what an arrow is for, while a half-typed number still waits.
+  const commitRef = useRef(commit)
+  commitRef.current = commit
+  const boxRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    const el = boxRef.current
+    if (!el) return
+    const onNativeChange = () => commitRef.current()
+    el.addEventListener('change', onNativeChange)
+    return () => el.removeEventListener('change', onNativeChange)
+  }, [])
+  const suffix = unit || (format ? format(value).replace(/^[-+\d.,]+/, '') : '')
   return (
     <div>
-      <div className="mb-1 flex items-center justify-between">
+      <div className="mb-1 flex items-center justify-between gap-2">
         <label className="text-xs font-medium text-muted-foreground">{label}</label>
-        <span className="text-xs tabular-nums text-foreground">{format ? format(value) : `${value}${unit}`}</span>
+        <span className="flex items-center gap-1 text-xs tabular-nums text-foreground">
+          <input
+            ref={boxRef}
+            type="number"
+            min={min}
+            max={max}
+            step={step}
+            value={draft ?? String(Number(value.toFixed(4)))}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              // Enter commits through the blur handler, so there is one path
+              // in and out of the draft however the author finishes.
+              if (e.key === 'Enter') e.currentTarget.blur()
+            }}
+            aria-label={label}
+            className="h-6 w-16 rounded border border-input bg-surface px-1.5 text-right text-xs tabular-nums text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+          {suffix && <span className="text-muted-foreground">{suffix}</span>}
+        </span>
       </div>
       <input
         type="range"
@@ -59,15 +114,27 @@ export function Segmented<T extends string>({
   value,
   options,
   onChange,
+  wrap = false,
+  itemClass,
 }: {
   value: T
   options: { value: T; label: string }[]
   onChange: (v: T) => void
+  /** Let a long option list flow onto a second line instead of clipping
+   *  at the panel's edge (a row of seven text buttons lost its last one). */
+  wrap?: boolean
+  /** Each button's sizing, in place of the defaults - e.g. two to a row. */
+  itemClass?: string
 }) {
   return (
-    <div className="segmented w-full">
+    <div className={`segmented w-full${wrap ? ' flex-wrap' : ''}`}>
       {options.map((o) => (
-        <button key={o.value} className="flex-1" data-active={value === o.value} onClick={() => onChange(o.value)}>
+        <button
+          key={o.value}
+          className={itemClass ?? (wrap ? 'grow basis-[22%]' : 'flex-1')}
+          data-active={value === o.value}
+          onClick={() => onChange(o.value)}
+        >
           {o.label}
         </button>
       ))}
@@ -75,20 +142,92 @@ export function Segmented<T extends string>({
   )
 }
 
-export function ColorField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+/** A labelled native select for a list too long for a Segmented row. A
+ *  stored value the list does not know is shown as its own option rather
+ *  than silently snapping to the first one. */
+export function Select<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string
+  value: T
+  options: { value: T; label: string }[]
+  onChange: (v: T) => void
+}) {
+  const known = options.some((o) => o.value === value)
   return (
+    <div>
+      <label className="label">{label}</label>
+      <select className="input" value={value} onChange={(e) => onChange(e.target.value as T)} aria-label={label}>
+        {!known && <option value={value}>{value}</option>}
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
+export function ColorField({
+  label,
+  value,
+  fallback,
+  onChange,
+  onClear,
+  note,
+}: {
+  label: string
+  value: string | undefined
+  /** What the page draws while nothing is set: the swatch shows it and the
+   *  box reads Auto. */
+  fallback?: string
+  onChange: (v: string) => void
+  /** Puts the colour back on Auto (unset). The button shows only while a
+   *  value is set, so a field that is always set never grows one. */
+  onClear?: () => void
+  /**
+   * What this colour MEASURES where the page sets it, when that is under the
+   * bar - shown under the row that sets it.
+   *
+   * The accent corrects itself at render time (elementColors.ts
+   * darkenToContrast), so it never needs one. The others are not corrected
+   * and must not be: a body colour, a muted colour, a band's own ink are the
+   * author's choice, and a builder that quietly moved them would be deciding
+   * what their resume looks like. So the panel SAYS what the pair comes to,
+   * beside the control that made it, and leaves the choice where it belongs.
+   */
+  note?: string
+}) {
+  const shown = value || fallback || ''
+  const row = (
     <div className="flex items-center justify-between gap-2">
       <label className="text-xs font-medium text-muted-foreground">{label}</label>
       <div className="flex items-center gap-1.5">
+        {onClear && value ? (
+          <button
+            type="button"
+            onClick={onClear}
+            title="Back to Auto"
+            className="h-7 rounded border border-input bg-surface px-1.5 text-[11px] text-muted-foreground transition hover:text-foreground"
+          >
+            Auto
+          </button>
+        ) : null}
         <input
-          value={value}
+          value={value ?? ''}
+          placeholder={onClear ? 'Auto' : undefined}
           onChange={(e) => onChange(e.target.value)}
+          aria-label={`${label} hex`}
           className="h-7 w-20 rounded border border-input bg-surface px-2 text-xs tabular-nums"
         />
-        <label className="relative h-7 w-7 overflow-hidden rounded border border-input" style={{ background: value }}>
+        <label className="relative h-7 w-7 overflow-hidden rounded border border-input" style={{ background: shown }}>
           <input
             type="color"
-            value={normalizeHex(value)}
+            value={normalizeHex(shown)}
             onChange={(e) => onChange(e.target.value)}
             className="absolute inset-0 cursor-pointer opacity-0"
             aria-label={label}
@@ -97,17 +236,86 @@ export function ColorField({ label, value, onChange }: { label: string; value: s
       </div>
     </div>
   )
+  if (!note) return row
+  return (
+    <div className="space-y-1">
+      {row}
+      <p className="text-[11px] text-amber-700 dark:text-amber-400">{note}</p>
+    </div>
+  )
 }
 
 function normalizeHex(v: string): string {
   return /^#[0-9a-fA-F]{6}$/.test(v) ? v : '#000000'
 }
 
-export function FieldGroup({ title, children }: { title: string; children: React.ReactNode }) {
+/** Where a group's open/closed state is kept, so folding one away sticks. */
+const GROUP_KEY = 'cvaurum:panel-group:'
+
+function readOpen(title: string, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem(GROUP_KEY + title)
+    return v === null ? fallback : v === '1'
+  } catch {
+    // Private mode, or storage blocked. The panel still has to open.
+    return fallback
+  }
+}
+
+/**
+ * One titled group of controls, foldable.
+ *
+ * The Design panel is seven of these and about a thousand lines of controls —
+ * the layout group alone is longer than a screen twice over — so finding the
+ * one setting you came for meant scrolling past every setting you did not.
+ * Each group now folds, and remembers: fold away the ones your résumé is done
+ * with and they stay folded next time.
+ *
+ * `defaultOpen` false is for the refinements (per-element colour overrides,
+ * date formats, link styling) — everything a first-time visitor needs is open
+ * on a fresh browser, because a control nobody can find is a control that does
+ * not exist.
+ */
+export function FieldGroup({
+  title,
+  children,
+  defaultOpen = true,
+}: {
+  title: string
+  children: React.ReactNode
+  defaultOpen?: boolean
+}) {
+  const [open, setOpen] = useState(() => readOpen(title, defaultOpen))
+  const toggle = () => {
+    setOpen((v) => {
+      try {
+        localStorage.setItem(GROUP_KEY + title, v ? '0' : '1')
+      } catch {
+        /* nothing to remember it with; the session still works */
+      }
+      return !v
+    })
+  }
+  const id = `group-${title.replace(/\s+/g, '-').toLowerCase()}`
   return (
     <section className="space-y-3">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</h3>
-      {children}
+      <h3>
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={open}
+          aria-controls={id}
+          className="group -mx-1 flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground transition hover:text-foreground"
+        >
+          <span>{title}</span>
+          <ChevronDown
+            className={cn('h-3.5 w-3.5 shrink-0 opacity-50 transition-transform group-hover:opacity-100', !open && '-rotate-90')}
+          />
+        </button>
+      </h3>
+      <div id={id} className={cn('space-y-3', !open && 'hidden')}>
+        {children}
+      </div>
     </section>
   )
 }

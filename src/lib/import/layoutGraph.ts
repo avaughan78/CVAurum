@@ -28,6 +28,9 @@ export interface Item {
   bold: boolean
   page: number
   col: 0 | 1 | 2 // 0 = full-width/single, 1 = left column, 2 = right column
+  /** true when this item sits in the NARROW column (the sidebar/aside),
+   *  whichever side it is on — the wide column is the main flow. */
+  aside: boolean
 }
 
 export interface Line {
@@ -41,6 +44,8 @@ export interface Line {
   upper: boolean
   page: number
   col: 0 | 1 | 2
+  /** see Item.aside */
+  aside: boolean
 }
 
 export interface LayoutGraph {
@@ -54,6 +59,31 @@ export interface LayoutGraph {
   ocrPages: number[]
   /** OCR was needed but the engine itself failed to start (blocked/offline). */
   ocrEngineFailed: boolean
+  /** What the file itself is like, beyond its words: the evidence the ATS
+   *  check's file rules read (src/lib/import/fileFacts.ts). */
+  file?: FileEvidence
+}
+
+/**
+ * Facts about the file a parser would meet, collected while it is read.
+ *
+ * The importer repairs what it can - it closes up letter-spaced headings,
+ * recovers two columns, OCRs a scanned page - which is right for importing and
+ * wrong for judging: a checker that only ever sees the repaired text tells the
+ * author their file is fine when the parser at the other end will not repair
+ * it. So the unrepaired facts are kept here.
+ */
+export interface FileEvidence {
+  /** Each page's size in points, in page order. */
+  pageSizes: { w: number; h: number }[]
+  /** Non-space characters in the native text layer, and how many of them map
+   *  to no real letter (no ToUnicode entry: private-use, replacement, control). */
+  textChars: number
+  unmappedChars: number
+  /** Lines whose raw text was letter-spaced ("S U M M A R Y"), as read and as repaired. */
+  tracked: { page: number; raw: string; text: string }[]
+  /** Pictures painted on each page, with their size in points. */
+  images: { page: number; x: number; top: number; w: number; h: number }[]
 }
 
 export interface BuildOptions {
@@ -91,15 +121,64 @@ interface PageText {
   total: number
 }
 
+type Matrix = [number, number, number, number, number, number]
+const mul = (m: Matrix, n: Matrix): Matrix => [
+  m[0] * n[0] + m[2] * n[1],
+  m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3],
+  m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4],
+  m[1] * n[4] + m[3] * n[5] + m[5],
+]
+
+/**
+ * The pictures a page paints, and how big. An image is drawn into the unit
+ * square under the current transform, so its size on the page is the length
+ * of the transform's two axis vectors. Image masks are left out: those are
+ * one-colour stencils (icons), not pictures.
+ */
+async function pageImages(page: pdfjsLib.PDFPageProxy, num: number, height: number): Promise<FileEvidence['images']> {
+  const out: FileEvidence['images'] = []
+  try {
+    const ops = await page.getOperatorList()
+    const O = pdfjsLib.OPS
+    const stack: Matrix[] = []
+    let ctm: Matrix = [1, 0, 0, 1, 0, 0]
+    for (let i = 0; i < ops.fnArray.length; i++) {
+      const fn = ops.fnArray[i]
+      const args = ops.argsArray[i] as unknown[]
+      if (fn === O.save) stack.push(ctm)
+      else if (fn === O.restore) ctm = stack.pop() ?? ctm
+      else if (fn === O.transform) ctm = mul(ctm, args as Matrix)
+      else if (fn === O.paintFormXObjectBegin) {
+        stack.push(ctm)
+        if (Array.isArray(args?.[0]) && (args[0] as number[]).length === 6) ctm = mul(ctm, args[0] as Matrix)
+      } else if (fn === O.paintFormXObjectEnd) ctm = stack.pop() ?? ctm
+      else if (fn === O.paintImageXObject || fn === O.paintInlineImageXObject || fn === O.paintImageXObjectRepeat) {
+        const w = Math.hypot(ctm[0], ctm[1])
+        const h = Math.hypot(ctm[2], ctm[3])
+        if (w > 1 && h > 1) out.push({ page: num, x: ctm[4], top: height - ctm[5] - h, w, h })
+      }
+    }
+  } catch {
+    /* a page whose operators cannot be listed has no pictures we can speak for */
+  }
+  return out
+}
+
 async function readTextLayer(
   doc: pdfjsLib.PDFDocumentProxy,
-): Promise<{ pages: PageText[]; pageWidth: Map<number, number> }> {
+): Promise<{ pages: PageText[]; pageWidth: Map<number, number>; sizes: FileEvidence['pageSizes']; images: FileEvidence['images'] }> {
   const pages: PageText[] = []
   const pageWidth = new Map<number, number>()
+  const sizes: FileEvidence['pageSizes'] = []
+  const images: FileEvidence['images'] = []
   for (let p = 1; p <= doc.numPages; p++) {
     const page = await doc.getPage(p)
     const viewport = page.getViewport({ scale: 1 })
     pageWidth.set(p, viewport.width)
+    sizes.push({ w: viewport.width, h: viewport.height })
+    images.push(...(await pageImages(page, p, viewport.height)))
     const tc = await page.getTextContent()
     const styles = tc.styles as Record<string, { fontFamily?: string }>
     const items: Item[] = []
@@ -121,12 +200,13 @@ async function readTextLayer(
         bold: BOLD_RE.test(fam) || BOLD_RE.test(String(raw.fontName)),
         page: p,
         col: 0,
+        aside: false,
       })
     }
     pages.push({ num: p, items, usable, total })
     page.cleanup()
   }
-  return { pages, pageWidth }
+  return { pages, pageWidth, sizes, images }
 }
 
 /**
@@ -172,16 +252,97 @@ function collapseTracking(text: string): string {
 }
 
 /**
+ * The items on a page that carry RUNNING TEXT - the population the gutter scan
+ * below measures a page's density against.
+ *
+ * pdf.js hands back one item per text-showing operator, which means the count
+ * moves whenever the file's text layer is cut differently even though the page
+ * reads the same. Two kinds of item are not running text and should not be
+ * counted as if they were:
+ *   - nothing at all. A whitespace-only item paints no ink; our own exporter
+ *     writes one wherever a visible space bridges a gap between two runs on one
+ *     row (paint.ts's bridgeGapWithSpace, which is what makes a title/date row
+ *     extract as a single line).
+ *   - a single character. A list marker is one ("•"), and so is every
+ *     letter or digit pdf.js splits off on its own where a bold word or a
+ *     tracked figure changes the font mid-line.
+ *
+ * Measured, on the gate's own rich `measure` document, whose pages 2 and 3 are
+ * ONE column with a date rail down the right: page 2 carries 212 items, 23 of
+ * them a single character (11 of those the bullet marks the exporter now draws
+ * as real text). Its best gutter candidate is crossed by 6 items - all of them
+ * main-column prose lines running under the rail. Counted against all 212, the
+ * 3% cap is 6.36 and the rail is accepted as a sidebar: three of eight work
+ * entries were lost on import. Counted against the 189 that carry running
+ * text, the cap is 5.67 and the rail is rejected, which is the right answer and
+ * the one the page gave before its text layer was recut.
+ *
+ * So the denominator stops moving when the file's text layer changes shape,
+ * which is what a proportional cap needs from it - and no document has to live
+ * with a cap lowered on its behalf.
+ */
+const runningTextItems = (items: Item[]): Item[] => items.filter((it) => it.str.trim().length > 1)
+
+/** One word of a date as a résumé sets it: a month, a year, a numeric date,
+ *  "Present" and its kin, or the dash and "to" between two of them. */
+const DATE_WORD =
+  /^(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?|\d{4}|\d{1,2}[/.-]\d{2,4}|present|current|now|today|to|till|[-–—])$/i
+const isDateText = (s: string) => {
+  const words = s.trim().split(/\s+/).map((w) => w.replace(/[,()]/g, '')).filter(Boolean)
+  return words.length > 0 && words.every((w) => DATE_WORD.test(w))
+}
+
+/**
+ * True when one side of a candidate gutter holds almost nothing but dates - a
+ * one-column page whose dates are set flush right (or left), not a sidebar.
+ * Measured on the import gate's rich document in the larger signature
+ * designs: a last page of certificates, awards and a publication - short
+ * titles on the left, a year each on the right - split cleanly at the gap,
+ * and the years were read as a column and handed to another section.
+ */
+function isDateRail(items: Item[], gutter: number): boolean {
+  let left = 0
+  let right = 0
+  let leftDates = 0
+  let rightDates = 0
+  for (const it of items) {
+    if (it.x < gutter - 2 && it.x + it.width > gutter + 2) continue
+    const date = isDateText(it.str)
+    if (it.x + it.width <= gutter) {
+      left++
+      if (date) leftDates++
+    } else {
+      right++
+      if (date) rightDates++
+    }
+  }
+  // Three quarters, not all: a rail carries the odd word beside its dates (an
+  // education line's "GPA" measured there), and a real sidebar is mostly words.
+  return (right > 0 && rightDates >= right * 0.75) || (left > 0 && leftDates >= left * 0.75)
+}
+
+/**
  * Find a clean vertical gutter that splits a page's items into two columns.
  * A good gutter has (almost) no item straddling it and substantial text on both
- * sides. Returns the x position, or null for single-column pages.
+ * sides. Returns the x position, or null for single-column pages - which a
+ * page whose one side is only dates is (isDateRail). Exported for its tests.
  */
-function detectGutter(items: Item[], width: number): number | null {
+export function detectGutter(all: Item[], width: number): number | null {
+  const items = runningTextItems(all)
   if (items.length < 20 || width <= 0) return null
   let best: number | null = null
   let bestStraddle = Infinity
-  for (let frac = 0.3; frac <= 0.62; frac += 0.02) {
-    const c = width * frac
+  // Integer stepping (2026-08-16): the old `frac += 0.02` float loop
+  // accumulated to 0.6200000000000002 and SKIPPED its own 0.62 endpoint —
+  // which was the only clean gutter on clarity's right-side aside (straddle
+  // 0 at exactly 0.62, every earlier candidate rejected at 13-28
+  // straddles), so the page fell back to single-column and the interleaved
+  // sections shattered on import. Range extended to 0.68: a right-side
+  // aside a third of the page wide puts its gutter near 0.64-0.67; the
+  // straddle cap still rejects fake gutters (full-width prose crosses
+  // them).
+  for (let k = 0; k <= 19; k++) {
+    const c = width * (0.3 + k * 0.02)
     let straddle = 0,
       left = 0,
       right = 0
@@ -190,12 +351,81 @@ function detectGutter(items: Item[], width: number): number | null {
       else if (it.x + it.width <= c) left++
       else right++
     }
-    if (left < items.length * 0.2 || right < items.length * 0.2) continue // both sides must be populated
+    // Both sides must be populated. An ABSOLUTE floor with a soft
+    // proportional component (2026-08-16): the old flat 20% rejected real
+    // sidebars on dense multi-page docs — clarity's aside fell under 20%
+    // of page-1 items once the main column held seven work entries, the
+    // gutter went undetected, and the interleaved columns shattered every
+    // section on import. The straddle cap below remains the guard against
+    // fake gutters (prose and full-width lines cross them).
+    const floor = Math.max(10, items.length * 0.08)
+    if (left < floor || right < floor) continue
     if (straddle <= items.length * 0.03 && straddle < bestStraddle) {
       bestStraddle = straddle
       best = c
     }
   }
+  // FALLBACK - a full-width BAND above the columns. Many real resumes run a
+  // header, and often a summary, across the whole page before the two
+  // columns start. Every one of those lines crosses any candidate gutter, so
+  // the straddle cap above rejects the page outright: measured on a real
+  // two-column resume whose header and five-line summary spanned the width,
+  // 13% straddle against a 3% cap. The columns went undetected and every row
+  // merged left into right - its two section headings extracted as the
+  // single line "EDUCATION PROFESSIONAL EXPERIENCE", so the work section
+  // never opened and the whole job history was lost.
+  //
+  // Runs only when the strict scan found nothing, so documents that already
+  // detect cleanly are untouched. assignColumns already keeps a straddling
+  // line as col 0, so the band stays full-width once the gutter is accepted.
+  if (best == null) {
+    const floor = Math.max(10, items.length * 0.08)
+    let bestBelow = 0
+    for (let k = 0; k <= 19; k++) {
+      const c = width * (0.3 + k * 0.02)
+      // The band is everything above the DEEPEST item crossing this
+      // candidate; below it the page has to be cleanly two-column.
+      let bandBottom = 0
+      for (const it of items) {
+        if (it.x < c - 2 && it.x + it.width > c + 2) bandBottom = Math.max(bandBottom, it.top + it.height)
+      }
+      let left = 0
+      let right = 0
+      for (const it of items) {
+        if (it.top < bandBottom - 0.5) continue
+        if (it.x + it.width <= c) left++
+        else right++
+      }
+      if (left < floor || right < floor) continue
+      // Prefer the candidate leaving the LARGEST columnar region: a bogus
+      // gutter has to push the band further down to clear itself.
+      if (left + right > bestBelow) {
+        bestBelow = left + right
+        best = c
+      }
+    }
+  }
+
+  // Centre the gutter in the empty band. The scan returns whichever
+  // candidate first achieved the lowest straddle, which sits hard against
+  // the sidebar's text — and then the ONE widest sidebar line straddles it,
+  // is tagged full-width, and lands in the middle of the main column's
+  // reading order. Measured on pinnacle: page 2 inherited a gutter at ~175pt
+  // and "AWS Certified Cloud Practitioner" (right edge 180.8, its
+  // neighbours 175.7) was interleaved between the two education entries,
+  // breaking the entry cluster so only one degree imported. Midway between
+  // the columns, every line clears it by the same margin.
+  if (best != null) {
+    let leftMax = -Infinity
+    let rightMin = Infinity
+    for (const it of items) {
+      const r = it.x + it.width
+      if (r <= best) leftMax = Math.max(leftMax, r)
+      else if (it.x >= best) rightMin = Math.min(rightMin, it.x)
+    }
+    if (leftMax > -Infinity && rightMin < Infinity && rightMin > leftMax) best = (leftMax + rightMin) / 2
+  }
+  if (best != null && isDateRail(items, best)) return null
   return best
 }
 
@@ -204,25 +434,75 @@ function assignColumns(items: Item[], pageWidth: Map<number, number>): boolean {
   let any = false
   const byPage = new Map<number, Item[]>()
   for (const it of items) (byPage.get(it.page) ?? byPage.set(it.page, []).get(it.page)!).push(it)
-  for (const [page, pageItems] of byPage) {
-    const gutter = detectGutter(pageItems, pageWidth.get(page) ?? 0)
+  let prevGutter: number | null = null
+  for (const [page, pageItems] of [...byPage.entries()].sort((a, b) => a[0] - b[0])) {
+    let gutter = detectGutter(pageItems, pageWidth.get(page) ?? 0)
+    // Continuation pages inherit the previous page's gutter when their own
+    // detection fails only for lack of volume (2026-08-16: sapphire's aside
+    // overflows to page 2 as a small remnant — under the population floor,
+    // the page fell back to single-column and the remnant's INTERESTS
+    // heading cut the work section mid-stream). The inherited gutter must
+    // still divide the page CLEANLY: near-zero straddle and ink on both
+    // sides. Genuinely full-width continuation pages (clarity page 2)
+    // reject it because their prose crosses the old gutter line.
+    if (gutter == null && prevGutter != null) {
+      let straddle = 0
+      let left = 0
+      let right = 0
+      // Running text only, for the same reason detectGutter weighs running
+      // text only: a bridging space or a lone bullet mark crosses a gutter
+      // without meaning anything by it.
+      for (const it of runningTextItems(pageItems)) {
+        if (it.x < prevGutter - 2 && it.x + it.width > prevGutter + 2) straddle++
+        else if (it.x + it.width <= prevGutter) left++
+        else right++
+      }
+      // Ink on BOTH sides is too strong a demand: a continuation page can
+      // hold ONLY the sidebar (aside's page 2) or only the main column.
+      // Such a page fell back to single-column, so its lines kept main-flow
+      // order instead of being emitted with the column they continue, and
+      // the section they belong to was split in two. Which SIDE the content
+      // falls on still identifies its column; a genuinely full-width
+      // continuation page still crosses the old gutter and is rejected by
+      // the straddle cap below.
+      if (left + right > 0 && straddle <= pageItems.length * 0.03 && !isDateRail(runningTextItems(pageItems), prevGutter))
+        gutter = prevGutter
+    }
     if (gutter == null) continue
+    prevGutter = gutter
     // A full-width band sits above the columns (header) — keep it col 0 so it
     // isn't split. Everything below the first two-column row is columnar.
     any = true
+    // The NARROW side is the sidebar/aside whichever side it is on; the
+    // wide side is the main flow (2026-08-16 — grouping by column INDEX
+    // broke one family or the other: clarity's aside is col 2 but double's
+    // MAIN is col 2).
+    const w = pageWidth.get(page) ?? 0
+    const asideCol = gutter < w / 2 ? 1 : 2
     for (const it of pageItems) {
       const center = it.x + it.width / 2
       const straddles = it.x < gutter - 2 && it.x + it.width > gutter + 2
       it.col = straddles ? 0 : center < gutter ? 1 : 2
+      it.aside = it.col === asideCol
     }
   }
   return any
 }
 
-function buildLines(items: Item[]): Line[] {
-  // Reading order: page, then column (full-width header first, then L, then R),
-  // then top, then x.
-  items.sort((a, b) => a.page - b.page || a.col - b.col || a.top - b.top || a.x - b.x)
+function buildLines(items: Item[], tracked: FileEvidence['tracked'] = []): Line[] {
+  // Reading order for RECOVERY (2026-08-16): main flow first (col 0/1 in
+  // page order), every col-2 column LAST (in page order). The old strictly
+  // per-page order (p1 main, p1 aside, p2 ...) let a short aside's own
+  // section headings CUT a main-column section that resumes on the next
+  // page — clarity's work entries 4-7 continued on page 2 but the page-1
+  // aside's SKILLS/LANGUAGES headings had already closed the work section,
+  // so they imported into a bogus section. Grouping each column class
+  // contiguously keeps cross-page sections whole in BOTH designs (right
+  // aside: main c1 + next page's c0 join; left sidebar: sidebar c1 pages
+  // join, main c2 pages join). Import cares about section grouping, not
+  // narrative page order.
+  const grp = (it: Item) => (it.aside ? 1 : 0)
+  items.sort((a, b) => grp(a) - grp(b) || a.page - b.page || a.col - b.col || a.top - b.top || a.x - b.x)
 
   const lines: Line[] = []
   let cur: Item[] = []
@@ -249,7 +529,10 @@ function buildLines(items: Item[]): Line[] {
     }
     // Collapse letter-spacing BEFORE squashing whitespace (a real word break in
     // tracked text shows up as 2+ spaces, which collapseTracking preserves).
-    text = collapseTracking(text.trim()).replace(/\s+/g, ' ').trim()
+    const raw = text.trim()
+    text = collapseTracking(raw).replace(/\s+/g, ' ').trim()
+    // Kept as the parser would meet it: repaired here, letter-spaced there.
+    if (text !== raw.replace(/\s+/g, ' ').trim()) tracked.push({ page: ordered[0].page, raw: raw.replace(/\s+/g, ' '), text })
     if (text) {
       const heights = ordered.map((i) => i.height).filter(Boolean)
       const boldChars = ordered.filter((i) => i.bold).reduce((n, i) => n + i.str.length, 0)
@@ -264,6 +547,7 @@ function buildLines(items: Item[]): Line[] {
         upper: isUpper(text),
         page: ordered[0].page,
         col: ordered[0].col,
+        aside: ordered[0].aside,
       })
     }
     cur = []
@@ -284,13 +568,26 @@ function buildLines(items: Item[]): Line[] {
     }
   }
   flush()
-  lines.sort((a, b) => a.page - b.page || a.col - b.col || a.top - b.top || a.x - b.x)
+  // Same recovery order as the item sort above: main flow (col 0/1) across
+  // ALL pages first, col-2 columns last — this final sort is what actually
+  // determines g.lines order, so it must group identically or the item-level
+  // sort is silently overridden (which is exactly what happened first).
+  const lgrp = (l: Line) => (l.aside ? 1 : 0)
+  lines.sort((a, b) => lgrp(a) - lgrp(b) || a.page - b.page || a.col - b.col || a.top - b.top || a.x - b.x)
   return lines
 }
 
-function assemble(items: Item[], pageWidth: Map<number, number>, pageCount: number, ocrPages: number[], ocrEngineFailed = false): LayoutGraph {
+function assemble(
+  items: Item[],
+  pageWidth: Map<number, number>,
+  pageCount: number,
+  ocrPages: number[],
+  ocrEngineFailed = false,
+  evidence: Omit<FileEvidence, 'tracked'> = { pageSizes: [], textChars: 0, unmappedChars: 0, images: [] },
+): LayoutGraph {
   const twoColumn = assignColumns(items, pageWidth)
-  const lines = buildLines(items)
+  const tracked: FileEvidence['tracked'] = []
+  const lines = buildLines(items, tracked)
   const bodyLines = lines.filter((l) => l.text.length > 12)
   const bodySize = median((bodyLines.length ? bodyLines : lines).map((l) => l.height)) || 10
   const gaps: number[] = []
@@ -309,6 +606,7 @@ function assemble(items: Item[], pageWidth: Map<number, number>, pageCount: numb
     twoColumn,
     ocrPages,
     ocrEngineFailed,
+    file: { ...evidence, tracked },
   }
 }
 
@@ -325,7 +623,10 @@ export async function buildLayoutGraph(file: File | ArrayBuffer, opts: BuildOpti
   const pageCount = doc.numPages
 
   try {
-    const { pages, pageWidth } = await readTextLayer(doc)
+    const { pages, pageWidth, sizes, images } = await readTextLayer(doc)
+    // Counted before OCR replaces anything: the native layer is what a parser reads.
+    const textChars = pages.reduce((n, p) => n + p.total, 0)
+    const unmappedChars = pages.reduce((n, p) => n + (p.total - p.usable), 0)
     const items: Item[] = pages.flatMap((p) => p.items)
 
     // Route unreadable pages through OCR (lazy-loaded; only touched if needed).
@@ -363,7 +664,7 @@ export async function buildLayoutGraph(file: File | ArrayBuffer, opts: BuildOpti
       }
     }
 
-    return assemble(items, pageWidth, pageCount, ocrPages, ocrEngineFailed)
+    return assemble(items, pageWidth, pageCount, ocrPages, ocrEngineFailed, { pageSizes: sizes, textChars, unmappedChars, images })
   } finally {
     doc.destroy()
   }
