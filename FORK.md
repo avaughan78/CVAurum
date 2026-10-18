@@ -17,5 +17,6 @@ https://cv.hirepotential.co.uk. HirePotential's apps link to it as their free CV
 - **If a deploy fails:** the site keeps the last good version. GitHub emails the failure.
 - **Security headers:** GitHub Pages ignores upstream's `public/_headers`, so the same headers
   (Content-Security-Policy and the rest; HSTS without `includeSubDomains; preload`) are set by a
-  Cloudflare Response Header Transform Rule on `cv.hirepotential.co.uk`. If upstream changes its
-  `_headers`, update that rule to match.
+  Cloudflare Response Header Transform Rule on `cv.hirepotential.co.uk`. The daily workflow's `headers` job
+  (`.github/headers/check.sh`) fails, and GitHub emails you, if upstream changes its `_headers`
+  or the live site stops sending what the rule sets; the run summary shows the difference.
